@@ -47,6 +47,8 @@ kernel void kernel_repeat(
 }
 
 typedef decltype(kernel_repeat<float>) kernel_repeat_t;
+typedef decltype(kernel_repeat<int32_t>) kernel_repeat_i32_t;
 
 // Host-visible F32 repeat used for HC expansion of embeddings.
 template [[host_name("kernel_repeat_f32")]] kernel kernel_repeat_t kernel_repeat<float>;
+template [[host_name("kernel_repeat_i32")]] kernel kernel_repeat_i32_t kernel_repeat<int32_t>;

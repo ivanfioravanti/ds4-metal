@@ -57,6 +57,7 @@
 #define EVAL_MAX_CHOICES 10
 #define EVAL_ANSWER_MAX 32
 #define EVAL_MAX_CONTEXT 1000000
+#define EVAL_MAX_PARALLEL 32
 
 typedef enum {
     EVAL_PENDING,
@@ -1223,6 +1224,9 @@ typedef struct {
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool self_test_extractors;
+    int parallel;
+    bool no_metal_residency;
+    bool batch_ffn;
 } eval_config;
 
 typedef struct {
@@ -1231,6 +1235,21 @@ typedef struct {
     int remaining_budget;
     int rank;
 } eval_think_close_info;
+
+typedef struct {
+    int case_idx;
+    eval_status status;
+    char phase[16];
+    int generated;
+    int prompt_tokens;
+    int prefill_current;
+    int prefill_total;
+    double speed_tps;
+    double generation_sec;
+    bool in_think;
+    byte_buf stream;
+    style_buf styles;
+} eval_worker_slot;
 
 typedef struct {
     int cols;
@@ -1248,6 +1267,7 @@ typedef struct {
     char (*guess)[EVAL_ANSWER_MAX];
     int *prompt_tokens;
     int *generated_tokens;
+    double *generation_seconds;
     int active_case;
     int generated;
     int max_tokens;
@@ -1269,9 +1289,24 @@ typedef struct {
     bool in_think;
     char pending_tag[16];
     size_t pending_tag_len;
+    int parallel_workers;
+    int worker_slot;
+    eval_worker_slot *worker_slots;
+    int decode_batch_last_n;
+    double decode_batch_last_tps;
+    double decode_batch_ema_tps;
+    int decode_batch_count;
+    int decode_batch_total_n;
+    int decode_batch_max_n;
+    pthread_mutex_t mu;
+    void *publish_ui;
 } eval_ui;
 
 static eval_ui *global_ui;
+static pthread_mutex_t global_backend_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t global_output_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t global_trace_mu = PTHREAD_MUTEX_INITIALIZER;
+static bool global_backend_lock_enabled;
 
 static double run_clock_sec(void);
 
@@ -1307,10 +1342,11 @@ static double tui_run_clock_visible_sec(const eval_ui *ui) {
 
 static void format_run_elapsed(char *dst, size_t dstlen, double sec) {
     if (sec < 0.0) sec = 0.0;
-    unsigned long long minutes = (unsigned long long)(sec / 60.0);
-    unsigned long long hours = minutes / 60ull;
-    minutes %= 60ull;
-    snprintf(dst, dstlen, "%02lluh:%02llum", hours, minutes);
+    unsigned long long total = (unsigned long long)(sec + 0.5);
+    unsigned long long seconds = total % 60ull;
+    unsigned long long minutes = (total / 60ull) % 60ull;
+    unsigned long long hours = total / 3600ull;
+    snprintf(dst, dstlen, "%02lluh:%02llum:%02llus", hours, minutes, seconds);
 }
 
 typedef struct {
@@ -1412,6 +1448,38 @@ static void style_free(style_buf *b) {
     memset(b, 0, sizeof(*b));
 }
 
+static void buf_copy(byte_buf *dst, const byte_buf *src) {
+    dst->len = 0;
+    if (src->len == 0) {
+        if (dst->v) dst->v[0] = '\0';
+        return;
+    }
+    buf_append(dst, src->v, src->len);
+}
+
+static void style_copy(style_buf *dst, const style_buf *src) {
+    dst->len = 0;
+    if (src->len == 0) return;
+    style_append(dst, 0, src->len);
+    memcpy(dst->v, src->v, src->len);
+}
+
+static void backend_lock(void) {
+    if (global_backend_lock_enabled) pthread_mutex_lock(&global_backend_mu);
+}
+
+static void backend_unlock(void) {
+    if (global_backend_lock_enabled) pthread_mutex_unlock(&global_backend_mu);
+}
+
+static void output_lock(void) {
+    pthread_mutex_lock(&global_output_mu);
+}
+
+static void output_unlock(void) {
+    pthread_mutex_unlock(&global_output_mu);
+}
+
 static double now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -1511,6 +1579,7 @@ static eval_config parse_options(int argc, char **argv) {
         .hard_limit_reply_budget = 512,
         .soft_limit_think_close_rank = 3,
         .think_mode = DS4_THINK_HIGH,
+        .parallel = 1,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -1550,6 +1619,10 @@ static eval_config parse_options(int argc, char **argv) {
             c.question_limit = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--case-sequence")) {
             c.case_sequence = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--parallel")) {
+            c.parallel = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--batch-decode") || !strcmp(arg, "--batch-ffn")) {
+            c.batch_ffn = true;
         } else if (!strcmp(arg, "--temp")) {
             c.temperature = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
         } else if (!strcmp(arg, "--top-p")) {
@@ -1631,6 +1704,8 @@ static eval_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
+        } else if (!strcmp(arg, "--no-metal-residency")) {
+            c.no_metal_residency = true;
         } else if (!strcmp(arg, "--think")) {
             c.think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {
@@ -1683,6 +1758,12 @@ static eval_config parse_options(int argc, char **argv) {
         fprintf(stderr,
                 "ds4-eval: --soft-limit-reply-budget (%d) must be >= --hard-limit-reply-budget (%d)\n",
                 c.soft_limit_reply_budget, c.hard_limit_reply_budget);
+        exit(2);
+    }
+    if (c.parallel > EVAL_MAX_PARALLEL) {
+        fprintf(stderr,
+                "ds4-eval: --parallel (%d) is too large; max is %d\n",
+                c.parallel, EVAL_MAX_PARALLEL);
         exit(2);
     }
     return c;
@@ -1748,9 +1829,18 @@ static const char *status_name(eval_status st) {
     return "?";
 }
 
+typedef struct {
+    size_t start;
+    size_t end;
+} line_span;
+
 static bool eval_status_running(eval_status st) {
     return st == EVAL_PREFILL || st == EVAL_THINKING;
 }
+
+static void format_short_count(char *dst, size_t dstlen, int n);
+static const char *short_phase_name(const char *phase);
+static void tui_draw_parallel_header(eval_ui *ui);
 
 static void print_trimmed(const char *s, int width) {
     if (width <= 0) return;
@@ -1989,8 +2079,12 @@ static void tui_draw_title(eval_ui *ui) {
 static void tui_draw_frame(eval_ui *ui) {
     fputs("\x1b[2J", stdout);
     tui_draw_title(ui);
-    term_move(1, ui->right_x);
-    fputs(ANSI_BOLD "live sampled tokens" ANSI_RESET, stdout);
+    if (ui->parallel_workers > 1) {
+        tui_draw_parallel_header(ui);
+    } else {
+        term_move(1, ui->right_x);
+        fputs(ANSI_BOLD "live sampled tokens" ANSI_RESET, stdout);
+    }
 
     for (int row = 1; row <= ui->rows; row++) {
         term_move(row, ui->left_w + 1);
@@ -2064,6 +2158,142 @@ static void tui_draw_left(eval_ui *ui) {
             print_trimmed(answers, answer_w);
         }
         fputs(ANSI_RESET, stdout);
+    }
+}
+
+static void tui_draw_stream_range(const byte_buf *stream, const style_buf *styles,
+                                  int x, int y, int width, int height) {
+    if (width <= 0 || height <= 0) return;
+
+    line_span *lines = NULL;
+    int line_len = 0;
+    int line_cap = 0;
+    size_t line_start = 0;
+    int col = 0;
+
+    for (size_t i = 0; i < stream->len; i++) {
+        char c = stream->v[i];
+        bool end_line = false;
+        size_t end = i;
+        if (c == '\n') {
+            end_line = true;
+            end = i;
+        } else {
+            col++;
+            if (col >= width) {
+                end_line = true;
+                end = i + 1;
+            }
+        }
+        if (end_line) {
+            if (line_len == line_cap) {
+                line_cap = line_cap ? line_cap * 2 : 64;
+                line_span *v = realloc(lines, (size_t)line_cap * sizeof(*lines));
+                if (!v) {
+                    fprintf(stderr, "ds4-eval: out of memory\n");
+                    exit(1);
+                }
+                lines = v;
+            }
+            lines[line_len++] = (line_span){line_start, end};
+            line_start = i + 1;
+            col = 0;
+        }
+    }
+    if (line_start <= stream->len) {
+        if (line_len == line_cap) {
+            line_cap = line_cap ? line_cap * 2 : 64;
+            line_span *v = realloc(lines, (size_t)line_cap * sizeof(*lines));
+            if (!v) {
+                fprintf(stderr, "ds4-eval: out of memory\n");
+                exit(1);
+            }
+            lines = v;
+        }
+        lines[line_len++] = (line_span){line_start, stream->len};
+    }
+
+    int start = line_len > height ? line_len - height : 0;
+    for (int row = 0; row < height; row++) {
+        term_move(y + row, x);
+        term_clear_to_eol();
+        int li = start + row;
+        if (li >= line_len) continue;
+        unsigned char cur_style = 255;
+        int printed = 0;
+        for (size_t i = lines[li].start; i < lines[li].end && printed < width; i++) {
+            unsigned char st = i < styles->len ? styles->v[i] : 0;
+            if (st != cur_style) {
+                fputs(st ? ANSI_DIM : ANSI_RESET, stdout);
+                cur_style = st;
+            }
+            char c = stream->v[i];
+            if (c == '\r' || c == '\n') continue;
+            if (c == '\t') c = ' ';
+            fputc((unsigned char)c, stdout);
+            printed++;
+        }
+        fputs(ANSI_RESET, stdout);
+    }
+    free(lines);
+}
+
+static void tui_draw_parallel_streams(eval_ui *ui) {
+    if (!ui->worker_slots || ui->parallel_workers <= 1) return;
+    const int width = tui_right_text_w(ui);
+    const int top = 2;
+    const int available = ui->rows - top + 1;
+    if (available <= 0) return;
+    int slot_h = available / ui->parallel_workers;
+    if (slot_h < 4) slot_h = 4;
+
+    for (int w = 0; w < ui->parallel_workers; w++) {
+        int y = top + w * slot_h;
+        if (y > ui->rows) break;
+        int h = slot_h;
+        if (w == ui->parallel_workers - 1 || y + h > ui->rows + 1) h = ui->rows - y + 1;
+        if (h <= 0) continue;
+
+        eval_worker_slot *slot = &ui->worker_slots[w];
+        term_move(y, ui->right_x);
+        term_clear_to_eol();
+        fputs(ANSI_BOLD, stdout);
+        printf("W%d ", w + 1);
+        fputs(ANSI_RESET, stdout);
+        if (slot->case_idx >= 0) {
+            const eval_case *tc = &ui->cases[slot->case_idx];
+            char gen[16], max[16], cur[16], total[16], line[512];
+            format_short_count(gen, sizeof(gen), slot->generated);
+            format_short_count(max, sizeof(max), ui->max_tokens);
+            if (slot->prefill_total > 0 && slot->status == EVAL_PREFILL) {
+                double pct = 100.0 * (double)slot->prefill_current / (double)slot->prefill_total;
+                format_short_count(cur, sizeof(cur), slot->prefill_current);
+                format_short_count(total, sizeof(total), slot->prefill_total);
+                snprintf(line, sizeof(line), "%.2f t/s  %s %s/%s %.0f%%  #%d %s/%s",
+                         slot->speed_tps, short_phase_name(slot->phase), cur, total, pct,
+                         slot->case_idx + 1, tc->source, tc->id);
+            } else {
+                snprintf(line, sizeof(line), "%.2f t/s  %s %s/%s  #%d %s/%s",
+                         slot->speed_tps, short_phase_name(slot->phase), gen, max,
+                         slot->case_idx + 1, tc->source, tc->id);
+            }
+            print_trimmed(line, width - 3);
+        } else {
+            fputs(ANSI_DIM "idle" ANSI_RESET, stdout);
+        }
+
+        int stream_y = y + 1;
+        int stream_h = h - 1;
+        if (stream_h > 0) {
+            tui_draw_stream_range(&slot->stream, &slot->styles,
+                                  ui->right_x, stream_y, width, stream_h);
+        }
+        if (w + 1 < ui->parallel_workers && y + h <= ui->rows) {
+            term_move(y + h - 1, ui->right_x);
+            fputs(ANSI_DIM, stdout);
+            for (int i = 0; i < width; i++) fputc('-', stdout);
+            fputs(ANSI_RESET, stdout);
+        }
     }
 }
 
@@ -2145,86 +2375,11 @@ static void stream_append_token_text(eval_ui *ui, const char *text, size_t len, 
     free(tmp);
 }
 
-typedef struct {
-    size_t start;
-    size_t end;
-} line_span;
-
 static void tui_draw_stream(eval_ui *ui) {
     if (!ui->enabled) return;
-    const int width = tui_right_text_w(ui);
-
-    line_span *lines = NULL;
-    int line_len = 0;
-    int line_cap = 0;
-    size_t line_start = 0;
-    int col = 0;
-
-    for (size_t i = 0; i < ui->stream.len; i++) {
-        char c = ui->stream.v[i];
-        bool end_line = false;
-        size_t end = i;
-        if (c == '\n') {
-            end_line = true;
-            end = i;
-        } else {
-            col++;
-            if (col >= width) {
-                end_line = true;
-                end = i + 1;
-            }
-        }
-        if (end_line) {
-            if (line_len == line_cap) {
-                line_cap = line_cap ? line_cap * 2 : 64;
-                line_span *v = realloc(lines, (size_t)line_cap * sizeof(*lines));
-                if (!v) {
-                    fprintf(stderr, "ds4-eval: out of memory\n");
-                    exit(1);
-                }
-                lines = v;
-            }
-            lines[line_len++] = (line_span){line_start, end};
-            line_start = i + 1;
-            col = 0;
-        }
-    }
-    if (line_start <= ui->stream.len) {
-        if (line_len == line_cap) {
-            line_cap = line_cap ? line_cap * 2 : 64;
-            line_span *v = realloc(lines, (size_t)line_cap * sizeof(*lines));
-            if (!v) {
-                fprintf(stderr, "ds4-eval: out of memory\n");
-                exit(1);
-            }
-            lines = v;
-        }
-        lines[line_len++] = (line_span){line_start, ui->stream.len};
-    }
-
-    int start = line_len > ui->body_h ? line_len - ui->body_h : 0;
-    for (int row = 0; row < ui->body_h; row++) {
-        term_move(ui->body_y + row, ui->right_x);
-        term_clear_to_eol();
-        int li = start + row;
-        if (li >= line_len) continue;
-        unsigned char cur_style = 255;
-        int printed = 0;
-        for (size_t i = lines[li].start; i < lines[li].end && printed < width; i++) {
-            unsigned char st = ui->styles.v[i];
-            if (st != cur_style) {
-                fputs(st ? ANSI_DIM : ANSI_RESET, stdout);
-                cur_style = st;
-            }
-            char c = ui->stream.v[i];
-            if (c == '\r' || c == '\n') continue;
-            if (c == '\t') c = ' ';
-            fputc((unsigned char)c, stdout);
-            printed++;
-        }
-        fputs(ANSI_RESET, stdout);
-    }
-    free(lines);
+    tui_draw_stream_range(&ui->stream, &ui->styles,
+                          ui->right_x, ui->body_y,
+                          tui_right_text_w(ui), ui->body_h);
 }
 
 static void format_short_count(char *dst, size_t dstlen, int n) {
@@ -2244,6 +2399,60 @@ static const char *short_phase_name(const char *phase) {
     if (!strcmp(phase, "passed")) return "PASS";
     if (!strcmp(phase, "failed")) return "FAIL";
     return "RUN";
+}
+
+static int eval_ui_total_generated(const eval_ui *ui) {
+    if (!ui || !ui->generated_tokens) return 0;
+    int total = 0;
+    for (int i = 0; i < ui->ncases; i++) total += ui->generated_tokens[i];
+    return total;
+}
+
+static double eval_ui_sum_case_tps(const eval_ui *ui) {
+    if (!ui || !ui->generated_tokens || !ui->generation_seconds) return 0.0;
+    double total = 0.0;
+    for (int i = 0; i < ui->ncases; i++) {
+        if (ui->generated_tokens[i] > 0 && ui->generation_seconds[i] > 0.001) {
+            total += (double)ui->generated_tokens[i] / ui->generation_seconds[i];
+        }
+    }
+    return total;
+}
+
+static void tui_draw_parallel_header(eval_ui *ui) {
+    if (!ui->enabled || ui->parallel_workers <= 1) return;
+    double active_sum_tps = 0.0;
+    int active = 0;
+    if (ui->worker_slots) {
+        for (int i = 0; i < ui->parallel_workers; i++) {
+            const eval_worker_slot *slot = &ui->worker_slots[i];
+            if (slot->case_idx >= 0 && slot->status == EVAL_THINKING) {
+                active_sum_tps += slot->speed_tps;
+                active++;
+            }
+        }
+    }
+    const int generated = eval_ui_total_generated(ui);
+    const double elapsed = tui_run_clock_visible_sec(ui);
+    const double wall_tps = elapsed > 0.001 ? (double)generated / elapsed : 0.0;
+    char gen[16];
+    char line[512];
+    format_short_count(gen, sizeof(gen), generated);
+    if (ui->decode_batch_ema_tps > 0.0 && ui->decode_batch_last_n > 0) {
+        snprintf(line, sizeof(line),
+                 "parallel live sampled tokens  batch %.1f t/s n%d  Σreq %.2f t/s  wall %.2f t/s  active %d/%d  gen %s",
+                 ui->decode_batch_ema_tps, ui->decode_batch_last_n,
+                 active_sum_tps, wall_tps, active, ui->parallel_workers, gen);
+    } else {
+        snprintf(line, sizeof(line),
+                 "parallel live sampled tokens  Σreq %.2f t/s  wall %.2f t/s  active %d/%d  gen %s",
+                 active_sum_tps, wall_tps, active, ui->parallel_workers, gen);
+    }
+    term_move(1, ui->right_x);
+    term_clear_to_eol();
+    fputs(ANSI_BOLD, stdout);
+    print_trimmed(line, tui_right_text_w(ui));
+    fputs(ANSI_RESET, stdout);
 }
 
 static void tui_draw_right_status(eval_ui *ui, const char *phase) {
@@ -2279,19 +2488,63 @@ static void tui_draw_right_status(eval_ui *ui, const char *phase) {
 
 static void tui_refresh(eval_ui *ui, const char *phase) {
     if (!ui->enabled) return;
+    pthread_mutex_lock(&ui->mu);
     tui_draw_left(ui);
-    tui_draw_right_status(ui, phase);
-    tui_draw_stream(ui);
+    if (ui->parallel_workers > 1) {
+        (void)phase;
+        tui_draw_parallel_header(ui);
+        tui_draw_parallel_streams(ui);
+    } else {
+        tui_draw_right_status(ui, phase);
+        tui_draw_stream(ui);
+    }
     fflush(stdout);
+    pthread_mutex_unlock(&ui->mu);
+}
+
+static void tui_publish_parallel(eval_ui *ui, const char *phase) {
+    eval_ui *root = ui->publish_ui ? (eval_ui *)ui->publish_ui : ui;
+    if (!root->enabled || !root->worker_slots || ui->worker_slot < 0 ||
+        ui->worker_slot >= root->parallel_workers) {
+        return;
+    }
+
+    pthread_mutex_lock(&root->mu);
+    eval_worker_slot *slot = &root->worker_slots[ui->worker_slot];
+    slot->case_idx = ui->active_case;
+    if (ui->active_case >= 0 && ui->active_case < root->ncases) {
+        slot->status = root->status[ui->active_case];
+        slot->prompt_tokens = root->prompt_tokens[ui->active_case];
+    } else {
+        slot->status = EVAL_PENDING;
+        slot->prompt_tokens = 0;
+    }
+    snprintf(slot->phase, sizeof(slot->phase), "%s", phase ? phase : "idle");
+    slot->generated = ui->generated;
+    slot->prefill_current = ui->prefill_current;
+    slot->prefill_total = ui->prefill_total;
+    slot->speed_tps = ui->speed_tps;
+    slot->generation_sec = ui->generated > 0 ? now_sec() - ui->phase_start_sec : 0.0;
+    slot->in_think = ui->in_think;
+    buf_copy(&slot->stream, &ui->stream);
+    style_copy(&slot->styles, &ui->styles);
+
+    tui_draw_left(root);
+    tui_draw_parallel_header(root);
+    tui_draw_parallel_streams(root);
+    fflush(stdout);
+    pthread_mutex_unlock(&root->mu);
 }
 
 static void tui_start(eval_ui *ui, const eval_case *cases, int ncases, int max_tokens,
-                      bool enabled) {
+                      int parallel_workers, bool enabled) {
     memset(ui, 0, sizeof(*ui));
+    pthread_mutex_init(&ui->mu, NULL);
     ui->enabled = enabled;
     ui->cases = cases;
     ui->ncases = ncases;
     ui->max_tokens = max_tokens;
+    ui->parallel_workers = parallel_workers;
     ui->selected_case = 0;
     ui->requested_case = -1;
     ui->quit_requested = false;
@@ -2299,7 +2552,16 @@ static void tui_start(eval_ui *ui, const eval_case *cases, int ncases, int max_t
     ui->guess = calloc((size_t)ncases, sizeof(*ui->guess));
     ui->prompt_tokens = calloc((size_t)ncases, sizeof(*ui->prompt_tokens));
     ui->generated_tokens = calloc((size_t)ncases, sizeof(*ui->generated_tokens));
-    if (!ui->status || !ui->guess || !ui->prompt_tokens || !ui->generated_tokens) {
+    ui->generation_seconds = calloc((size_t)ncases, sizeof(*ui->generation_seconds));
+    if (parallel_workers > 1) {
+        ui->worker_slots = calloc((size_t)parallel_workers, sizeof(*ui->worker_slots));
+        if (ui->worker_slots) {
+            for (int i = 0; i < parallel_workers; i++) ui->worker_slots[i].case_idx = -1;
+        }
+    }
+    if (!ui->status || !ui->guess || !ui->prompt_tokens || !ui->generated_tokens ||
+        !ui->generation_seconds ||
+        (parallel_workers > 1 && !ui->worker_slots)) {
         fprintf(stderr, "ds4-eval: out of memory\n");
         exit(1);
     }
@@ -2338,12 +2600,21 @@ static void tui_start(eval_ui *ui, const eval_case *cases, int ncases, int max_t
 
 static void tui_free(eval_ui *ui) {
     if (ui->active) tui_restore();
+    if (ui->worker_slots) {
+        for (int i = 0; i < ui->parallel_workers; i++) {
+            buf_free(&ui->worker_slots[i].stream);
+            style_free(&ui->worker_slots[i].styles);
+        }
+        free(ui->worker_slots);
+    }
     free(ui->status);
     free(ui->guess);
     free(ui->prompt_tokens);
     free(ui->generated_tokens);
+    free(ui->generation_seconds);
     buf_free(&ui->stream);
     style_free(&ui->styles);
+    pthread_mutex_destroy(&ui->mu);
     memset(ui, 0, sizeof(*ui));
 }
 
@@ -2525,7 +2796,9 @@ static int token_rank_in_top(ds4_session *session, int token, int max_rank) {
     if (token < 0 || max_rank <= 0) return 0;
     ds4_token_score *top = malloc((size_t)max_rank * sizeof(*top));
     if (!top) return 0;
+    backend_lock();
     int n = ds4_session_top_logprobs(session, top, max_rank);
+    backend_unlock();
     int rank = 0;
     for (int i = 0; i < n; i++) {
         if (top[i].id == token) {
@@ -2552,6 +2825,9 @@ static void trace_write_header(FILE *trace, const eval_config *cfg,
             "max_tokens: %d\n"
             "max_prompt_tokens: %d\n"
             "questions: %d\n"
+            "parallel: %d\n"
+            "batch_ffn: %s\n"
+            "metal_residency: %s\n"
             "temperature: %.6g\n"
             "top_p: %.6g\n"
             "min_p: %.6g\n"
@@ -2569,6 +2845,9 @@ static void trace_write_header(FILE *trace, const eval_config *cfg,
             cfg->max_tokens,
             max_prompt_tokens,
             ncases,
+            cfg->parallel,
+            cfg->batch_ffn ? "enabled" : "disabled",
+            cfg->no_metal_residency ? "disabled" : "default",
             cfg->temperature,
             cfg->top_p,
             cfg->min_p,
@@ -2597,6 +2876,7 @@ static void trace_write_case(FILE *trace,
                              const char *picked,
                              const eval_think_close_info *think_close) {
     if (!trace) return;
+    pthread_mutex_lock(&global_trace_mu);
     int nchoices = eval_case_nchoices(tc);
     fprintf(trace,
             "===== CASE %d/%d %s/%s =====\n"
@@ -2659,6 +2939,7 @@ static void trace_write_case(FILE *trace,
     trace_write_block(trace, "MODEL_OUTPUT", model_output);
     fputc('\n', trace);
     fflush(trace);
+    pthread_mutex_unlock(&global_trace_mu);
 }
 
 /* Model outputs can contain provisional "answer" text after a forced
@@ -3614,15 +3895,265 @@ static void eval_prefill_progress(void *ud, const char *event, int current, int 
     double elapsed = now_sec() - ui->phase_start_sec;
     ui->speed_tps = elapsed > 0.001 ? (double)current / elapsed : 0.0;
     tui_refresh(ui, "prefill");
+    tui_publish_parallel(ui, "prefill");
     double paused_sec = tui_wait_if_paused(ui, "prefill");
     if (paused_sec > 0.0) ui->phase_start_sec += paused_sec;
 }
 
+typedef struct {
+    bool pending;
+    bool done;
+    ds4_session *session;
+    int token;
+    int rc;
+    char err[256];
+} eval_decode_request;
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    eval_decode_request *requests;
+    ds4_session **batch_sessions;
+    int *batch_tokens;
+    int *batch_slots;
+    int nworkers;
+    int active_workers;
+    int pending_count;
+    int wait_ms;
+    int prefill_ready_count;
+    int prefill_barrier_epoch;
+    int prefill_barrier_target;
+    int prefill_barrier_len;
+    uint64_t prefill_barrier_hash;
+    bool prefill_barrier_mismatch;
+    bool prefill_barrier_enabled;
+    bool in_progress;
+    eval_ui *ui;
+} eval_decode_coordinator;
+
+static bool eval_decode_coordinator_init(eval_decode_coordinator *c, int nworkers,
+                                         eval_ui *ui, bool prefill_barrier_enabled) {
+    memset(c, 0, sizeof(*c));
+    if (nworkers <= 1) return true;
+    c->nworkers = nworkers;
+    c->active_workers = nworkers;
+    c->ui = ui;
+    c->wait_ms = 2;
+    c->prefill_barrier_enabled = prefill_barrier_enabled;
+    c->requests = calloc((size_t)nworkers, sizeof(*c->requests));
+    c->batch_sessions = calloc((size_t)nworkers, sizeof(*c->batch_sessions));
+    c->batch_tokens = calloc((size_t)nworkers, sizeof(*c->batch_tokens));
+    c->batch_slots = calloc((size_t)nworkers, sizeof(*c->batch_slots));
+    if (!c->requests || !c->batch_sessions || !c->batch_tokens || !c->batch_slots) {
+        free(c->requests);
+        free(c->batch_sessions);
+        free(c->batch_tokens);
+        free(c->batch_slots);
+        memset(c, 0, sizeof(*c));
+        return false;
+    }
+    pthread_mutex_init(&c->mu, NULL);
+    pthread_cond_init(&c->cv, NULL);
+    return true;
+}
+
+static void eval_decode_coordinator_free(eval_decode_coordinator *c) {
+    if (!c || c->nworkers <= 1) return;
+    pthread_cond_destroy(&c->cv);
+    pthread_mutex_destroy(&c->mu);
+    free(c->requests);
+    free(c->batch_sessions);
+    free(c->batch_tokens);
+    free(c->batch_slots);
+    memset(c, 0, sizeof(*c));
+}
+
+static void cond_deadline_ms(struct timespec *ts, int ms) {
+    clock_gettime(CLOCK_REALTIME, ts);
+    ts->tv_nsec += (long)(ms % 1000) * 1000000L;
+    ts->tv_sec += ms / 1000 + ts->tv_nsec / 1000000000L;
+    ts->tv_nsec %= 1000000000L;
+}
+
+static void eval_ui_record_decode_batch(eval_ui *ui, int n, double sec) {
+    if (!ui || n <= 0 || sec <= 0.0) return;
+    const double tps = (double)n / sec;
+    pthread_mutex_lock(&ui->mu);
+    ui->decode_batch_last_n = n;
+    ui->decode_batch_last_tps = tps;
+    ui->decode_batch_ema_tps =
+        ui->decode_batch_ema_tps > 0.0 ? ui->decode_batch_ema_tps * 0.85 + tps * 0.15 : tps;
+    ui->decode_batch_count++;
+    ui->decode_batch_total_n += n;
+    if (n > ui->decode_batch_max_n) ui->decode_batch_max_n = n;
+    pthread_mutex_unlock(&ui->mu);
+}
+
+static void eval_decode_worker_done(eval_decode_coordinator *c) {
+    if (!c || c->nworkers <= 1) return;
+    pthread_mutex_lock(&c->mu);
+    if (c->active_workers > 0) c->active_workers--;
+    pthread_cond_broadcast(&c->cv);
+    pthread_mutex_unlock(&c->mu);
+}
+
+static uint64_t eval_prompt_hash(const ds4_tokens *tokens) {
+    uint64_t h = 1469598103934665603ULL;
+    if (tokens) {
+        for (int i = 0; i < tokens->len; i++) {
+            h ^= (uint32_t)tokens->v[i];
+            h *= 1099511628211ULL;
+        }
+        h ^= (uint32_t)tokens->len;
+        h *= 1099511628211ULL;
+    }
+    return h ? h : 1;
+}
+
+static void eval_decode_prefill_barrier_reset(eval_decode_coordinator *c) {
+    c->prefill_ready_count = 0;
+    c->prefill_barrier_target = 0;
+    c->prefill_barrier_len = 0;
+    c->prefill_barrier_hash = 0;
+    c->prefill_barrier_mismatch = false;
+    c->prefill_barrier_epoch++;
+    pthread_cond_broadcast(&c->cv);
+}
+
+/* Only identical prompts wait here.  Mixed-prompt waves are released as soon as
+ * a mismatch is observed, so short prefills are not held behind long ones. */
+static void eval_decode_prefill_barrier(eval_decode_coordinator *c,
+                                        uint64_t prompt_hash,
+                                        int prompt_len) {
+    if (!c || c->nworkers <= 1 || !c->prefill_barrier_enabled) return;
+
+    pthread_mutex_lock(&c->mu);
+    int target = c->active_workers;
+    if (target <= 1) {
+        pthread_mutex_unlock(&c->mu);
+        return;
+    }
+    if (c->prefill_ready_count == 0) {
+        c->prefill_barrier_target = target;
+        c->prefill_barrier_len = prompt_len;
+        c->prefill_barrier_hash = prompt_hash;
+        c->prefill_barrier_mismatch = false;
+    } else if (target < c->prefill_barrier_target) {
+        c->prefill_barrier_target = target;
+    }
+
+    const int epoch = c->prefill_barrier_epoch;
+    if (!c->prefill_barrier_mismatch &&
+        (prompt_len != c->prefill_barrier_len ||
+         prompt_hash != c->prefill_barrier_hash)) {
+        c->prefill_barrier_mismatch = true;
+        pthread_cond_broadcast(&c->cv);
+    }
+
+    c->prefill_ready_count++;
+    while (epoch == c->prefill_barrier_epoch) {
+        target = c->active_workers;
+        if (target > 0 && target < c->prefill_barrier_target) {
+            c->prefill_barrier_target = target;
+        }
+        if (c->prefill_ready_count >= c->prefill_barrier_target) {
+            eval_decode_prefill_barrier_reset(c);
+            break;
+        }
+        if (c->prefill_barrier_mismatch) break;
+        pthread_cond_wait(&c->cv, &c->mu);
+    }
+    pthread_mutex_unlock(&c->mu);
+}
+
+static int eval_decode_submit(eval_decode_coordinator *c, int worker_id,
+                              ds4_session *session, int token,
+                              char *err, size_t errlen) {
+    if (!c || c->nworkers <= 1 || worker_id < 0 || worker_id >= c->nworkers) {
+        backend_lock();
+        int rc = ds4_session_eval(session, token, err, errlen);
+        backend_unlock();
+        return rc;
+    }
+
+    pthread_mutex_lock(&c->mu);
+    while (c->in_progress) pthread_cond_wait(&c->cv, &c->mu);
+
+    eval_decode_request *req = &c->requests[worker_id];
+    req->pending = true;
+    req->done = false;
+    req->session = session;
+    req->token = token;
+    req->rc = 0;
+    req->err[0] = '\0';
+    c->pending_count++;
+    pthread_cond_broadcast(&c->cv);
+
+    struct timespec deadline;
+    cond_deadline_ms(&deadline, c->wait_ms);
+    while (!req->done && !c->in_progress) {
+        const int target = c->active_workers > 0 ? c->active_workers : c->nworkers;
+        if (c->pending_count >= target) break;
+        int tw = pthread_cond_timedwait(&c->cv, &c->mu, &deadline);
+        if (tw == ETIMEDOUT) break;
+    }
+
+    if (!req->done && !c->in_progress) {
+        c->in_progress = true;
+        int n = 0;
+        for (int i = 0; i < c->nworkers; i++) {
+            eval_decode_request *r = &c->requests[i];
+            if (!r->pending) continue;
+            c->batch_slots[n] = i;
+            c->batch_sessions[n] = r->session;
+            c->batch_tokens[n] = r->token;
+            r->pending = false;
+            n++;
+        }
+        c->pending_count = 0;
+        pthread_mutex_unlock(&c->mu);
+
+        char batch_err[256] = {0};
+        const double batch_t0 = now_sec();
+        backend_lock();
+        int batch_rc = ds4_session_eval_batch(c->batch_sessions,
+                                              c->batch_tokens,
+                                              n,
+                                              batch_err,
+                                              sizeof(batch_err));
+        backend_unlock();
+        eval_ui_record_decode_batch(c->ui, n, now_sec() - batch_t0);
+
+        pthread_mutex_lock(&c->mu);
+        for (int i = 0; i < n; i++) {
+            eval_decode_request *r = &c->requests[c->batch_slots[i]];
+            r->rc = batch_rc;
+            if (batch_rc != 0) snprintf(r->err, sizeof(r->err), "%s", batch_err);
+            r->done = true;
+        }
+        c->in_progress = false;
+        pthread_cond_broadcast(&c->cv);
+    }
+
+    while (!req->done) pthread_cond_wait(&c->cv, &c->mu);
+    int rc = req->rc;
+    if (rc != 0 && errlen > 0) snprintf(err, errlen, "%s", req->err);
+    req->done = false;
+    req->session = NULL;
+    req->token = -1;
+    pthread_mutex_unlock(&c->mu);
+    return rc;
+}
+
 static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                                     const eval_config *cfg, eval_ui *ui,
-                                    FILE *trace, int idx, uint64_t *rng) {
-    const eval_case *tc = &eval_cases[idx];
+                                    FILE *trace, int idx, uint64_t *rng,
+                                    eval_decode_coordinator *decode,
+                                    int worker_id) {
+    const eval_case *tc = &ui->cases[idx];
     const bool tty = ui->enabled;
+    const bool parallel_ui = !tty && ui->publish_ui != NULL;
+    const bool parallel_plain = !tty && ui->parallel_workers > 1;
     const bool use_plain_color = !tty && isatty(STDOUT_FILENO);
     const ds4_think_mode think_mode = ds4_think_mode_for_context(cfg->think_mode, cfg->ctx_size);
     const char *system = eval_system_prompt();
@@ -3634,9 +4165,12 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     }
 
     ds4_tokens prompt = {0};
+    backend_lock();
     ds4_encode_chat_prompt(engine, system, question, think_mode, &prompt);
+    backend_unlock();
     ui->prompt_tokens[idx] = prompt.len;
     ui->generated_tokens[idx] = 0;
+    ui->generation_seconds[idx] = 0.0;
 
     if (prompt.len >= cfg->ctx_size) {
         ui->active_case = idx;
@@ -3689,7 +4223,20 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     if (tty) {
         tui_reset_stream(ui, tc, ds4_think_mode_enabled(think_mode));
         tui_refresh(ui, "prefill");
+    } else if (parallel_ui) {
+        ui->stream.len = 0;
+        if (ui->stream.v) ui->stream.v[0] = '\0';
+        ui->styles.len = 0;
+        ui->in_think = ds4_think_mode_enabled(think_mode);
+        ui->pending_tag_len = 0;
+        ui->generated = 0;
+        ui->prefill_current = 0;
+        ui->prefill_total = 0;
+        ui->phase_start_sec = now_sec();
+        ui->speed_tps = 0.0;
+        tui_publish_parallel(ui, "prefill");
     } else {
+        output_lock();
         printf("\n%s[%d/%d] %s%s%s/%s%s%s %s%s\n",
                use_plain_color ? ANSI_BOLD : "",
                idx + 1, ui->ncases,
@@ -3699,12 +4246,16 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                use_plain_color ? ANSI_RESET : "", tc->title,
                use_plain_color ? ANSI_RESET : "");
         fflush(stdout);
+        output_unlock();
     }
 
     char err[256];
     ds4_session_set_progress(session, eval_prefill_progress, ui);
     ds4_session_set_display_progress(session, eval_prefill_progress, ui);
-    if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
+    backend_lock();
+    int sync_rc = ds4_session_sync(session, &prompt, err, sizeof(err));
+    backend_unlock();
+    if (sync_rc != 0) {
         ds4_session_set_progress(session, NULL, NULL);
         ds4_session_set_display_progress(session, NULL, NULL);
         tui_run_clock_stop(ui);
@@ -3718,6 +4269,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     ds4_session_set_progress(session, NULL, NULL);
     ds4_session_set_display_progress(session, NULL, NULL);
     int prompt_tokens = prompt.len;
+    uint64_t prompt_hash = eval_prompt_hash(&prompt);
     ui->prompt_tokens[idx] = prompt_tokens;
     ds4_tokens_free(&prompt);
 
@@ -3742,9 +4294,10 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         free(question);
         return EVAL_RUN_SWITCH;
     }
-
+    eval_decode_prefill_barrier(decode, prompt_hash, prompt_tokens);
     ui->status[idx] = EVAL_THINKING;
     ui->generated = 0;
+    ui->generation_seconds[idx] = 0.0;
     ui->phase_start_sec = now_sec();
     ui->speed_tps = 0.0;
     byte_buf raw = {0};
@@ -3752,9 +4305,14 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     bool generation_in_think = ds4_think_mode_enabled(think_mode);
     eval_think_close_info think_close = {0};
     ds4_tokens think_close_tokens = {0};
-    if (generation_in_think) ds4_tokenize_text(engine, "</think>", &think_close_tokens);
-    if (!tty && plain_in_think) plain_set_thinking_color(use_plain_color);
+    if (generation_in_think) {
+        backend_lock();
+        ds4_tokenize_text(engine, "</think>", &think_close_tokens);
+        backend_unlock();
+    }
+    if (!tty && !parallel_plain && plain_in_think) plain_set_thinking_color(use_plain_color);
     tui_refresh(ui, "thinking");
+    tui_publish_parallel(ui, "thinking");
 
     const int eos = ds4_token_eos(engine);
     double t0 = ui->phase_start_sec;
@@ -3855,9 +4413,12 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                 }
             }
         }
-        if (token < 0)
+        if (token < 0) {
+            backend_lock();
             token = ds4_session_sample(session, cfg->temperature, 0,
                                        cfg->top_p, cfg->min_p, rng);
+            backend_unlock();
+        }
         if (token == eos) break;
         if (close_kind != EVAL_THINK_CLOSE_NONE &&
             think_close.kind == EVAL_THINK_CLOSE_NONE) {
@@ -3866,8 +4427,9 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
             think_close.remaining_budget = remaining_budget;
             think_close.rank = close_rank;
         }
-        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-            plain_reset_color(use_plain_color);
+        int eval_rc = eval_decode_submit(decode, worker_id, session, token, err, sizeof(err));
+        if (eval_rc != 0) {
+            if (!parallel_plain) plain_reset_color(use_plain_color);
             ui->generated_tokens[idx] = ui->generated;
             tui_run_clock_stop(ui);
             fprintf(stderr, "ds4-eval: decode failed for %s: %s\n", tc->id, err);
@@ -3902,22 +4464,34 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         if (tty) {
             stream_append_token_text(ui, text, len, false);
             tui_refresh(ui, ui->in_think ? "thinking" : "answer");
-        } else {
+        } else if (parallel_ui) {
+            stream_append_token_text(ui, text, len, false);
+            tui_publish_parallel(ui, ui->in_think ? "thinking" : "answer");
+        } else if (!parallel_plain) {
             if (plain_in_think && strstr(raw.v ? raw.v : "", "</think>")) {
                 plain_in_think = false;
                 plain_reset_color(use_plain_color);
             }
+            output_lock();
             fwrite(text, 1, len, stdout);
             fflush(stdout);
+            output_unlock();
         }
         free(text);
     }
     if (tty) {
         stream_append_token_text(ui, NULL, 0, true);
         tui_draw_stream(ui);
+    } else if (parallel_ui) {
+        stream_append_token_text(ui, NULL, 0, true);
+        tui_publish_parallel(ui, ui->in_think ? "thinking" : "answer");
     } else {
-        plain_reset_color(use_plain_color);
-        if (!raw.v || raw.len == 0 || raw.v[raw.len - 1] != '\n') fputc('\n', stdout);
+        if (!parallel_plain) plain_reset_color(use_plain_color);
+        if (!parallel_plain && (!raw.v || raw.len == 0 || raw.v[raw.len - 1] != '\n')) {
+            output_lock();
+            fputc('\n', stdout);
+            output_unlock();
+        }
     }
 
     char got[EVAL_ANSWER_MAX];
@@ -3928,17 +4502,21 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     ui->generated_tokens[idx] = ui->generated;
     tui_run_clock_stop(ui);
     double sec = now_sec() - t0;
+    ui->generation_seconds[idx] = sec;
     tui_refresh(ui, pass ? "passed" : "failed");
+    tui_publish_parallel(ui, pass ? "passed" : "failed");
     trace_write_case(trace, cfg, tc, idx, ui->ncases, pass ? "PASSED" : "FAILED", NULL,
                      system, question, raw.v ? raw.v : "", think_mode, prompt_tokens,
                      ui->generated, sec, got, &think_close);
 
     if (!tty) {
+        output_lock();
         printf("%s%s%s got %s expected %s (%.1fs, %d tokens)\n",
                use_plain_color ? (pass ? ANSI_GREEN : ANSI_RED) : "",
                pass ? "PASSED" : "FAIL",
                use_plain_color ? ANSI_RESET : "",
                got, tc->answer, sec, ui->generated);
+        output_unlock();
     }
 
     if (tty && cfg->pause_ms > 0) usleep((useconds_t)cfg->pause_ms * 1000);
@@ -4078,7 +4656,23 @@ static void print_eval_report(const eval_ui *ui, int ncases, int passed, int fai
 
     printf("ds4-eval: %d/%d passed", passed, ncases);
     if (failed) printf(", %d failed", failed);
+    const int total_generated = eval_ui_total_generated(ui);
+    const double runtime_sec = tui_run_clock_visible_sec(ui);
+    const double wall_tps = runtime_sec > 0.001 ? (double)total_generated / runtime_sec : 0.0;
+    const double summed_case_tps = eval_ui_sum_case_tps(ui);
     printf(", runtime %s\n", elapsed);
+    printf("ds4-eval: generated %d tokens, wall %.2f t/s", total_generated, wall_tps);
+    if (ui->parallel_workers > 1) {
+        printf(", summed request %.2f t/s", summed_case_tps);
+        if (ui->decode_batch_count > 0) {
+            const double avg_batch =
+                (double)ui->decode_batch_total_n / (double)ui->decode_batch_count;
+            printf(", decode batch avg %.1f/max %d",
+                   avg_batch,
+                   ui->decode_batch_max_n);
+        }
+    }
+    putchar('\n');
     printf("%-3s %-8s %8s %8s %8s %-8s %-8s %s\n",
            "#", "state", "prompt", "gen", "total", "given", "correct", "test");
     for (int i = 0; i < ncases; i++) {
@@ -4099,14 +4693,163 @@ static void print_eval_report(const eval_ui *ui, int ncases, int passed, int fai
     }
 }
 
+typedef struct {
+    ds4_engine *engine;
+    ds4_session *session;
+    const eval_config *cfg;
+    eval_ui *ui;
+    FILE *trace;
+    eval_decode_coordinator *decode;
+    pthread_mutex_t *next_mu;
+    int *next_case;
+    int ncases;
+    int *rc;
+    uint64_t rng;
+    int worker_id;
+} eval_worker;
+
+static void *eval_worker_main(void *arg) {
+    eval_worker *w = arg;
+    eval_ui local_ui = *w->ui;
+    local_ui.enabled = false;
+    local_ui.active = false;
+    local_ui.parallel_workers = w->cfg->parallel;
+    local_ui.stream.v = NULL;
+    local_ui.stream.len = 0;
+    local_ui.stream.cap = 0;
+    local_ui.styles.v = NULL;
+    local_ui.styles.len = 0;
+    local_ui.styles.cap = 0;
+    local_ui.selected_case = 0;
+    local_ui.selection_active = false;
+    local_ui.requested_case = -1;
+    local_ui.paused = false;
+    local_ui.worker_slot = w->worker_id;
+    local_ui.publish_ui = w->ui;
+
+    for (;;) {
+        pthread_mutex_lock(w->next_mu);
+        if (*w->rc != 0 || *w->next_case >= w->ncases) {
+            pthread_mutex_unlock(w->next_mu);
+            break;
+        }
+        int idx = (*w->next_case)++;
+        pthread_mutex_unlock(w->next_mu);
+
+        eval_run_result result =
+            run_one_case(w->engine, w->session, w->cfg, &local_ui, w->trace,
+                         idx, &w->rng, w->decode, w->worker_id);
+        if (result == EVAL_RUN_ERROR) {
+            pthread_mutex_lock(w->next_mu);
+            *w->rc = 1;
+            pthread_mutex_unlock(w->next_mu);
+            break;
+        }
+    }
+    eval_decode_worker_done(w->decode);
+    return NULL;
+}
+
+static int run_parallel_eval(ds4_engine *engine, const eval_config *cfg,
+                             eval_ui *ui, FILE *trace, int ncases) {
+    int nworkers = cfg->parallel;
+    if (nworkers > ncases) nworkers = ncases;
+    if (nworkers < 1) nworkers = 1;
+
+    if (!ui->enabled) {
+        fprintf(stderr,
+                "ds4-eval: starting %d parallel workers with %d independent sessions\n",
+                nworkers, nworkers);
+    }
+
+    ds4_session **sessions = calloc((size_t)nworkers, sizeof(*sessions));
+    pthread_t *threads = calloc((size_t)nworkers, sizeof(*threads));
+    eval_worker *workers = calloc((size_t)nworkers, sizeof(*workers));
+    if (!sessions || !threads || !workers) {
+        fprintf(stderr, "ds4-eval: out of memory\n");
+        free(sessions);
+        free(threads);
+        free(workers);
+        return 1;
+    }
+
+    int rc = 0;
+    int session_count = 0;
+    for (int i = 0; i < nworkers; i++) {
+        if (ds4_session_create(&sessions[i], engine, cfg->ctx_size) != 0) {
+            fprintf(stderr, "ds4-eval: failed to create session for worker %d\n", i + 1);
+            rc = 1;
+            goto done;
+        }
+        session_count++;
+    }
+
+    pthread_mutex_t next_mu = PTHREAD_MUTEX_INITIALIZER;
+    eval_decode_coordinator decode;
+    const bool prefill_barrier_enabled = cfg->batch_ffn;
+    if (!eval_decode_coordinator_init(&decode, nworkers, ui, prefill_barrier_enabled)) {
+        fprintf(stderr, "ds4-eval: out of memory\n");
+        rc = 1;
+        pthread_mutex_destroy(&next_mu);
+        goto done;
+    }
+    int next_case = 0;
+    ui->parallel_workers = nworkers;
+    tui_run_clock_start(ui);
+
+    int started_workers = 0;
+    uint64_t base_seed = cfg->seed ? cfg->seed :
+        ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
+    for (int i = 0; i < nworkers; i++) {
+        workers[i] = (eval_worker) {
+            .engine = engine,
+            .session = sessions[i],
+            .cfg = cfg,
+            .ui = ui,
+            .trace = trace,
+            .decode = &decode,
+            .next_mu = &next_mu,
+            .next_case = &next_case,
+            .ncases = ncases,
+            .rc = &rc,
+            .rng = base_seed ^ ((uint64_t)(i + 1) * UINT64_C(0x9e3779b97f4a7c15)),
+            .worker_id = i,
+        };
+        if (pthread_create(&threads[i], NULL, eval_worker_main, &workers[i]) != 0) {
+            fprintf(stderr, "ds4-eval: failed to start worker %d\n", i + 1);
+            pthread_mutex_lock(&next_mu);
+            rc = 1;
+            pthread_mutex_unlock(&next_mu);
+            break;
+        }
+        started_workers++;
+    }
+
+    for (int i = 0; i < started_workers; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    tui_run_clock_stop(ui);
+    eval_decode_coordinator_free(&decode);
+    pthread_mutex_destroy(&next_mu);
+
+done:
+    for (int i = 0; sessions && i < session_count; i++) ds4_session_free(sessions[i]);
+    free(sessions);
+    free(threads);
+    free(workers);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     eval_config cfg = parse_options(argc, argv);
     if (cfg.self_test_extractors) return run_extractor_self_tests();
     if (cfg.regrade_trace_path) return regrade_trace_file(cfg.regrade_trace_path);
 
-    int ncases = (int)(sizeof(eval_cases) / sizeof(eval_cases[0]));
+    const int embedded_ncases = (int)(sizeof(eval_cases) / sizeof(eval_cases[0]));
+    int ncases = embedded_ncases;
+    const eval_case *cases = eval_cases;
     if (cfg.question_limit > 0 && cfg.question_limit < ncases) ncases = cfg.question_limit;
-    if (cfg.question_limit > (int)(sizeof(eval_cases) / sizeof(eval_cases[0]))) {
+    if (cfg.question_limit > embedded_ncases) {
         fprintf(stderr, "ds4-eval: only %zu questions are embedded\n",
                 sizeof(eval_cases) / sizeof(eval_cases[0]));
         return 2;
@@ -4117,12 +4860,24 @@ int main(int argc, char **argv) {
         parse_case_sequence(cfg.case_sequence, ncases, &case_sequence, &case_sequence_len) != 0) {
         return 2;
     }
+    if (cfg.parallel > 1 && cfg.case_sequence) {
+        fprintf(stderr, "ds4-eval: --case-sequence is not supported with --parallel\n");
+        free(case_sequence);
+        return 2;
+    }
+    if (cfg.parallel > 1 && cfg.dist.role != DS4_DISTRIBUTED_NONE) {
+        fprintf(stderr, "ds4-eval: --parallel is not supported with distributed mode\n");
+        free(case_sequence);
+        return 2;
+    }
     if (!cfg.seed) {
         cfg.seed = (uint64_t)time(NULL) ^
                    ((uint64_t)getpid() << 32) ^
                    (uint64_t)clock();
     }
-
+    if (cfg.no_metal_residency) {
+        setenv("DS4_METAL_NO_RESIDENCY", "1", 1);
+    }
     FILE *trace = NULL;
     if (cfg.trace_path) {
         trace = fopen(cfg.trace_path, "w");
@@ -4152,6 +4907,7 @@ int main(int argc, char **argv) {
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .distributed = cfg.dist,
+        .batch_decode = cfg.batch_ffn,
     };
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
@@ -4172,14 +4928,14 @@ int main(int argc, char **argv) {
     int max_prompt_case = -1;
     const bool auto_ctx = cfg.ctx_size <= 0;
     if (auto_ctx) {
-        cfg.ctx_size = eval_auto_context_size(engine, &cfg, eval_cases, ncases,
+        cfg.ctx_size = eval_auto_context_size(engine, &cfg, cases, ncases,
                                               &max_prompt_tokens, &max_prompt_case);
         fprintf(stderr,
                 "ds4-eval: context auto-sized to %d tokens "
                 "(largest prompt=%d tokens, case=%d, generation budget=%d)\n",
                 cfg.ctx_size, max_prompt_tokens, max_prompt_case + 1, cfg.max_tokens);
     } else {
-        max_prompt_tokens = eval_max_prompt_tokens(engine, &cfg, eval_cases, ncases,
+        max_prompt_tokens = eval_max_prompt_tokens(engine, &cfg, cases, ncases,
                                                    cfg.ctx_size, &max_prompt_case);
         fprintf(stderr,
                 "ds4-eval: context set to %d tokens "
@@ -4191,74 +4947,82 @@ int main(int argc, char **argv) {
     eval_warn_think_max_downgraded(&cfg);
     trace_write_header(trace, &cfg, ds4_engine_model_name(engine), ncases, max_prompt_tokens);
     log_context_memory(cfg.backend, cfg.ctx_size, cfg.prefill_chunk);
-
-    ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
-        fprintf(stderr, "ds4-eval: failed to create session\n");
-        if (trace) fclose(trace);
-        ds4_engine_close(engine);
-        free(case_sequence);
-        return 1;
-    }
-    if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
-        wait_distributed_route(session) != 0)
-    {
-        ds4_session_free(session);
-        if (trace) fclose(trace);
-        ds4_engine_close(engine);
-        free(case_sequence);
-        return 1;
-    }
-
     eval_ui ui;
     bool split_ui = !cfg.plain && isatty(STDOUT_FILENO);
-    tui_start(&ui, eval_cases, ncases, cfg.max_tokens, split_ui);
+    tui_start(&ui, cases, ncases, cfg.max_tokens, cfg.parallel, split_ui);
 
-    uint64_t rng = cfg.seed;
     int rc = 0;
-    int next = 0;
-    int sequence_pos = 0;
-    while (next >= 0) {
-        if (case_sequence_len > 0) {
-            if (sequence_pos >= case_sequence_len) break;
-            next = case_sequence[sequence_pos++];
-            ui.selected_case = next;
-            ui.selection_active = false;
+    if (cfg.parallel > 1) {
+        global_backend_lock_enabled = true;
+        rc = run_parallel_eval(engine, &cfg, &ui, trace, ncases);
+    } else {
+        ds4_session *session = NULL;
+        if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
+            fprintf(stderr, "ds4-eval: failed to create session\n");
+            tui_free(&ui);
+            if (trace) fclose(trace);
+            ds4_engine_close(engine);
+            free(case_sequence);
+            return 1;
         }
-        tui_consume_input(&ui);
-        tui_wait_if_paused(&ui, "idle");
-        if (ui.quit_requested) break;
-        if (case_sequence_len == 0 && ui.requested_case >= 0) {
-            next = ui.requested_case;
-            ui.requested_case = -1;
-            ui.selection_active = false;
-            ui.selected_case = next;
+        if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
+            wait_distributed_route(session) != 0)
+        {
+            ds4_session_free(session);
+            tui_free(&ui);
+            if (trace) fclose(trace);
+            ds4_engine_close(engine);
+            free(case_sequence);
+            return 1;
         }
 
-        eval_run_result result = run_one_case(engine, session, &cfg, &ui, trace, next, &rng);
-        if (result == EVAL_RUN_ERROR) {
-            rc = 1;
-            break;
+        uint64_t rng = cfg.seed;
+        int next = 0;
+        int sequence_pos = 0;
+        while (next >= 0) {
+            if (case_sequence_len > 0) {
+                if (sequence_pos >= case_sequence_len) break;
+                next = case_sequence[sequence_pos++];
+                ui.selected_case = next;
+                ui.selection_active = false;
+            }
+            tui_consume_input(&ui);
+            tui_wait_if_paused(&ui, "idle");
+            if (ui.quit_requested) break;
+            if (case_sequence_len == 0 && ui.requested_case >= 0) {
+                next = ui.requested_case;
+                ui.requested_case = -1;
+                ui.selection_active = false;
+                ui.selected_case = next;
+            }
+
+            eval_run_result result = run_one_case(engine, session, &cfg, &ui, trace,
+                                                  next, &rng, NULL, -1);
+            if (result == EVAL_RUN_ERROR) {
+                rc = 1;
+                break;
+            }
+            if (result == EVAL_RUN_QUIT) break;
+            /* A successful case should advance to the next pending benchmark.  If a
+             * stale quit flag ever survives here, clear it; real q handling either
+             * returns EVAL_RUN_QUIT from run_one_case() or is consumed at the top of
+             * the next idle iteration. */
+            ui.quit_requested = false;
+            if (case_sequence_len > 0) continue;
+            if (ui.requested_case >= 0) {
+                next = ui.requested_case;
+                ui.requested_case = -1;
+                ui.selection_active = false;
+                ui.selected_case = next;
+                continue;
+            }
+            next = next_pending_case(&ui, next + 1);
+            if (next >= 0) {
+                ui.selected_case = next;
+                ui.selection_active = false;
+            }
         }
-        if (result == EVAL_RUN_QUIT) break;
-        /* A successful case should advance to the next pending benchmark.  If a
-         * stale quit flag ever survives here, clear it; real q handling either
-         * returns EVAL_RUN_QUIT from run_one_case() or is consumed at the top of
-         * the next idle iteration. */
-        ui.quit_requested = false;
-        if (case_sequence_len > 0) continue;
-        if (ui.requested_case >= 0) {
-            next = ui.requested_case;
-            ui.requested_case = -1;
-            ui.selection_active = false;
-            ui.selected_case = next;
-            continue;
-        }
-        next = next_pending_case(&ui, next + 1);
-        if (next >= 0) {
-            ui.selected_case = next;
-            ui.selection_active = false;
-        }
+        ds4_session_free(session);
     }
 
     int passed = 0;
@@ -4281,7 +5045,6 @@ int main(int argc, char **argv) {
     }
 
     tui_free(&ui);
-    ds4_session_free(session);
     ds4_engine_close(engine);
     if (trace) fclose(trace);
     free(case_sequence);

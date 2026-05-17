@@ -632,15 +632,23 @@ subset of reduced single-function C/C++ vulnerability-localization questions.
 The model is asked for the single best source line, or the smallest exact line
 set only when the bug cannot be localized to one line; the scorer accepts small
 audited ranges only when adjacent lines are equivalent locations for the same
-bug. The order is
-intentionally progressive: early questions are useful smoke tests, while later
+bug. The order is intentionally progressive: early questions are useful smoke tests, while later
 questions are hard enough that a strong reasoning model should still miss some
 of them. The SuperGPQA slice is curated rather than blind: upstream rows with
 wrong keys, missing figures, or underspecified prompts are replaced with cleaner
 rows.
 
-The set should be treated as a hard capability regression suite rather than
-a pass/fail unit test.
+Use `--parallel N` to run multiple questions from one `ds4-eval` process with
+independent sessions. With the TTY UI enabled, the right pane is split into one
+live stream per worker and the header reports wall throughput and summed
+per-request throughput.
+
+```sh
+./ds4-eval --questions 2 --parallel 2 --nothink
+```
+
+For a model like DeepSeek V4 Flash, the set should be treated as a hard
+capability regression suite rather than a pass/fail unit test:
 
 - **GPQA Diamond** contributes graduate-level science questions with
   multiple-choice answers. DeepSeek's model card reports strong results

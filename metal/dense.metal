@@ -322,6 +322,140 @@ kernel void kernel_dsv4_shared_gate_up_swiglu_q8_0(
     }
 }
 
+template <typename type4>
+void dequantize_q8_0_t4(device const block_q8_0 *xb, short il, thread type4 & reg);
+
+template<short r1ptg>
+kernel void kernel_dsv4_shared_gate_up_swiglu_q8_0_ext(
+        constant ds4_metal_args_mul_mv_ext & args,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        constant     float &clamp_value,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG   = FC_mul_mv_nsg;
+    const short nxpsg = FC_mul_mv_nxpsg;
+
+    const short chpt = 4;
+    const short chpb = 8;
+    const short nypsg = 32 / nxpsg;
+
+    const short tx = tiisg % nxpsg;
+    const short ty = tiisg / nxpsg;
+
+    const int i01 = tgpig.x * (nypsg * NSG) + nypsg * sgitg + ty;
+    const int i11 = tgpig.y * r1ptg;
+    const int i1m = tgpig.z;
+
+    const int i12 = i1m % args.ne12;
+    const int i13 = i1m / args.ne12;
+
+    const uint64_t offset0 = i01 * args.nb01 + (i12 / args.r2) * args.nb02 + (i13 / args.r3) * args.nb03;
+    const uint64_t offset1 = i11 * args.nb11 + i12 * args.nb12 + i13 * args.nb13;
+
+    device const block_q8_0 *xg = (i01 < args.ne01) ? (device const block_q8_0 *)(src0_gate + offset0) + tx / chpb : (device const block_q8_0 *)src0_gate;
+    device const block_q8_0 *xu = (i01 < args.ne01) ? (device const block_q8_0 *)(src0_up   + offset0) + tx / chpb : (device const block_q8_0 *)src0_up;
+
+    device const float4 *y4[r1ptg];
+    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+        y4[ir1] = (i11 + ir1 < args.ne11) ? (device const float4 *)(src1 + offset1 + ir1 * args.nb11) + tx : (device const float4 *)src1;
+    }
+
+    float sumg[r1ptg] = { [0 ... r1ptg - 1] = 0.0f };
+    float sumu[r1ptg] = { [0 ... r1ptg - 1] = 0.0f };
+
+    short cch = tx % chpb;
+
+    for (int ich = tx; 4 * ich < args.ne00; ich += chpt * nxpsg) {
+        float4 lg[chpt];
+        float4 lu[chpt];
+
+#pragma unroll(chpt)
+        for (short ch = 0; ch < chpt; ++ch) {
+            dequantize_q8_0_t4(xg, cch, lg[ch]);
+            dequantize_q8_0_t4(xu, cch, lu[ch]);
+
+            cch += nxpsg;
+            if (cch >= chpb) {
+                const short adv = cch / chpb;
+                xg += adv;
+                xu += adv;
+                cch %= chpb;
+            }
+        }
+
+#pragma unroll(chpt)
+        for (short ch = 0; ch < chpt; ++ch) {
+#pragma unroll(r1ptg)
+            for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+                const float4 yv = y4[ir1][ch * nxpsg];
+                sumg[ir1] += dot(lg[ch], yv);
+                sumu[ir1] += dot(lu[ch], yv);
+            }
+        }
+
+#pragma unroll(r1ptg)
+        for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+            y4[ir1] += chpt * nxpsg;
+        }
+    }
+
+#pragma unroll(r1ptg)
+    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+        if (nxpsg >= 32) {
+            sumg[ir1] += simd_shuffle_down(sumg[ir1], 16);
+            sumu[ir1] += simd_shuffle_down(sumu[ir1], 16);
+        }
+        if (nxpsg >= 16) {
+            sumg[ir1] += simd_shuffle_down(sumg[ir1], 8);
+            sumu[ir1] += simd_shuffle_down(sumu[ir1], 8);
+        }
+        if (nxpsg >= 8) {
+            sumg[ir1] += simd_shuffle_down(sumg[ir1], 4);
+            sumu[ir1] += simd_shuffle_down(sumu[ir1], 4);
+        }
+        if (nxpsg >= 4) {
+            sumg[ir1] += simd_shuffle_down(sumg[ir1], 2);
+            sumu[ir1] += simd_shuffle_down(sumu[ir1], 2);
+        }
+        if (nxpsg >= 2) {
+            sumg[ir1] += simd_shuffle_down(sumg[ir1], 1);
+            sumu[ir1] += simd_shuffle_down(sumu[ir1], 1);
+        }
+    }
+
+    if (tx == 0 && i01 < args.ne01) {
+        for (short ir1 = 0; ir1 < r1ptg && i11 + ir1 < args.ne11; ++ir1) {
+            device float *gate_f32 = (device float *)dst_gate + (uint64_t)i1m * args.ne0 * args.ne1 + (uint64_t)(i11 + ir1) * args.ne0;
+            device float *up_f32   = (device float *)dst_up   + (uint64_t)i1m * args.ne0 * args.ne1 + (uint64_t)(i11 + ir1) * args.ne0;
+            device float *mid_f32  = (device float *)dst_mid  + (uint64_t)i1m * args.ne0 * args.ne1 + (uint64_t)(i11 + ir1) * args.ne0;
+            const float gate = sumg[ir1];
+            const float up = sumu[ir1];
+            gate_f32[i01] = gate;
+            up_f32[i01] = up;
+            float g = gate;
+            float u = up;
+            if (clamp_value > 1.0e-6f) {
+                g = min(g, clamp_value);
+                u = clamp(u, -clamp_value, clamp_value);
+            }
+            mid_f32[i01] = (g / (1.0f + exp(-g))) * u;
+        }
+    }
+}
+
+typedef decltype(kernel_dsv4_shared_gate_up_swiglu_q8_0_ext<2>) shared_gate_up_swiglu_q8_0_ext_t;
+
+template [[host_name("kernel_dsv4_shared_gate_up_swiglu_q8_0_r1_2")]] kernel shared_gate_up_swiglu_q8_0_ext_t kernel_dsv4_shared_gate_up_swiglu_q8_0_ext<2>;
+template [[host_name("kernel_dsv4_shared_gate_up_swiglu_q8_0_r1_3")]] kernel shared_gate_up_swiglu_q8_0_ext_t kernel_dsv4_shared_gate_up_swiglu_q8_0_ext<3>;
+template [[host_name("kernel_dsv4_shared_gate_up_swiglu_q8_0_r1_4")]] kernel shared_gate_up_swiglu_q8_0_ext_t kernel_dsv4_shared_gate_up_swiglu_q8_0_ext<4>;
+template [[host_name("kernel_dsv4_shared_gate_up_swiglu_q8_0_r1_5")]] kernel shared_gate_up_swiglu_q8_0_ext_t kernel_dsv4_shared_gate_up_swiglu_q8_0_ext<5>;
+
 template<typename T0, typename T1, short NR0, typename args_t>
 void kernel_mul_mv_t_t_impl(
         args_t args,

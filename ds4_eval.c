@@ -1282,6 +1282,7 @@ typedef struct {
     bool selection_active;
     int selected_case;
     int requested_case;
+    int worker_scroll;
     bool paused;
     bool quit_requested;
     byte_buf stream;
@@ -1789,6 +1790,15 @@ static void term_clear_to_eol(void) {
     fputs("\x1b[K", stdout);
 }
 
+static void term_put_safe_byte(unsigned char c) {
+    if (c == '\t') {
+        c = ' ';
+    } else if (c < 0x20 || c == 0x7f) {
+        c = ' ';
+    }
+    fputc(c, stdout);
+}
+
 static int tui_right_text_w(const eval_ui *ui) {
     /* Avoid writing the physical last column.  Many terminals defer wrapping
      * until the next byte after the last column, which would spill right-pane
@@ -1797,6 +1807,7 @@ static int tui_right_text_w(const eval_ui *ui) {
 }
 
 static void tui_clear_left_line(eval_ui *ui, int row) {
+    fputs(ANSI_RESET, stdout);
     term_move(row, 1);
     for (int i = 0; i < ui->left_w; i++) fputc(' ', stdout);
     term_move(row, ui->left_w + 1);
@@ -1842,18 +1853,79 @@ static void format_short_count(char *dst, size_t dstlen, int n);
 static const char *short_phase_name(const char *phase);
 static void tui_draw_parallel_header(eval_ui *ui);
 
+static int clamp_int(int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static int tui_parallel_available_rows(const eval_ui *ui) {
+    const int top = 2;
+    return ui && ui->rows >= top ? ui->rows - top + 1 : 0;
+}
+
+static int tui_parallel_slot_height(const eval_ui *ui) {
+    const int available = tui_parallel_available_rows(ui);
+    if (!ui || ui->parallel_workers <= 0 || available <= 0) return 0;
+    int slot_h = available / ui->parallel_workers;
+    if (slot_h < 2) slot_h = 2;
+    return slot_h;
+}
+
+static int tui_parallel_visible_workers(const eval_ui *ui) {
+    const int available = tui_parallel_available_rows(ui);
+    const int slot_h = tui_parallel_slot_height(ui);
+    if (!ui || ui->parallel_workers <= 0 || available <= 0 || slot_h <= 0) return 0;
+    int visible = available / slot_h;
+    if (visible < 1) visible = 1;
+    if (visible > ui->parallel_workers) visible = ui->parallel_workers;
+    return visible;
+}
+
+static void tui_clamp_worker_scroll(eval_ui *ui) {
+    if (!ui || ui->parallel_workers <= 1) return;
+    int visible = tui_parallel_visible_workers(ui);
+    int max_scroll = ui->parallel_workers - visible;
+    if (max_scroll < 0) max_scroll = 0;
+    ui->worker_scroll = clamp_int(ui->worker_scroll, 0, max_scroll);
+}
+
+static int tui_worker_for_case(const eval_ui *ui, int case_idx) {
+    if (!ui || !ui->worker_slots || case_idx < 0) return -1;
+    for (int i = 0; i < ui->parallel_workers; i++) {
+        if (ui->worker_slots[i].case_idx == case_idx) return i;
+    }
+    return -1;
+}
+
+static void tui_scroll_worker_into_view(eval_ui *ui, int worker_idx) {
+    if (!ui || worker_idx < 0 || worker_idx >= ui->parallel_workers) return;
+    int visible = tui_parallel_visible_workers(ui);
+    if (visible <= 0) return;
+    if (worker_idx < ui->worker_scroll) {
+        ui->worker_scroll = worker_idx;
+    } else if (worker_idx >= ui->worker_scroll + visible) {
+        ui->worker_scroll = worker_idx - visible + 1;
+    }
+    tui_clamp_worker_scroll(ui);
+}
+
 static void print_trimmed(const char *s, int width) {
     if (width <= 0) return;
     int len = (int)strlen(s);
     if (len <= width) {
-        fputs(s, stdout);
+        for (int i = 0; i < len; i++) {
+            term_put_safe_byte((unsigned char)s[i]);
+        }
         return;
     }
     if (width <= 3) {
         for (int i = 0; i < width; i++) fputc('.', stdout);
         return;
     }
-    fwrite(s, 1, (size_t)width - 3, stdout);
+    for (int i = 0; i < width - 3; i++) {
+        term_put_safe_byte((unsigned char)s[i]);
+    }
     fputs("...", stdout);
 }
 
@@ -2020,9 +2092,23 @@ static void tui_consume_input(eval_ui *ui) {
         if (selected < 0) selected = 0;
         if (selected >= ui->ncases) selected = ui->ncases - 1;
         ui->selected_case = selected;
+
+        if (ui->parallel_workers > 1) {
+            int selected_worker = tui_worker_for_case(ui, selected);
+            if (selected_worker >= 0) {
+                tui_scroll_worker_into_view(ui, selected_worker);
+            } else {
+                ui->worker_scroll += move;
+                tui_clamp_worker_scroll(ui);
+            }
+        }
     }
 
-    if (enter) {
+    if (enter && ui->parallel_workers > 1) {
+        ui->selection_active = false;
+        int active_worker = tui_worker_for_case(ui, ui->active_case);
+        tui_scroll_worker_into_view(ui, active_worker);
+    } else if (enter) {
         if (!ui->selection_active) {
             ui->selected_case = ui->active_case;
             ui->selection_active = true;
@@ -2108,6 +2194,8 @@ static void tui_draw_left(eval_ui *ui) {
            ANSI_GREEN, passed, ANSI_RESET,
            ui->ncases,
            failed ? ANSI_RED : ANSI_DIM, failed, ANSI_RESET);
+
+    tui_clear_left_line(ui, 3);
 
     const int first_row = 4;
     const int visible_rows = ui->rows >= first_row ? ui->rows - first_row + 1 : 0;
@@ -2229,8 +2317,7 @@ static void tui_draw_stream_range(const byte_buf *stream, const style_buf *style
             }
             char c = stream->v[i];
             if (c == '\r' || c == '\n') continue;
-            if (c == '\t') c = ' ';
-            fputc((unsigned char)c, stdout);
+            term_put_safe_byte((unsigned char)c);
             printed++;
         }
         fputs(ANSI_RESET, stdout);
@@ -2242,17 +2329,24 @@ static void tui_draw_parallel_streams(eval_ui *ui) {
     if (!ui->worker_slots || ui->parallel_workers <= 1) return;
     const int width = tui_right_text_w(ui);
     const int top = 2;
-    const int available = ui->rows - top + 1;
+    const int available = tui_parallel_available_rows(ui);
     if (available <= 0) return;
-    int slot_h = available / ui->parallel_workers;
-    if (slot_h < 4) slot_h = 4;
+    const int slot_h = tui_parallel_slot_height(ui);
+    const int visible = tui_parallel_visible_workers(ui);
+    if (slot_h <= 0 || visible <= 0) return;
+    tui_clamp_worker_scroll(ui);
 
-    for (int w = 0; w < ui->parallel_workers; w++) {
-        int y = top + w * slot_h;
-        if (y > ui->rows) break;
-        int h = slot_h;
-        if (w == ui->parallel_workers - 1 || y + h > ui->rows + 1) h = ui->rows - y + 1;
+    const int base_h = available / visible;
+    const int extra_h = available % visible;
+    int y = top;
+    int drawn_until = top - 1;
+    for (int v = 0; v < visible; v++) {
+        int w = ui->worker_scroll + v;
+        if (w >= ui->parallel_workers || y > ui->rows) break;
+        int h = base_h + (v < extra_h ? 1 : 0);
+        if (h < 1 || v == visible - 1 || y + h > ui->rows + 1) h = ui->rows - y + 1;
         if (h <= 0) continue;
+        drawn_until = y + h - 1;
 
         eval_worker_slot *slot = &ui->worker_slots[w];
         term_move(y, ui->right_x);
@@ -2283,17 +2377,24 @@ static void tui_draw_parallel_streams(eval_ui *ui) {
         }
 
         int stream_y = y + 1;
-        int stream_h = h - 1;
+        bool draw_separator = (w + 1 < ui->parallel_workers || v + 1 < visible) && h >= 3;
+        int stream_h = h - 1 - (draw_separator ? 1 : 0);
         if (stream_h > 0) {
             tui_draw_stream_range(&slot->stream, &slot->styles,
                                   ui->right_x, stream_y, width, stream_h);
         }
-        if (w + 1 < ui->parallel_workers && y + h <= ui->rows) {
+        if (draw_separator) {
             term_move(y + h - 1, ui->right_x);
             fputs(ANSI_DIM, stdout);
             for (int i = 0; i < width; i++) fputc('-', stdout);
             fputs(ANSI_RESET, stdout);
         }
+        y += h;
+    }
+
+    for (int row = drawn_until + 1; row <= ui->rows; row++) {
+        term_move(row, ui->right_x);
+        term_clear_to_eol();
     }
 }
 
@@ -2438,15 +2539,22 @@ static void tui_draw_parallel_header(eval_ui *ui) {
     char gen[16];
     char line[512];
     format_short_count(gen, sizeof(gen), generated);
+    char worker_view[48] = "";
+    int visible_workers = tui_parallel_visible_workers(ui);
+    if (visible_workers > 0 && visible_workers < ui->parallel_workers) {
+        int first = clamp_int(ui->worker_scroll, 0, ui->parallel_workers - visible_workers);
+        snprintf(worker_view, sizeof(worker_view), "  view W%d-W%d/%d",
+                 first + 1, first + visible_workers, ui->parallel_workers);
+    }
     if (ui->decode_batch_ema_tps > 0.0 && ui->decode_batch_last_n > 0) {
         snprintf(line, sizeof(line),
-                 "parallel live sampled tokens  batch %.1f t/s n%d  Σreq %.2f t/s  wall %.2f t/s  active %d/%d  gen %s",
+                 "parallel live sampled tokens  batch %.1f t/s n%d  Σreq %.2f t/s  wall %.2f t/s  active %d/%d  gen %s%s",
                  ui->decode_batch_ema_tps, ui->decode_batch_last_n,
-                 active_sum_tps, wall_tps, active, ui->parallel_workers, gen);
+                 active_sum_tps, wall_tps, active, ui->parallel_workers, gen, worker_view);
     } else {
         snprintf(line, sizeof(line),
-                 "parallel live sampled tokens  Σreq %.2f t/s  wall %.2f t/s  active %d/%d  gen %s",
-                 active_sum_tps, wall_tps, active, ui->parallel_workers, gen);
+                 "parallel live sampled tokens  Σreq %.2f t/s  wall %.2f t/s  active %d/%d  gen %s%s",
+                 active_sum_tps, wall_tps, active, ui->parallel_workers, gen, worker_view);
     }
     term_move(1, ui->right_x);
     term_clear_to_eol();
@@ -2510,11 +2618,18 @@ static void tui_publish_parallel(eval_ui *ui, const char *phase) {
     }
 
     pthread_mutex_lock(&root->mu);
+    tui_consume_input(root);
     eval_worker_slot *slot = &root->worker_slots[ui->worker_slot];
+    bool changed_case = slot->case_idx != ui->active_case;
     slot->case_idx = ui->active_case;
     if (ui->active_case >= 0 && ui->active_case < root->ncases) {
         slot->status = root->status[ui->active_case];
         slot->prompt_tokens = root->prompt_tokens[ui->active_case];
+        root->active_case = ui->active_case;
+        if (!root->selection_active && changed_case) {
+            root->selected_case = ui->active_case;
+            tui_scroll_worker_into_view(root, ui->worker_slot);
+        }
     } else {
         slot->status = EVAL_PENDING;
         slot->prompt_tokens = 0;

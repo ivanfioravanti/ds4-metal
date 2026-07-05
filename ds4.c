@@ -26297,6 +26297,14 @@ typedef struct {
     ds4_gpu_tensor *router_weights;
     ds4_gpu_tensor *output_norm;
     ds4_gpu_tensor *logits;
+    ds4_gpu_tensor *decode_batch_logits;
+    uint32_t decode_batch_logits_cap;
+    ds4_gpu_tensor *decode_positions;
+    uint32_t decode_positions_cap;
+    ds4_gpu_tensor *decode_packed_kv_lora;
+    ds4_gpu_tensor *decode_packed_k_rope;
+    ds4_gpu_tensor *decode_packed_selected;
+    uint32_t decode_packed_rows_cap;
     ds4_gpu_tensor *batch_router_logits;
     ds4_gpu_tensor *batch_router_probs;
     ds4_gpu_tensor *batch_router_selected;
@@ -27254,6 +27262,11 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
         ds4_gpu_tensor_free(g->layer_value_cache[il]);
         ds4_gpu_tensor_free(g->layer_key_cache[il]);
     }
+    ds4_gpu_tensor_free(g->decode_batch_logits);
+    ds4_gpu_tensor_free(g->decode_positions);
+    ds4_gpu_tensor_free(g->decode_packed_selected);
+    ds4_gpu_tensor_free(g->decode_packed_k_rope);
+    ds4_gpu_tensor_free(g->decode_packed_kv_lora);
     ds4_gpu_tensor_free(g->logits);
     ds4_gpu_tensor_free(g->batch_router_weights);
     ds4_gpu_tensor_free(g->batch_router_selected);
@@ -28784,8 +28797,10 @@ static bool glm_graph_use_flash_attention_staged_kv(
            n_tokens == cache_len;
 }
 
+static __thread bool g_glm_force_indexed_decode;
+
 static bool glm_graph_force_indexed_decode(void) {
-    return false;
+    return g_glm_force_indexed_decode;
 }
 
 static bool glm_graph_disable_indexed_decode(void) {
@@ -32076,7 +32091,7 @@ static bool glm_graph_forward_token(
     const bool use_indexed_attention =
         glm_graph_decode_uses_indexed_attention(g, pos, logits_out);
     uint32_t decode_layer_flush_interval = 0;
-    if (logits_out != NULL) {
+    if (logits_out != NULL || glm_graph_force_indexed_decode()) {
         decode_layer_flush_interval = use_indexed_attention ? 4u : 32u;
         if (decode_layer_flush_interval > g->layer_count) {
             decode_layer_flush_interval = g->layer_count;
@@ -41145,6 +41160,1484 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return ds4_session_eval_internal(s, token, true, err, errlen);
 }
 
+#ifndef DS4_NO_GPU
+#define DS4_GLM_DECODE_BATCH_MAX 32u
+
+static bool glm_graph_ensure_decode_batch_logits(ds4_glm_gpu_graph *g,
+                                                 uint32_t           rows) {
+    if (!g || rows == 0 || rows > DS4_GLM_DECODE_BATCH_MAX) return false;
+    if (g->decode_batch_logits && g->decode_batch_logits_cap >= rows) return true;
+
+    const uint64_t row_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
+    if (row_bytes == 0 || (uint64_t)rows > UINT64_MAX / row_bytes) return false;
+
+    ds4_gpu_tensor_free(g->decode_batch_logits);
+    g->decode_batch_logits = ds4_gpu_tensor_alloc((uint64_t)rows * row_bytes);
+    g->decode_batch_logits_cap = g->decode_batch_logits ? rows : 0;
+    return g->decode_batch_logits != NULL;
+}
+
+static bool glm_graph_ensure_decode_positions(ds4_glm_gpu_graph *g,
+                                              uint32_t           rows) {
+    if (!g || rows == 0 || rows > DS4_GLM_DECODE_BATCH_MAX) return false;
+    if (g->decode_positions && g->decode_positions_cap >= rows) return true;
+
+    if ((uint64_t)rows > UINT64_MAX / sizeof(uint32_t)) return false;
+    ds4_gpu_tensor_free(g->decode_positions);
+    g->decode_positions = ds4_gpu_tensor_alloc((uint64_t)rows * sizeof(uint32_t));
+    g->decode_positions_cap = g->decode_positions ? rows : 0;
+    return g->decode_positions != NULL;
+}
+
+static bool glm_graph_upload_positions(ds4_gpu_tensor *out,
+                                       const uint32_t *positions,
+                                       uint32_t        n_positions) {
+    if (!out || !positions || n_positions == 0) return false;
+    return ds4_gpu_tensor_write(out,
+                                0,
+                                positions,
+                                (uint64_t)n_positions * sizeof(positions[0])) != 0;
+}
+
+static bool glm_graph_ensure_decode_packed_attention(ds4_glm_gpu_graph *g,
+                                                     uint32_t           rows) {
+    if (!g || rows == 0) return false;
+    if (g->decode_packed_rows_cap >= rows &&
+        g->decode_packed_kv_lora &&
+        g->decode_packed_k_rope &&
+        g->decode_packed_selected) {
+        return true;
+    }
+
+    const uint64_t elem_bytes = glm_graph_compact_cache_elem_bytes();
+    const uint64_t kv_row_bytes = (uint64_t)DS4_N_KV_LORA * elem_bytes;
+    const uint64_t rope_row_bytes = (uint64_t)DS4_N_ROT * elem_bytes;
+    if (kv_row_bytes == 0 || rope_row_bytes == 0 ||
+        (uint64_t)rows > UINT64_MAX / kv_row_bytes ||
+        (uint64_t)rows > UINT64_MAX / rope_row_bytes ||
+        (uint64_t)rows > UINT64_MAX / sizeof(uint32_t)) {
+        return false;
+    }
+
+    ds4_gpu_tensor_free(g->decode_packed_kv_lora);
+    ds4_gpu_tensor_free(g->decode_packed_k_rope);
+    ds4_gpu_tensor_free(g->decode_packed_selected);
+    g->decode_packed_kv_lora = ds4_gpu_tensor_alloc((uint64_t)rows * kv_row_bytes);
+    g->decode_packed_k_rope = ds4_gpu_tensor_alloc((uint64_t)rows * rope_row_bytes);
+    g->decode_packed_selected =
+        ds4_gpu_tensor_alloc((uint64_t)rows * sizeof(uint32_t));
+    if (!g->decode_packed_kv_lora ||
+        !g->decode_packed_k_rope ||
+        !g->decode_packed_selected) {
+        ds4_gpu_tensor_free(g->decode_packed_kv_lora);
+        ds4_gpu_tensor_free(g->decode_packed_k_rope);
+        ds4_gpu_tensor_free(g->decode_packed_selected);
+        g->decode_packed_kv_lora = NULL;
+        g->decode_packed_k_rope = NULL;
+        g->decode_packed_selected = NULL;
+        g->decode_packed_rows_cap = 0;
+        return false;
+    }
+    g->decode_packed_rows_cap = rows;
+    return true;
+}
+
+static void ds4_session_batch_glm_mark_invalid(ds4_session **sessions, int n) {
+    for (int i = 0; i < n; i++) {
+        ds4_session *s = sessions[i];
+        if (!s) continue;
+        s->checkpoint_valid = false;
+        s->mtp_draft_valid = false;
+        ds4_session_glm_cap_dense_cache(s);
+    }
+}
+
+static void ds4_session_batch_glm_free_owned_selected(
+        ds4_gpu_tensor **selected,
+        bool            *owned,
+        int              n) {
+    if (!selected || !owned) return;
+    for (int i = 0; i < n; i++) {
+        if (!owned[i]) continue;
+        ds4_gpu_tensor_free(selected[i]);
+        selected[i] = NULL;
+        owned[i] = false;
+    }
+}
+
+static bool ds4_session_batch_glm_profile_enabled(void) {
+    const char *env = getenv("DS4_GLM_BATCH_PROFILE");
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
+static bool ds4_session_batch_glm_ffn_enabled(void) {
+    const char *disable = getenv("DS4_GLM_DISABLE_BATCH_FFN");
+    return !(disable && disable[0] && strcmp(disable, "0") != 0);
+}
+
+static bool ds4_session_batch_glm_packed_attention_enabled(void) {
+    const char *disable = getenv("DS4_GLM_DISABLE_PACKED_BATCH_ATTN");
+    return !(disable && disable[0] && strcmp(disable, "0") != 0);
+}
+
+static bool ds4_session_batch_glm_diagnostics_active(void) {
+    return g_expert_profile.active ||
+           getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL ||
+           getenv("DS4_METAL_LAYER_STAGE_PROFILE") != NULL ||
+           getenv("DS4_METAL_DECODE_STAGE_PROFILE") != NULL ||
+           getenv("DS4_METAL_INDEXER_STAGE_PROFILE") != NULL ||
+           getenv("DS4_METAL_Q_STAGE_PROFILE") != NULL;
+}
+
+static bool glm_graph_decode_layer_finish_indexed_attention_from_tensors(
+        ds4_glm_gpu_graph       *g,
+        const ds4_model         *model,
+        const ds4_layer_weights *l,
+        uint32_t                 il,
+        ds4_gpu_tensor          *heads,
+        ds4_gpu_tensor          *q,
+        ds4_gpu_tensor          *qk_low,
+        ds4_gpu_tensor          *selected,
+        uint32_t                 selected_count) {
+    if (!g || !model || !l || !heads || !q || !qk_low ||
+        !selected || selected_count == 0) {
+        return false;
+    }
+
+    const float rope_base = layer_rope_freq_base(il);
+    const float rope_scale = layer_rope_freq_scale(il);
+    bool ok = true;
+    if (glm_graph_indexed_decode_split_group8_available(selected_count)) {
+        const uint32_t split_block_rows =
+            glm_graph_indexed_decode_split_block_rows_for(selected_count);
+        const uint32_t split_blocks =
+            (selected_count + split_block_rows - 1u) / split_block_rows;
+        ok = ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
+                heads,
+                g->attn_partial_lora,
+                g->attn_partial_ms,
+                q,
+                qk_low,
+                g->layer_kv_lora_cache[il],
+                g->layer_k_rope_cache[il],
+                model->map,
+                model->size,
+                l->attn_v_b->abs_offset,
+                selected,
+                selected_count,
+                true,
+                g->compact_cache_cap,
+                glm_graph_compact_cache_is_f16(),
+                DS4_N_HEAD,
+                DS4_N_KV_LORA,
+                (uint32_t)g->q_nope,
+                DS4_N_ROT,
+                DS4_N_VALUE_MLA,
+                0,
+                split_block_rows,
+                split_blocks,
+                rope_base,
+                rope_scale,
+                0.0f,
+                1.0f,
+                DS4_ROPE_YARN_BETA_FAST,
+                DS4_ROPE_YARN_BETA_SLOW) != 0;
+    } else {
+        ok = ds4_gpu_glm_attention_indexed_decode_tensor(
+                heads,
+                q,
+                qk_low,
+                g->layer_kv_lora_cache[il],
+                g->layer_k_rope_cache[il],
+                model->map,
+                model->size,
+                l->attn_v_b->abs_offset,
+                selected,
+                selected_count,
+                g->compact_cache_cap,
+                glm_graph_compact_cache_is_f16(),
+                DS4_N_HEAD,
+                DS4_N_KV_LORA,
+                (uint32_t)g->q_nope,
+                DS4_N_ROT,
+                DS4_N_VALUE_MLA,
+                0,
+                rope_base,
+                rope_scale,
+                0.0f,
+                1.0f,
+                DS4_ROPE_YARN_BETA_FAST,
+                DS4_ROPE_YARN_BETA_SLOW) != 0;
+    }
+    return ok;
+}
+
+static int ds4_session_batch_glm_finish_indexed_attention_packed(
+        ds4_engine             *e,
+        ds4_session           **sessions,
+        const bool             *use_indexed_attention,
+        ds4_gpu_tensor        **selected,
+        const uint32_t         *selected_count,
+        int                     n,
+        const ds4_layer_weights *l,
+        uint32_t                il,
+        uint32_t                common_selected_count) {
+    if (!e || !sessions || !use_indexed_attention || !selected ||
+        !selected_count || !l || n <= 1 ||
+        common_selected_count == 0 ||
+        !ds4_session_batch_glm_packed_attention_enabled()) {
+        return -1;
+    }
+
+    ds4_glm_gpu_graph *scratch = &sessions[0]->glm_graph;
+    if (!scratch->batch_q ||
+        !scratch->batch_qk_low ||
+        !scratch->batch_attn_lora ||
+        !scratch->batch_heads ||
+        scratch->compact_cache_cap == 0 ||
+        common_selected_count > scratch->compact_cache_cap ||
+        !glm_graph_compact_cache_is_f16() ||
+        DS4_N_KV_LORA != 512u ||
+        DS4_N_ROT != 64u ||
+        (uint64_t)n > UINT32_MAX / (uint64_t)common_selected_count) {
+        return -1;
+    }
+
+    const uint32_t packed_rows =
+        (uint32_t)((uint64_t)n * (uint64_t)common_selected_count);
+    for (int i = 0; i < n; i++) {
+        ds4_glm_gpu_graph *g = &sessions[i]->glm_graph;
+        if (!use_indexed_attention[i] ||
+            selected_count[i] == 0 ||
+            selected_count[i] > common_selected_count ||
+            !selected[i] ||
+            g->compact_cache_cap != scratch->compact_cache_cap ||
+            !g->layer_kv_lora_cache[il] ||
+            !g->layer_k_rope_cache[il]) {
+            return -1;
+        }
+    }
+
+    if (!glm_graph_ensure_decode_packed_attention(scratch, packed_rows)) {
+        return -1;
+    }
+
+    bool ok = true;
+    for (int i = 0; ok && i < n; i++) {
+        ds4_glm_gpu_graph *g = &sessions[i]->glm_graph;
+        const uint32_t dst_row0 = (uint32_t)i * common_selected_count;
+        ok = ds4_gpu_glm_pack_selected_kv_f16_tensor(
+                scratch->decode_packed_kv_lora,
+                scratch->decode_packed_k_rope,
+                scratch->decode_packed_selected,
+                g->layer_kv_lora_cache[il],
+                g->layer_k_rope_cache[il],
+                selected[i],
+                selected_count[i],
+                common_selected_count,
+                g->compact_cache_cap,
+                dst_row0,
+                packed_rows,
+                DS4_N_KV_LORA,
+                DS4_N_ROT) != 0;
+    }
+    const float rope_base = layer_rope_freq_base(il);
+    const float rope_scale = layer_rope_freq_scale(il);
+    if (ok) {
+        ok = ds4_gpu_glm_attention_indexed_batch_lora_packed_tensor(
+                scratch->batch_attn_lora,
+                scratch->batch_q,
+                scratch->batch_qk_low,
+                scratch->decode_packed_kv_lora,
+                scratch->decode_packed_k_rope,
+                scratch->decode_packed_selected,
+                (uint32_t)n,
+                common_selected_count,
+                scratch->compact_cache_cap,
+                DS4_N_HEAD,
+                DS4_N_KV_LORA,
+                (uint32_t)scratch->q_nope,
+                DS4_N_ROT,
+                0,
+                rope_base,
+                rope_scale,
+                0.0f,
+                1.0f,
+                DS4_ROPE_YARN_BETA_FAST,
+                DS4_ROPE_YARN_BETA_SLOW) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_glm_value_project_q8_0_batch_heads_tensor(
+                scratch->batch_heads,
+                scratch->batch_attn_lora,
+                e->model.map,
+                e->model.size,
+                l->attn_v_b->abs_offset,
+                (uint32_t)n,
+                DS4_N_HEAD,
+                DS4_N_KV_LORA,
+                DS4_N_VALUE_MLA) != 0;
+    }
+    return ok ? 1 : -1;
+}
+
+static bool glm_graph_decode_layer_prepare_attention_from_tensors(
+        ds4_glm_gpu_graph       *g,
+        const ds4_model         *model,
+        const ds4_layer_weights *l,
+        uint32_t                 il,
+        uint32_t                 pos,
+        ds4_gpu_tensor          *q,
+        ds4_gpu_tensor          *kv_raw,
+        ds4_gpu_tensor          *kv_norm,
+        ds4_gpu_tensor          *indexer_k,
+        ds4_gpu_tensor          *indexer_q,
+        ds4_gpu_tensor          *indexer_weights,
+        ds4_gpu_tensor          *k_nope,
+        ds4_gpu_tensor          *value,
+        ds4_gpu_tensor          *heads,
+        bool                     use_indexed_attention,
+        bool                     q_rope_ready,
+        bool                     indexer_q_rope_ready,
+        ds4_gpu_tensor          *selected_override,
+        uint32_t                 selected_override_count,
+        ds4_gpu_tensor         **last_indexer_selected,
+        uint32_t                *last_indexer_selected_count) {
+    if (!g || !model || !l || !last_indexer_selected ||
+        !last_indexer_selected_count || !q || !kv_raw || !kv_norm) {
+        return false;
+    }
+
+    const uint32_t kv_raw_dim = (uint32_t)l->attn_kv_a_mqa->dim[1];
+    const float rope_base = layer_rope_freq_base(il);
+    const float rope_scale = layer_rope_freq_scale(il);
+    bool ok = q_rope_ready ||
+              ds4_gpu_glm_rope_tail_tensor(q,
+                                            1,
+                                            DS4_N_HEAD,
+                                            DS4_N_KEY_MLA,
+                                            DS4_N_ROT,
+                                            pos,
+                                            0,
+                                            rope_base,
+                                            rope_scale,
+                                            0.0f,
+                                            1.0f,
+                                            DS4_ROPE_YARN_BETA_FAST,
+                                            DS4_ROPE_YARN_BETA_SLOW) != 0;
+
+    if (ok && g->compact_cache_cap != 0 &&
+        glm_graph_layer_uses_full_indexer(il)) {
+        if (!indexer_k) return false;
+        ok = ds4_gpu_glm_store_indexer_k_tensor(
+                g->layer_indexer_key_cache[il],
+                indexer_k,
+                model->map,
+                model->size,
+                l->indexer_k_norm->abs_offset,
+                l->indexer_k_norm_b->abs_offset,
+                pos,
+                1,
+                g->compact_cache_cap,
+                DS4_N_INDEXER_HEAD_DIM,
+                DS4_N_ROT,
+                0,
+                1.0e-6f,
+                rope_base,
+                rope_scale,
+                0.0f,
+                1.0f,
+                DS4_ROPE_YARN_BETA_FAST,
+                DS4_ROPE_YARN_BETA_SLOW,
+                glm_graph_compact_cache_is_f16()) != 0;
+    }
+    if (ok && g->compact_cache_cap != 0) {
+        ok = ds4_gpu_glm_store_compact_kv_tensor(g->layer_kv_lora_cache[il],
+                                                 g->layer_k_rope_cache[il],
+                                                 kv_norm,
+                                                 kv_raw,
+                                                 pos,
+                                                 1,
+                                                 g->compact_cache_cap,
+                                                 kv_raw_dim,
+                                                 DS4_N_KV_LORA,
+                                                 DS4_N_ROT,
+                                                 glm_graph_compact_cache_is_f16()) != 0;
+    }
+
+    if (use_indexed_attention) {
+        if (ok && glm_graph_layer_uses_full_indexer(il)) {
+            const uint32_t visible = pos + 1u;
+            const uint32_t indexer_top_k = glm_graph_indexer_top_k_limit();
+            const bool use_selected_override =
+                selected_override && selected_override_count != 0;
+            if (use_selected_override) {
+                *last_indexer_selected = selected_override;
+                *last_indexer_selected_count = selected_override_count;
+            } else if (visible <= indexer_top_k) {
+                ok = ds4_gpu_glm_fill_selected_range_tensor(g->indexer_selected,
+                                                            visible) != 0;
+                *last_indexer_selected_count = visible;
+            } else {
+                if (!indexer_q || !indexer_weights) return false;
+                if (ok && !indexer_q_rope_ready) ok = ds4_gpu_glm_indexer_rope_tail_tensor(
+                        indexer_q,
+                        1,
+                        DS4_N_INDEXER_HEAD,
+                        DS4_N_INDEXER_HEAD_DIM,
+                        DS4_N_ROT,
+                        pos,
+                        0,
+                        rope_base,
+                        rope_scale,
+                        0.0f,
+                        1.0f,
+                        DS4_ROPE_YARN_BETA_FAST,
+                        DS4_ROPE_YARN_BETA_SLOW) != 0;
+                if (ok && glm_graph_indexer_qat()) {
+                    ok = ds4_gpu_dsv4_indexer_qat_tensor(indexer_q,
+                                                         DS4_N_INDEXER_HEAD,
+                                                         DS4_N_INDEXER_HEAD_DIM) != 0;
+                }
+                const float indexer_scale =
+                    1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM *
+                                         DS4_N_INDEXER_HEAD));
+                if (ok) ok = ds4_gpu_glm_indexer_score_one_tensor(
+                        g->indexer_scores,
+                        indexer_q,
+                        indexer_weights,
+                        g->layer_indexer_key_cache[il],
+                        visible,
+                        DS4_N_INDEXER_HEAD,
+                        DS4_N_INDEXER_HEAD_DIM,
+                        indexer_scale,
+                        glm_graph_compact_cache_is_f16()) != 0;
+                if (ok) ok = ds4_gpu_indexer_topk_tensor(g->indexer_selected,
+                                                         g->indexer_scores,
+                                                         visible,
+                                                         1,
+                                                         indexer_top_k) != 0;
+                *last_indexer_selected_count = indexer_top_k;
+            }
+            if (ok && !use_selected_override) *last_indexer_selected = g->indexer_selected;
+        } else if (ok && (!*last_indexer_selected ||
+                          *last_indexer_selected_count == 0)) {
+            ok = false;
+        }
+    } else {
+        if (!k_nope || !value || !heads) return false;
+        if (ok) ok = ds4_gpu_glm_build_kv_cache_tensor(
+                g->layer_key_cache[il],
+                g->layer_value_cache[il],
+                kv_raw,
+                k_nope,
+                value,
+                pos,
+                1,
+                g->ctx_cap,
+                DS4_N_HEAD,
+                kv_raw_dim,
+                DS4_N_KV_LORA,
+                (uint32_t)g->q_nope,
+                DS4_N_ROT,
+                DS4_N_VALUE_MLA,
+                0,
+                rope_base,
+                rope_scale,
+                0.0f,
+                1.0f,
+                DS4_ROPE_YARN_BETA_FAST,
+                DS4_ROPE_YARN_BETA_SLOW,
+                true) != 0;
+        if (ok) ok = ds4_gpu_glm_attention_full_tensor(
+                heads,
+                q,
+                g->layer_key_cache[il],
+                g->layer_value_cache[il],
+                pos,
+                1,
+                pos + 1u,
+                g->ctx_cap,
+                DS4_N_HEAD,
+                DS4_N_KEY_MLA,
+                DS4_N_VALUE_MLA,
+                true) != 0;
+    }
+
+    return ok;
+}
+
+static bool ds4_session_batch_glm_output_heads(ds4_engine  *e,
+                                               ds4_session **sessions,
+                                               int          n,
+                                               bool         batch_cur_ready) {
+    if (!e || !sessions || n <= 0) return false;
+
+    ds4_glm_gpu_graph *scratch = &sessions[0]->glm_graph;
+    if (!scratch->batch_cur ||
+        !scratch->batch_ffn_norm ||
+        !scratch->decode_batch_logits ||
+        (uint32_t)n > scratch->decode_batch_logits_cap ||
+        (uint32_t)n > scratch->ctx_cap) {
+        return false;
+    }
+
+    if (scratch->ssd_streaming) {
+        for (int i = 0; i < n; i++) {
+            sessions[i]->glm_graph.streaming_static_decode_map_current = false;
+        }
+        if (!glm_graph_stream_map_output(scratch, &e->model, &e->weights)) {
+            return false;
+        }
+    }
+
+    const uint64_t emb_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    bool ok = glm_graph_begin_commands_if_needed();
+    if (batch_cur_ready) {
+        for (int i = 0; ok && i < n; i++) {
+            ok = ds4_gpu_tensor_copy(sessions[i]->glm_graph.cur,
+                                     0,
+                                     scratch->batch_cur,
+                                     (uint64_t)i * emb_bytes,
+                                     emb_bytes) != 0;
+        }
+    } else {
+        for (int i = 0; ok && i < n; i++) {
+            ok = ds4_gpu_tensor_copy(scratch->batch_cur,
+                                     (uint64_t)i * emb_bytes,
+                                     sessions[i]->glm_graph.cur,
+                                     0,
+                                     emb_bytes) != 0;
+        }
+    }
+    if (ok) {
+        ok = ds4_gpu_rms_norm_weight_rows_tensor(
+                scratch->batch_ffn_norm,
+                scratch->batch_cur,
+                e->model.map,
+                e->model.size,
+                e->weights.output_norm->abs_offset,
+                DS4_N_EMBD,
+                (uint32_t)n,
+                DS4_RMS_EPS) != 0;
+    }
+    if (ok) {
+        ok = glm_graph_matmul_q8_0_tensor(scratch->decode_batch_logits,
+                                          &e->model,
+                                          e->weights.output->abs_offset,
+                                          DS4_N_EMBD,
+                                          DS4_N_VOCAB,
+                                          scratch->batch_ffn_norm,
+                                          (uint32_t)n);
+    }
+    if (ok) ok = glm_graph_end_commands_if_active();
+    else (void)ds4_gpu_synchronize();
+    if (!ok) return false;
+
+    const uint64_t logits_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
+    for (int i = 0; i < n; i++) {
+        if (ds4_gpu_tensor_read(scratch->decode_batch_logits,
+                                (uint64_t)i * logits_bytes,
+                                sessions[i]->logits,
+                                logits_bytes) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int ds4_session_eval_batch_glm_ffn_chunk(ds4_session **sessions,
+                                                const int    *tokens,
+                                                int           n,
+                                                ds4_engine   *e,
+                                                char         *err,
+                                                size_t        errlen) {
+    if (!sessions || !tokens || !e || n <= 1 ||
+        n > (int)DS4_GLM_DECODE_BATCH_MAX ||
+        !ds4_session_batch_glm_ffn_enabled() ||
+        ds4_session_batch_glm_diagnostics_active()) {
+        return -1;
+    }
+
+    ds4_glm_gpu_graph *scratch = &sessions[0]->glm_graph;
+    if (!scratch->prefill_tokens ||
+        !scratch->batch_cur ||
+        !scratch->batch_attn_norm ||
+        !scratch->batch_q_rank ||
+        !scratch->batch_q_rank_norm ||
+        !scratch->batch_q ||
+        !scratch->batch_indexer_k ||
+        (scratch->compact_cache_cap != 0 &&
+         (!scratch->batch_indexer_q ||
+          !scratch->batch_indexer_weights ||
+          !scratch->batch_qk_low ||
+          (uint32_t)n > scratch->indexed_prefill_cap)) ||
+        !scratch->batch_kv_raw ||
+        !scratch->batch_kv_norm ||
+        !scratch->batch_k_nope ||
+        !scratch->batch_value ||
+        !scratch->batch_heads ||
+        !scratch->batch_attn_out ||
+        !scratch->batch_after_attn ||
+        !scratch->batch_next ||
+        (uint32_t)n > scratch->ctx_cap) {
+        return -1;
+    }
+
+    for (uint32_t il = scratch->layer_start; il <= scratch->layer_end; il++) {
+        if (metal_graph_decode_stage_profile_enabled(il)) return -1;
+    }
+
+    uint32_t pos[DS4_GLM_DECODE_BATCH_MAX];
+    bool updates_dense[DS4_GLM_DECODE_BATCH_MAX];
+    bool use_indexed_attention[DS4_GLM_DECODE_BATCH_MAX];
+    ds4_gpu_tensor *last_indexer_selected[DS4_GLM_DECODE_BATCH_MAX];
+    uint32_t last_indexer_selected_count[DS4_GLM_DECODE_BATCH_MAX];
+    bool last_indexer_selected_owned[DS4_GLM_DECODE_BATCH_MAX];
+    memset(last_indexer_selected, 0, sizeof(last_indexer_selected));
+    memset(last_indexer_selected_count, 0, sizeof(last_indexer_selected_count));
+    memset(last_indexer_selected_owned, 0, sizeof(last_indexer_selected_owned));
+
+    const bool profile = ds4_session_batch_glm_profile_enabled();
+    const double t0 = profile ? now_sec() : 0.0;
+    double embed_s = 0.0;
+    double proj_s = 0.0;
+    double prep_s = 0.0;
+    double qk_low_s = 0.0;
+    double attn_s = 0.0;
+    double packed_attn_s = 0.0;
+    double attn_o_s = 0.0;
+    double ffn_s = 0.0;
+    double scatter_s = 0.0;
+    double rope_s = 0.0;
+    uint32_t q_rope_batch_layers = 0;
+    uint32_t indexer_rope_batch_layers = 0;
+    uint32_t selected_range_batch_layers = 0;
+    uint32_t indexed_attn_layers = 0;
+    uint32_t packed_attn_layers = 0;
+    uint32_t packed_attn_fallback_layers = 0;
+    uint32_t mixed_selected_layers = 0;
+    uint32_t max_selected_seen = 0;
+    const bool saved_force_indexed_decode = g_glm_force_indexed_decode;
+    g_glm_force_indexed_decode = true;
+    const bool static_decode_map =
+        scratch->ssd_streaming && metal_graph_stream_decode_static_map_enabled();
+    const bool static_map_state_cache =
+        static_decode_map && metal_graph_stream_decode_static_map_state_cache_enabled();
+
+    bool ok = true;
+    for (int i = 0; ok && i < n; i++) {
+        ds4_session *s = sessions[i];
+        ds4_glm_gpu_graph *g = &s->glm_graph;
+        if (tokens[i] < 0 || tokens[i] >= (int)DS4_N_VOCAB ||
+            g->ssd_streaming != scratch->ssd_streaming ||
+            (uint32_t)s->checkpoint.len >= g->ctx_size) {
+            ok = false;
+            break;
+        }
+        pos[i] = (uint32_t)s->checkpoint.len;
+        use_indexed_attention[i] =
+            glm_graph_decode_uses_indexed_attention(g, pos[i], NULL);
+        updates_dense[i] =
+            glm_graph_decode_updates_dense_cache(g, pos[i], NULL);
+        if (pos[i] >= g->ctx_cap && !use_indexed_attention[i]) {
+            glm_graph_log_full_attention_limit(g, pos[i], 1);
+            ok = false;
+        }
+        if (ok && g->compact_cache_cap != 0) {
+            ok = glm_graph_ensure_compact_cache(g, pos[i] + 1u);
+        }
+    }
+    if (!ok) {
+        g_glm_force_indexed_decode = saved_force_indexed_decode;
+        return -1;
+    }
+
+    if (!glm_graph_ensure_decode_batch_logits(scratch, (uint32_t)n)) {
+        g_glm_force_indexed_decode = saved_force_indexed_decode;
+        if (err && errlen) {
+            snprintf(err, errlen, "%s GLM batch logits scratch allocation failed",
+                     ds4_backend_name(e->backend));
+        }
+        return 1;
+    }
+    if (!glm_graph_ensure_decode_positions(scratch, (uint32_t)n) ||
+        !glm_graph_upload_positions(scratch->decode_positions, pos, (uint32_t)n)) {
+        g_glm_force_indexed_decode = saved_force_indexed_decode;
+        if (err && errlen) {
+            snprintf(err, errlen, "%s GLM batch positions scratch allocation failed",
+                     ds4_backend_name(e->backend));
+        }
+        return 1;
+    }
+
+    if (ok && scratch->ssd_streaming) {
+        if (static_decode_map) {
+            bool need_static_map = !static_map_state_cache;
+            for (int i = 0; i < n && !need_static_map; i++) {
+                if (!sessions[i]->glm_graph.streaming_static_decode_map_current) {
+                    need_static_map = true;
+                }
+            }
+            if (need_static_map) {
+                ok = metal_graph_stream_map_decode_static_all(&e->model, &e->weights);
+                if (ok && static_map_state_cache) {
+                    for (int i = 0; i < n; i++) {
+                        sessions[i]->glm_graph.streaming_static_decode_map_current = true;
+                    }
+                }
+            }
+        } else {
+            for (int i = 0; i < n; i++) {
+                sessions[i]->glm_graph.streaming_static_decode_map_current = false;
+            }
+            ok = glm_graph_stream_map_token(scratch, &e->model, &e->weights);
+        }
+    } else if (ok) {
+        ok = glm_graph_stream_map_token(scratch, &e->model, &e->weights);
+    }
+
+    const double embed_t0 = profile ? now_sec() : 0.0;
+    if (ok) ok = glm_graph_upload_tokens(scratch->prefill_tokens, tokens, (uint32_t)n);
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
+    if (ok) {
+        ok = ds4_gpu_embed_tokens_q8_0_tensor(scratch->batch_cur,
+                                              scratch->prefill_tokens,
+                                              e->model.map,
+                                              e->model.size,
+                                              e->weights.token_embd->abs_offset,
+                                              DS4_N_VOCAB,
+                                              (uint32_t)n,
+                                              DS4_N_EMBD) != 0;
+    }
+    if (profile) embed_s += now_sec() - embed_t0;
+    if (ok && scratch->ssd_streaming && !static_decode_map) {
+        ok = ds4_gpu_end_commands() != 0;
+    }
+
+    for (uint32_t il = scratch->layer_start; ok && il <= scratch->layer_end; il++) {
+        const ds4_layer_weights *l = &e->weights.layer[il];
+        if (scratch->ssd_streaming && !static_decode_map) {
+            ok = glm_graph_stream_map_decode_layer(scratch, &e->model, &e->weights, il);
+            if (ok) ok = ds4_gpu_begin_commands() != 0;
+        }
+        const uint32_t kv_raw_dim = (uint32_t)l->attn_kv_a_mqa->dim[1];
+        const float rope_base = layer_rope_freq_base(il);
+        const float rope_scale = layer_rope_freq_scale(il);
+        const bool layer_full_indexer =
+            scratch->compact_cache_cap != 0 && glm_graph_layer_uses_full_indexer(il);
+        const double proj_t0 = profile ? now_sec() : 0.0;
+        if (ok) {
+            ok = ds4_gpu_rms_norm_weight_rows_tensor(scratch->batch_attn_norm,
+                                                     scratch->batch_cur,
+                                                     e->model.map,
+                                                     e->model.size,
+                                                     l->attn_norm->abs_offset,
+                                                     DS4_N_EMBD,
+                                                     (uint32_t)n,
+                                                     DS4_RMS_EPS) != 0;
+        }
+        if (ok) {
+            ok = glm_graph_matmul_q8_0_tensor(scratch->batch_q_rank,
+                                              &e->model,
+                                              l->attn_q_a->abs_offset,
+                                              DS4_N_EMBD,
+                                              DS4_N_LORA_Q,
+                                              scratch->batch_attn_norm,
+                                              (uint32_t)n);
+        }
+        if (ok) {
+            ok = glm_graph_matmul_q8_0_tensor(scratch->batch_kv_raw,
+                                              &e->model,
+                                              l->attn_kv_a_mqa->abs_offset,
+                                              DS4_N_EMBD,
+                                              kv_raw_dim,
+                                              scratch->batch_attn_norm,
+                                              (uint32_t)n);
+        }
+        if (ok) {
+            ok = ds4_gpu_rms_norm_weight_rows_tensor(scratch->batch_q_rank_norm,
+                                                     scratch->batch_q_rank,
+                                                     e->model.map,
+                                                     e->model.size,
+                                                     l->attn_q_a_norm->abs_offset,
+                                                     DS4_N_LORA_Q,
+                                                     (uint32_t)n,
+                                                     DS4_RMS_EPS) != 0;
+        }
+        if (ok) {
+            ok = ds4_gpu_glm_kv_lora_rms_norm_tensor(scratch->batch_kv_norm,
+                                                     scratch->batch_kv_raw,
+                                                     e->model.map,
+                                                     e->model.size,
+                                                     l->attn_kv_a_norm->abs_offset,
+                                                     (uint32_t)n,
+                                                     kv_raw_dim,
+                                                     DS4_N_KV_LORA,
+                                                     DS4_RMS_EPS) != 0;
+        }
+        if (ok) {
+            ok = glm_graph_matmul_q8_0_tensor(scratch->batch_q,
+                                              &e->model,
+                                              l->attn_q_b->abs_offset,
+                                              DS4_N_LORA_Q,
+                                              scratch->q_dim,
+                                              scratch->batch_q_rank_norm,
+                                              (uint32_t)n);
+        }
+        if (ok && layer_full_indexer) {
+            ok = glm_graph_matmul_q8_0_tensor(scratch->batch_indexer_k,
+                                              &e->model,
+                                              l->indexer_attn_k->abs_offset,
+                                              DS4_N_EMBD,
+                                              DS4_N_INDEXER_HEAD_DIM,
+                                              scratch->batch_cur,
+                                              (uint32_t)n);
+        }
+        bool need_indexer_query = false;
+        uint32_t range_selected_count = 0;
+        const uint32_t indexer_top_k = glm_graph_indexer_top_k_limit();
+        if (layer_full_indexer) {
+            for (int i = 0; i < n; i++) {
+                if (!use_indexed_attention[i]) continue;
+                const uint32_t visible = pos[i] + 1u;
+                if (visible > indexer_top_k) {
+                    need_indexer_query = true;
+                    break;
+                }
+                if (visible > range_selected_count) {
+                    range_selected_count = visible;
+                }
+            }
+        }
+        const uint64_t indexer_q_dim =
+            (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+        if (ok && need_indexer_query) {
+            ok = glm_graph_matmul_q8_0_tensor(scratch->batch_indexer_q,
+                                              &e->model,
+                                              l->indexer_attn_q_b->abs_offset,
+                                              DS4_N_LORA_Q,
+                                              indexer_q_dim,
+                                              scratch->batch_q_rank_norm,
+                                              (uint32_t)n);
+        }
+        if (ok && need_indexer_query) {
+            ok = ds4_gpu_matmul_f32_tensor(scratch->batch_indexer_weights,
+                                           e->model.map,
+                                           e->model.size,
+                                           l->indexer_proj->abs_offset,
+                                           DS4_N_EMBD,
+                                           DS4_N_INDEXER_HEAD,
+                                           scratch->batch_cur,
+                                           (uint32_t)n) != 0;
+        }
+        bool batch_q_rope_ready = false;
+        bool batch_indexer_q_rope_ready = false;
+        const double rope_t0 = profile ? now_sec() : 0.0;
+        if (ok) {
+            batch_q_rope_ready =
+                ds4_gpu_glm_rope_tail_positions_tensor(
+                        scratch->batch_q,
+                        scratch->decode_positions,
+                        (uint32_t)n,
+                        DS4_N_HEAD,
+                        DS4_N_KEY_MLA,
+                        DS4_N_ROT,
+                        0,
+                        rope_base,
+                        rope_scale,
+                        0.0f,
+                        1.0f,
+                        DS4_ROPE_YARN_BETA_FAST,
+                        DS4_ROPE_YARN_BETA_SLOW) != 0;
+        }
+        if (ok && need_indexer_query) {
+            batch_indexer_q_rope_ready =
+                ds4_gpu_glm_indexer_rope_tail_positions_tensor(
+                        scratch->batch_indexer_q,
+                        scratch->decode_positions,
+                        (uint32_t)n,
+                        DS4_N_INDEXER_HEAD,
+                        DS4_N_INDEXER_HEAD_DIM,
+                        DS4_N_ROT,
+                        0,
+                        rope_base,
+                        rope_scale,
+                        0.0f,
+                        1.0f,
+                        DS4_ROPE_YARN_BETA_FAST,
+                        DS4_ROPE_YARN_BETA_SLOW) != 0;
+        }
+        if (profile) {
+            rope_s += now_sec() - rope_t0;
+            if (batch_q_rope_ready) q_rope_batch_layers++;
+            if (batch_indexer_q_rope_ready) indexer_rope_batch_layers++;
+        }
+        ds4_gpu_tensor *selected_override[DS4_GLM_DECODE_BATCH_MAX];
+        uint32_t selected_override_count[DS4_GLM_DECODE_BATCH_MAX];
+        memset(selected_override, 0, sizeof(selected_override));
+        memset(selected_override_count, 0, sizeof(selected_override_count));
+        bool selected_range_ready =
+            ok &&
+            layer_full_indexer &&
+            range_selected_count != 0 &&
+            !need_indexer_query &&
+            scratch->batch_indexer_selected &&
+            ds4_gpu_glm_fill_selected_range_positions_tensor(
+                    scratch->batch_indexer_selected,
+                    scratch->decode_positions,
+                    (uint32_t)n,
+                    range_selected_count,
+                    scratch->compact_cache_cap) != 0;
+        if (selected_range_ready) {
+            const uint64_t selected_row_bytes =
+                (uint64_t)range_selected_count * sizeof(uint32_t);
+            for (int i = 0; selected_range_ready && i < n; i++) {
+                if (!use_indexed_attention[i]) continue;
+                selected_override[i] =
+                    ds4_gpu_tensor_view(scratch->batch_indexer_selected,
+                                        (uint64_t)i * selected_row_bytes,
+                                        selected_row_bytes);
+                selected_override_count[i] = pos[i] + 1u;
+                if (!selected_override[i]) selected_range_ready = false;
+            }
+            if (!selected_range_ready) {
+                for (int i = 0; i < n; i++) {
+                    ds4_gpu_tensor_free(selected_override[i]);
+                    selected_override[i] = NULL;
+                    selected_override_count[i] = 0;
+                }
+            }
+        }
+        if (layer_full_indexer) {
+            for (int i = 0; i < n; i++) {
+                if (last_indexer_selected_owned[i]) {
+                    ds4_gpu_tensor_free(last_indexer_selected[i]);
+                    last_indexer_selected[i] = NULL;
+                    last_indexer_selected_count[i] = 0;
+                    last_indexer_selected_owned[i] = false;
+                }
+            }
+        }
+        if (profile && selected_range_ready) selected_range_batch_layers++;
+        bool need_full_kv = false;
+        for (int i = 0; i < n; i++) {
+            if (!use_indexed_attention[i]) {
+                need_full_kv = true;
+                break;
+            }
+        }
+        if (ok && need_full_kv) {
+            ok = ds4_gpu_glm_k_b_project_tensor(scratch->batch_k_nope,
+                                                scratch->batch_kv_norm,
+                                                e->model.map,
+                                                e->model.size,
+                                                l->attn_k_b->abs_offset,
+                                                (uint32_t)n,
+                                                DS4_N_KV_LORA,
+                                                (uint32_t)scratch->q_nope,
+                                                DS4_N_HEAD) != 0;
+        }
+        if (ok && need_full_kv) {
+            ok = glm_graph_matmul_q8_0_tensor(scratch->batch_value,
+                                              &e->model,
+                                              l->attn_v_b->abs_offset,
+                                              DS4_N_KV_LORA,
+                                              scratch->heads_dim,
+                                              scratch->batch_kv_norm,
+                                              (uint32_t)n);
+        }
+        const uint64_t q_bytes = scratch->q_dim * sizeof(float);
+        const uint64_t kv_raw_bytes = (uint64_t)kv_raw_dim * sizeof(float);
+        const uint64_t kv_norm_bytes = (uint64_t)DS4_N_KV_LORA * sizeof(float);
+        const uint64_t indexer_k_bytes =
+            (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+        const uint64_t indexer_q_bytes = indexer_q_dim * sizeof(float);
+        const uint64_t indexer_weights_bytes =
+            (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float);
+        const uint64_t k_nope_bytes =
+            (uint64_t)DS4_N_HEAD * scratch->q_nope * sizeof(float);
+        const uint64_t value_bytes = scratch->heads_dim * sizeof(float);
+        if (profile) proj_s += now_sec() - proj_t0;
+        const double prep_t0 = profile ? now_sec() : 0.0;
+        for (int i = 0; ok && i < n; i++) {
+            ds4_gpu_tensor *q_view =
+                ds4_gpu_tensor_view(scratch->batch_q,
+                                    (uint64_t)i * q_bytes,
+                                    q_bytes);
+            ds4_gpu_tensor *kv_raw_view =
+                ds4_gpu_tensor_view(scratch->batch_kv_raw,
+                                    (uint64_t)i * kv_raw_bytes,
+                                    kv_raw_bytes);
+            ds4_gpu_tensor *kv_norm_view =
+                ds4_gpu_tensor_view(scratch->batch_kv_norm,
+                                    (uint64_t)i * kv_norm_bytes,
+                                    kv_norm_bytes);
+            ds4_gpu_tensor *indexer_k_view = layer_full_indexer ?
+                ds4_gpu_tensor_view(scratch->batch_indexer_k,
+                                    (uint64_t)i * indexer_k_bytes,
+                                    indexer_k_bytes) :
+                NULL;
+            ds4_gpu_tensor *indexer_q_view = need_indexer_query ?
+                ds4_gpu_tensor_view(scratch->batch_indexer_q,
+                                    (uint64_t)i * indexer_q_bytes,
+                                    indexer_q_bytes) :
+                NULL;
+            ds4_gpu_tensor *indexer_weights_view = need_indexer_query ?
+                ds4_gpu_tensor_view(scratch->batch_indexer_weights,
+                                    (uint64_t)i * indexer_weights_bytes,
+                                    indexer_weights_bytes) :
+                NULL;
+            ds4_gpu_tensor *k_nope_view = need_full_kv ?
+                ds4_gpu_tensor_view(scratch->batch_k_nope,
+                                    (uint64_t)i * k_nope_bytes,
+                                    k_nope_bytes) :
+                NULL;
+            ds4_gpu_tensor *value_view = need_full_kv ?
+                ds4_gpu_tensor_view(scratch->batch_value,
+                                    (uint64_t)i * value_bytes,
+                                    value_bytes) :
+                NULL;
+            ds4_gpu_tensor *heads_view =
+                ds4_gpu_tensor_view(scratch->batch_heads,
+                                    (uint64_t)i * value_bytes,
+                                    value_bytes);
+            ok = q_view && kv_raw_view && kv_norm_view && heads_view &&
+                 (!layer_full_indexer || indexer_k_view) &&
+                 (!need_indexer_query ||
+                  (indexer_q_view && indexer_weights_view)) &&
+                 (!need_full_kv || (k_nope_view && value_view));
+            if (ok) ok = glm_graph_decode_layer_prepare_attention_from_tensors(
+                    &sessions[i]->glm_graph,
+                    &e->model,
+                    l,
+                    il,
+                    pos[i],
+                    q_view,
+                    kv_raw_view,
+                    kv_norm_view,
+                    indexer_k_view,
+                    indexer_q_view,
+                    indexer_weights_view,
+                    k_nope_view,
+                    value_view,
+                    heads_view,
+                    use_indexed_attention[i],
+                    batch_q_rope_ready,
+                    batch_indexer_q_rope_ready,
+                    selected_override[i],
+                    selected_override_count[i],
+                    &last_indexer_selected[i],
+                    &last_indexer_selected_count[i]);
+            ds4_gpu_tensor_free(heads_view);
+            ds4_gpu_tensor_free(value_view);
+            ds4_gpu_tensor_free(k_nope_view);
+            ds4_gpu_tensor_free(indexer_weights_view);
+            ds4_gpu_tensor_free(indexer_q_view);
+            ds4_gpu_tensor_free(indexer_k_view);
+            ds4_gpu_tensor_free(kv_norm_view);
+            ds4_gpu_tensor_free(kv_raw_view);
+            ds4_gpu_tensor_free(q_view);
+            if (ok && selected_override[i]) {
+                last_indexer_selected_owned[i] = true;
+            } else {
+                ds4_gpu_tensor_free(selected_override[i]);
+                selected_override[i] = NULL;
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            if (selected_override[i] &&
+                (!last_indexer_selected_owned[i] ||
+                 last_indexer_selected[i] != selected_override[i])) {
+                ds4_gpu_tensor_free(selected_override[i]);
+                selected_override[i] = NULL;
+            }
+        }
+        if (profile) prep_s += now_sec() - prep_t0;
+        bool need_qk_low = false;
+        for (int i = 0; ok && i < n; i++) {
+            if (use_indexed_attention[i]) {
+                need_qk_low = true;
+                break;
+            }
+        }
+        const uint64_t qk_low_bytes =
+            (uint64_t)DS4_N_HEAD * DS4_N_KV_LORA * sizeof(float);
+        const double qk_low_t0 = profile ? now_sec() : 0.0;
+        if (ok && need_qk_low) {
+            ok = ds4_gpu_glm_qk_lowrank_q8_0_batch_tensor(
+                    scratch->batch_qk_low,
+                    scratch->batch_q,
+                    e->model.map,
+                    e->model.size,
+                    l->attn_k_b->abs_offset,
+                    (uint32_t)n,
+                    DS4_N_HEAD,
+                    DS4_N_KV_LORA,
+                    (uint32_t)scratch->q_nope,
+                    DS4_N_KEY_MLA) != 0;
+        }
+        if (profile) qk_low_s += now_sec() - qk_low_t0;
+        bool heads_ready_in_batch = false;
+        bool can_pack_indexed_attention = need_qk_low;
+        uint32_t common_selected_count = 0;
+        uint32_t min_selected_count = UINT32_MAX;
+        for (int i = 0; ok && can_pack_indexed_attention && i < n; i++) {
+            if (!use_indexed_attention[i] ||
+                !last_indexer_selected[i] ||
+                last_indexer_selected_count[i] == 0) {
+                can_pack_indexed_attention = false;
+                break;
+            }
+            if (last_indexer_selected_count[i] < min_selected_count) {
+                min_selected_count = last_indexer_selected_count[i];
+            }
+            if (last_indexer_selected_count[i] > common_selected_count) {
+                common_selected_count = last_indexer_selected_count[i];
+            }
+        }
+        if (profile && need_qk_low) {
+            indexed_attn_layers++;
+            if (can_pack_indexed_attention) {
+                if (common_selected_count > max_selected_seen) {
+                    max_selected_seen = common_selected_count;
+                }
+                if (min_selected_count != UINT32_MAX &&
+                    min_selected_count != common_selected_count) {
+                    mixed_selected_layers++;
+                }
+            }
+        }
+        if (ok && can_pack_indexed_attention) {
+            const double packed_attn_t0 = profile ? now_sec() : 0.0;
+            const int packed_rc =
+                ds4_session_batch_glm_finish_indexed_attention_packed(
+                        e,
+                        sessions,
+                        use_indexed_attention,
+                        last_indexer_selected,
+                        last_indexer_selected_count,
+                        n,
+                        l,
+                        il,
+                        common_selected_count);
+            if (packed_rc > 0) {
+                heads_ready_in_batch = true;
+                if (profile) {
+                    packed_attn_s += now_sec() - packed_attn_t0;
+                    packed_attn_layers++;
+                }
+            } else if (profile) {
+                packed_attn_fallback_layers++;
+            }
+        }
+        for (int i = 0; ok && !heads_ready_in_batch && i < n; i++) {
+            if (!use_indexed_attention[i]) continue;
+            const double serial_attn_t0 = profile ? now_sec() : 0.0;
+            ds4_gpu_tensor *q_view =
+                ds4_gpu_tensor_view(scratch->batch_q,
+                                    (uint64_t)i * q_bytes,
+                                    q_bytes);
+            ds4_gpu_tensor *qk_low_view =
+                ds4_gpu_tensor_view(scratch->batch_qk_low,
+                                    (uint64_t)i * qk_low_bytes,
+                                    qk_low_bytes);
+            ds4_gpu_tensor *heads_view =
+                ds4_gpu_tensor_view(scratch->batch_heads,
+                                    (uint64_t)i * value_bytes,
+                                    value_bytes);
+            ok = q_view && qk_low_view && heads_view;
+            if (ok) ok = glm_graph_decode_layer_finish_indexed_attention_from_tensors(
+                    &sessions[i]->glm_graph,
+                    &e->model,
+                    l,
+                    il,
+                    heads_view,
+                    q_view,
+                    qk_low_view,
+                    last_indexer_selected[i],
+                    last_indexer_selected_count[i]);
+            ds4_gpu_tensor_free(heads_view);
+            ds4_gpu_tensor_free(qk_low_view);
+            ds4_gpu_tensor_free(q_view);
+            if (profile) attn_s += now_sec() - serial_attn_t0;
+        }
+        if (ok && !heads_ready_in_batch) heads_ready_in_batch = true;
+        const double attn_o_t0 = profile ? now_sec() : 0.0;
+        if (ok) {
+            ok = glm_graph_matmul_q8_0_tensor(scratch->batch_attn_out,
+                                              &e->model,
+                                              l->attn_output->abs_offset,
+                                              scratch->heads_dim,
+                                              DS4_N_EMBD,
+                                              scratch->batch_heads,
+                                              (uint32_t)n);
+        }
+        if (ok) {
+            ok = ds4_gpu_add_tensor(scratch->batch_after_attn,
+                                    scratch->batch_cur,
+                                    scratch->batch_attn_out,
+                                    (uint32_t)((uint64_t)n * DS4_N_EMBD)) != 0;
+        }
+        if (profile) attn_o_s += now_sec() - attn_o_t0;
+        const double ffn_t0 = profile ? now_sec() : 0.0;
+        if (ok) {
+            ok = glm_graph_encode_ffn_batch(scratch,
+                                            &e->model,
+                                            l,
+                                            il,
+                                            pos[0],
+                                            scratch->batch_after_attn,
+                                            scratch->batch_next,
+                                            (uint32_t)n,
+                                            false,
+                                            false,
+                                            NULL);
+        }
+        if (profile) ffn_s += now_sec() - ffn_t0;
+        const double scatter_t0 = profile ? now_sec() : 0.0;
+        if (ok) {
+            ds4_gpu_tensor *tmp = scratch->batch_cur;
+            scratch->batch_cur = scratch->batch_next;
+            scratch->batch_next = tmp;
+        }
+        if (profile) scatter_s += now_sec() - scatter_t0;
+        const uint32_t slice_done = il - scratch->layer_start + 1u;
+        if (ok && scratch->ssd_streaming && !static_decode_map) {
+            ok = ds4_gpu_end_commands() != 0;
+        } else if (ok && il < scratch->layer_end && (slice_done % 4u) == 0u) {
+            ok = ds4_gpu_flush_commands() != 0;
+        }
+    }
+
+    if (ok && (!scratch->ssd_streaming || static_decode_map)) {
+        ok = ds4_gpu_end_commands() != 0;
+    } else if (!ok) {
+        (void)ds4_gpu_synchronize();
+    }
+    g_glm_force_indexed_decode = saved_force_indexed_decode;
+
+    if (!ok) {
+        ds4_session_batch_glm_free_owned_selected(last_indexer_selected,
+                                                  last_indexer_selected_owned,
+                                                  n);
+        if (err && errlen) {
+            snprintf(err, errlen, "%s GLM batch FFN decode failed",
+                     ds4_backend_name(e->backend));
+        }
+        ds4_session_batch_glm_mark_invalid(sessions, n);
+        return 1;
+    }
+    const double body_done = profile ? now_sec() : 0.0;
+
+    if (!ds4_session_batch_glm_output_heads(e, sessions, n, true)) {
+        ds4_session_batch_glm_free_owned_selected(last_indexer_selected,
+                                                  last_indexer_selected_owned,
+                                                  n);
+        if (err && errlen) {
+            snprintf(err, errlen, "%s GLM batch output failed",
+                     ds4_backend_name(e->backend));
+        }
+        ds4_session_batch_glm_mark_invalid(sessions, n);
+        return 1;
+    }
+    const double output_done = profile ? now_sec() : 0.0;
+    ds4_session_batch_glm_free_owned_selected(last_indexer_selected,
+                                              last_indexer_selected_owned,
+                                              n);
+    if (profile) {
+        fprintf(stderr,
+                "ds4: GLM decode proj+qk-low+packed-attn-o+FFN-batch n=%d body=%.3f ms embed=%.3f ms proj=%.3f ms rope=%.3f ms prep=%.3f ms qk_low=%.3f ms attn=%.3f ms packed_attn=%.3f ms attn_o=%.3f ms ffn=%.3f ms scatter=%.3f ms output=%.3f ms total=%.3f ms q_rope_batch=%u indexer_rope_batch=%u selected_range_batch=%u indexed_layers=%u packed_layers=%u packed_fallback=%u mixed_sel_layers=%u max_sel=%u\n",
+                n,
+                (body_done - t0) * 1000.0,
+                embed_s * 1000.0,
+                proj_s * 1000.0,
+                rope_s * 1000.0,
+                prep_s * 1000.0,
+                qk_low_s * 1000.0,
+                attn_s * 1000.0,
+                packed_attn_s * 1000.0,
+                attn_o_s * 1000.0,
+                ffn_s * 1000.0,
+                scatter_s * 1000.0,
+                (output_done - body_done) * 1000.0,
+                (output_done - t0) * 1000.0,
+                q_rope_batch_layers,
+                indexer_rope_batch_layers,
+                selected_range_batch_layers,
+                indexed_attn_layers,
+                packed_attn_layers,
+                packed_attn_fallback_layers,
+                mixed_selected_layers,
+                max_selected_seen);
+    }
+
+    for (int i = 0; i < n; i++) {
+        ds4_session *s = sessions[i];
+        token_vec_push(&s->checkpoint, tokens[i]);
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        if (updates_dense[i]) ds4_session_glm_note_dense_cache(s, pos[i], 1);
+    }
+    return 0;
+}
+
+static int ds4_session_eval_batch_glm_chunk(ds4_session **sessions,
+                                            const int    *tokens,
+                                            int           n,
+                                            ds4_engine   *e,
+                                            char         *err,
+                                            size_t        errlen) {
+    if (!sessions || !tokens || !e || n <= 0) return -1;
+    if (n == 1) return ds4_session_eval(sessions[0], tokens[0], err, errlen);
+    if (n > (int)DS4_GLM_DECODE_BATCH_MAX) return -1;
+    if (ds4_session_batch_glm_diagnostics_active()) return -1;
+
+    int ffn_batch_rc = ds4_session_eval_batch_glm_ffn_chunk(sessions,
+                                                            tokens,
+                                                            n,
+                                                            e,
+                                                            err,
+                                                            errlen);
+    if (ffn_batch_rc >= 0) return ffn_batch_rc;
+
+    ds4_glm_gpu_graph *scratch = &sessions[0]->glm_graph;
+    if (!glm_graph_ensure_decode_batch_logits(scratch, (uint32_t)n)) {
+        if (err && errlen) {
+            snprintf(err, errlen, "%s GLM batch logits scratch allocation failed",
+                     ds4_backend_name(e->backend));
+        }
+        return 1;
+    }
+
+    const bool profile = ds4_session_batch_glm_profile_enabled();
+    const double t0 = profile ? now_sec() : 0.0;
+    bool updates_dense[DS4_GLM_DECODE_BATCH_MAX];
+    uint32_t pos[DS4_GLM_DECODE_BATCH_MAX];
+    const bool saved_force_indexed_decode = g_glm_force_indexed_decode;
+    g_glm_force_indexed_decode = true;
+    for (int i = 0; i < n; i++) {
+        ds4_session *s = sessions[i];
+        pos[i] = (uint32_t)s->checkpoint.len;
+        updates_dense[i] =
+            glm_graph_decode_updates_dense_cache(&s->glm_graph, pos[i], NULL);
+        if (!glm_graph_forward_token(&s->glm_graph,
+                                     &e->model,
+                                     &e->weights,
+                                     tokens[i],
+                                     NULL,
+                                     pos[i],
+                                     NULL,
+                                     NULL)) {
+            g_glm_force_indexed_decode = saved_force_indexed_decode;
+            if (err && errlen) {
+                snprintf(err, errlen, "%s GLM decode failed",
+                         ds4_backend_name(e->backend));
+            }
+            ds4_session_batch_glm_mark_invalid(sessions, i + 1);
+            return 1;
+        }
+    }
+    g_glm_force_indexed_decode = saved_force_indexed_decode;
+    const double body_done = profile ? now_sec() : 0.0;
+
+    if (!ds4_session_batch_glm_output_heads(e, sessions, n, false)) {
+        if (err && errlen) {
+            snprintf(err, errlen, "%s GLM batch output failed",
+                     ds4_backend_name(e->backend));
+        }
+        ds4_session_batch_glm_mark_invalid(sessions, n);
+        return 1;
+    }
+    const double output_done = profile ? now_sec() : 0.0;
+    if (profile) {
+        fprintf(stderr,
+                "ds4: GLM decode batch n=%d body=%.3f ms output=%.3f ms total=%.3f ms\n",
+                n,
+                (body_done - t0) * 1000.0,
+                (output_done - body_done) * 1000.0,
+                (output_done - t0) * 1000.0);
+    }
+
+    for (int i = 0; i < n; i++) {
+        ds4_session *s = sessions[i];
+        token_vec_push(&s->checkpoint, tokens[i]);
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        if (updates_dense[i]) ds4_session_glm_note_dense_cache(s, pos[i], 1);
+    }
+    return 0;
+}
+
+static int ds4_session_eval_batch_glm(ds4_session **sessions,
+                                      const int    *tokens,
+                                      int           n,
+                                      char         *err,
+                                      size_t        errlen) {
+    if (!sessions || !tokens || n <= 1) return -1;
+
+    ds4_session *first = sessions[0];
+    if (!ds4_session_is_glm(first) ||
+        ds4_session_is_cpu(first) ||
+        first->distributed ||
+        !first->engine ||
+        !first->glm_graph_ready ||
+        !first->glm_graph.has_output_head ||
+        !first->glm_graph.batch_cur ||
+        !first->glm_graph.batch_ffn_norm ||
+        first->glm_graph.ctx_cap < 2) {
+        return -1;
+    }
+
+    ds4_engine *e = first->engine;
+    const ds4_glm_gpu_graph *ref = &first->glm_graph;
+    for (int i = 0; i < n; i++) {
+        ds4_session *s = sessions[i];
+        if (!s ||
+            s->engine != e ||
+            s->distributed ||
+            ds4_session_is_cpu(s) ||
+            !ds4_session_is_glm(s) ||
+            !s->glm_graph_ready ||
+            !s->glm_graph.has_output_head ||
+            !s->glm_graph.batch_cur ||
+            !s->glm_graph.batch_ffn_norm ||
+            s->glm_graph.layer_start != ref->layer_start ||
+            s->glm_graph.layer_end != ref->layer_end ||
+            s->glm_graph.ctx_size != ref->ctx_size ||
+            s->glm_graph.ctx_cap != ref->ctx_cap ||
+            s->glm_graph.compact_cache_cap != ref->compact_cache_cap ||
+            s->glm_graph.indexer_full_layers != ref->indexer_full_layers ||
+            s->glm_graph.q_dim != ref->q_dim ||
+            s->glm_graph.heads_dim != ref->heads_dim ||
+            s->glm_graph.kv_raw_dim != ref->kv_raw_dim ||
+            s->glm_graph.ssd_streaming != ref->ssd_streaming ||
+            (uint32_t)s->checkpoint.len >= s->glm_graph.ctx_size) {
+            return -1;
+        }
+    }
+
+    uint32_t max_chunk = DS4_GLM_DECODE_BATCH_MAX;
+    if (max_chunk > ref->ctx_cap) max_chunk = ref->ctx_cap;
+    if (max_chunk < 2) return -1;
+
+    int done = 0;
+    while (done < n) {
+        int chunk = n - done;
+        if (chunk > (int)max_chunk) chunk = (int)max_chunk;
+        int rc = ds4_session_eval_batch_glm_chunk(sessions + done,
+                                                  tokens + done,
+                                                  chunk,
+                                                  e,
+                                                  err,
+                                                  errlen);
+        if (rc != 0) return rc;
+        done += chunk;
+    }
+    return 0;
+}
+#endif
+
 int ds4_session_eval_batch(ds4_session **sessions, const int *tokens, int n,
                            char *err, size_t errlen) {
     if (!sessions || !tokens || n <= 0) {
@@ -41157,6 +42650,10 @@ int ds4_session_eval_batch(ds4_session **sessions, const int *tokens, int n,
             return 1;
         }
     }
+#ifndef DS4_NO_GPU
+    int glm_batch_rc = ds4_session_eval_batch_glm(sessions, tokens, n, err, errlen);
+    if (glm_batch_rc >= 0) return glm_batch_rc;
+#endif
     for (int i = 0; i < n; i++) {
         if (ds4_session_eval(sessions[i], tokens[i], err, errlen) != 0) return 1;
     }

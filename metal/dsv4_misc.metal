@@ -206,6 +206,16 @@ struct ds4_metal_args_glm_fill_selected_range_batch {
     uint32_t pad_row;
 };
 
+struct ds4_metal_args_glm_pack_selected_kv {
+    uint32_t src_n_selected;
+    uint32_t dst_n_selected;
+    uint32_t src_cache_cap;
+    uint32_t dst_row0;
+    uint32_t dst_cache_cap;
+    uint32_t kv_lora_dim;
+    uint32_t qk_rope;
+};
+
 struct ds4_metal_args_glm_indexer_rope_tail {
     uint32_t n_tokens;
     uint32_t n_head;
@@ -1381,6 +1391,68 @@ kernel void kernel_glm_fill_selected_range_batch(
     selected[gid] = slot < visible ? slot : args.pad_row;
 }
 
+kernel void kernel_glm_fill_selected_range_positions(
+        constant ds4_metal_args_glm_fill_selected_range_batch & args,
+        device const uint32_t *positions,
+        device uint32_t *selected,
+        uint gid [[thread_position_in_grid]]) {
+    const uint total = args.n_tokens * args.n_selected;
+    if (gid >= total || args.n_selected == 0u) return;
+    const uint token = gid / args.n_selected;
+    const uint slot = gid - token * args.n_selected;
+    const uint visible = positions[token] + 1u;
+    selected[gid] = slot < visible ? slot : args.pad_row;
+}
+
+kernel void kernel_glm_pack_selected_kv_f16(
+        constant ds4_metal_args_glm_pack_selected_kv & args,
+        device const uint32_t *src_selected,
+        device const char *src_kv_lora_cache,
+        device const char *src_k_rope_cache,
+        device uint32_t *dst_selected,
+        device char *dst_kv_lora_cache,
+        device char *dst_k_rope_cache,
+        ushort tid_u [[thread_index_in_threadgroup]],
+        uint2 tgpig [[threadgroup_position_in_grid]]) {
+    const uint slot = tgpig.x;
+    const uint part = tgpig.y;
+    const uint tid = (uint)tid_u;
+    if (slot >= args.dst_n_selected || part > 1u) return;
+
+    const bool has_src = slot < args.src_n_selected;
+    const uint src_row = has_src ? src_selected[slot] : args.src_cache_cap;
+    const uint dst_row = args.dst_row0 + slot;
+    if (dst_row >= args.dst_cache_cap) return;
+    if (part == 0u && tid == 0u) {
+        dst_selected[dst_row] = src_row;
+    }
+
+    const bool valid = src_row < args.src_cache_cap;
+    if (part == 0u) {
+        device half4 *dst =
+            (device half4 *)((device half *)dst_kv_lora_cache +
+                (uint64_t)dst_row * args.kv_lora_dim);
+        device const half4 *src =
+            (device const half4 *)((device const half *)src_kv_lora_cache +
+                (uint64_t)(valid ? src_row : 0u) * args.kv_lora_dim);
+        const uint n4 = args.kv_lora_dim >> 2;
+        for (uint i = tid; i < n4; i += 256u) {
+            dst[i] = valid ? src[i] : half4(half(0.0f));
+        }
+    } else {
+        device half4 *dst =
+            (device half4 *)((device half *)dst_k_rope_cache +
+                (uint64_t)dst_row * args.qk_rope);
+        device const half4 *src =
+            (device const half4 *)((device const half *)src_k_rope_cache +
+                (uint64_t)(valid ? src_row : 0u) * args.qk_rope);
+        const uint n4 = args.qk_rope >> 2;
+        for (uint i = tid; i < n4; i += 256u) {
+            dst[i] = valid ? src[i] : half4(half(0.0f));
+        }
+    }
+}
+
 kernel void kernel_glm_indexer_rope_tail_f32(
         constant ds4_metal_args_glm_indexer_rope_tail & args,
         device char *x,
@@ -1395,6 +1467,62 @@ kernel void kernel_glm_indexer_rope_tail_f32(
 
     const uint nth = ntg_u.x;
     const uint pos = args.pos0 + token;
+    device float *row =
+        (device float *)(x +
+            ((uint64_t)token * args.n_head + head) * args.head_dim * sizeof(float));
+    row += args.rot_offset;
+
+    float corr_dims[2] = {0.0f, 0.0f};
+    if (args.ext_factor != 0.0f) {
+        glm_rope_yarn_corr_dims((int)args.rot_dim,
+                                (int)args.n_ctx_orig,
+                                args.freq_base,
+                                args.beta_fast,
+                                args.beta_slow,
+                                corr_dims);
+    }
+    const float theta_base = (float)pos;
+    const float inv_ndims = -1.0f / (float)args.rot_dim;
+    for (uint i = tid * 2u; i < args.rot_dim; i += nth * 2u) {
+        const uint rel_i0 = i;
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+        const float theta = theta_base * exp2(inv_ndims * (float)rel_i0 * log2(args.freq_base));
+#else
+        const float theta = theta_base * pow(args.freq_base, inv_ndims * (float)rel_i0);
+#endif
+        float cos_theta;
+        float sin_theta;
+        glm_rope_yarn(theta,
+                      args.freq_scale,
+                      corr_dims,
+                      (int)rel_i0,
+                      args.ext_factor,
+                      args.attn_factor,
+                      &cos_theta,
+                      &sin_theta);
+        const uint j = i + 1u;
+        const float x0 = row[i];
+        const float x1 = row[j];
+        row[i] = x0 * cos_theta - x1 * sin_theta;
+        row[j] = x0 * sin_theta + x1 * cos_theta;
+    }
+}
+
+kernel void kernel_glm_indexer_rope_tail_positions_f32(
+        constant ds4_metal_args_glm_indexer_rope_tail & args,
+        device char *x,
+        device const uint32_t *positions,
+        uint tid [[thread_index_in_threadgroup]],
+        ushort3 ntg_u [[threads_per_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    const uint head = tgpig.x;
+    const uint token = tgpig.y;
+    if (head >= args.n_head || token >= args.n_tokens) return;
+    if (args.rot_dim == 0u || args.rot_offset > args.head_dim ||
+        args.rot_dim > args.head_dim - args.rot_offset || (args.rot_dim & 1u) != 0u) return;
+
+    const uint nth = ntg_u.x;
+    const uint pos = positions[token];
     device float *row =
         (device float *)(x +
             ((uint64_t)token * args.n_head + head) * args.head_dim * sizeof(float));
@@ -3518,6 +3646,206 @@ kernel_glm_attention_indexed_batch_lora_group8_vec_impl<true, false>;
 template [[host_name("kernel_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads")]]
 kernel glm_attention_indexed_batch_lora_group8_vec_t
 kernel_glm_attention_indexed_batch_lora_group8_vec_impl<true, true>;
+
+template <bool assume_valid_heads>
+kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_packed_impl(
+        constant ds4_metal_args_glm_attention_indexed_batch & args,
+        device const char *q,
+        device const char *qk_low,
+        device const char *packed_kv_lora_cache,
+        device const char *packed_k_rope_cache,
+        device const uint32_t *selected,
+        device char *lora_out,
+        threadgroup half4 *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid_u [[thread_index_in_threadgroup]],
+        ushort lane_u [[thread_index_in_simdgroup]],
+        ushort sg_u [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint group_heads = 8u;
+    constexpr uint stage_rows = 16u;
+    const uint token = tgpig.y;
+    const uint tid = (uint)tid_u;
+    const uint lane = (uint)lane_u;
+    const uint head_in_group = (uint)sg_u;
+    const uint head = tgpig.x * group_heads + head_in_group;
+    if (token >= args.n_tokens ||
+        args.n_selected == 0u ||
+        args.cache_f16 == 0u ||
+        args.kv_lora_dim != 512u ||
+        args.qk_rope != 64u) {
+        return;
+    }
+
+    const bool valid_head = assume_valid_heads || head < args.n_head;
+    const uint safe_head = valid_head ? head : 0u;
+    const uint kv_vecs = args.kv_lora_dim >> 2;
+    const uint rope_vecs = args.qk_rope >> 2;
+    const uint qk_dim = args.qk_nope + args.qk_rope;
+    const uint64_t q_token_stride = (uint64_t)args.n_head * qk_dim * sizeof(float);
+    const uint64_t low_token_stride =
+        (uint64_t)args.n_head * args.kv_lora_dim * sizeof(float);
+    const uint64_t packed_row0 = (uint64_t)token * args.n_selected;
+
+    threadgroup half4 *kv_shared = scratch;
+    threadgroup float4 *rope_shared =
+        (threadgroup float4 *)(kv_shared + stage_rows * kv_vecs);
+
+    device const float *qh =
+        (device const float *)(q +
+            (uint64_t)token * q_token_stride +
+            (uint64_t)safe_head * qk_dim * sizeof(float));
+    device const float4 *low4 =
+        (device const float4 *)(qk_low +
+            (uint64_t)token * low_token_stride +
+            (uint64_t)safe_head * args.kv_lora_dim * sizeof(float));
+    device const uint32_t *token_selected =
+        selected + (uint64_t)token * args.n_selected;
+
+    float4 low0 = 0.0f;
+    float4 low1 = 0.0f;
+    float4 low2 = 0.0f;
+    float4 low3 = 0.0f;
+    float4 qrope = 0.0f;
+    if (valid_head) {
+        low0 = low4[lane + 0u];
+        low1 = low4[lane + 32u];
+        low2 = low4[lane + 64u];
+        low3 = low4[lane + 96u];
+        if (lane < rope_vecs) {
+            qrope = *((device const float4 *)(qh + args.qk_nope + lane * 4u));
+        }
+    }
+
+    float corr_dims[2] = {0.0f, 0.0f};
+    if (args.ext_factor != 0.0f) {
+        glm_rope_yarn_corr_dims((int)args.qk_rope,
+                                (int)args.n_ctx_orig,
+                                args.freq_base,
+                                args.beta_fast,
+                                args.beta_slow,
+                                corr_dims);
+    }
+
+    float M = -FLT_MAX / 2.0f;
+    float S = 0.0f;
+    float4 o0 = 0.0f;
+    float4 o1 = 0.0f;
+    float4 o2 = 0.0f;
+    float4 o3 = 0.0f;
+
+    for (uint base = 0u; base < args.n_selected; base += stage_rows) {
+        const uint rows = min(stage_rows, args.n_selected - base);
+        for (uint off = tid; off < rows * kv_vecs; off += 256u) {
+            const uint rr = off / kv_vecs;
+            const uint vv = off - rr * kv_vecs;
+            const uint orig_row = token_selected[base + rr];
+            const bool valid_row = orig_row < args.cache_cap;
+            if (valid_row) {
+                const uint64_t packed_row = packed_row0 + base + rr;
+                device const half4 *src =
+                    (device const half4 *)((device const half *)packed_kv_lora_cache +
+                        packed_row * args.kv_lora_dim);
+                kv_shared[off] = src[vv];
+            } else {
+                kv_shared[off] = half4(half(0.0f));
+            }
+        }
+        for (uint off = tid; off < rows * rope_vecs; off += 256u) {
+            const uint rr = off / rope_vecs;
+            const uint vv = off - rr * rope_vecs;
+            const uint r = vv * 4u;
+            const uint orig_row = token_selected[base + rr];
+            const bool valid_row = orig_row < args.cache_cap;
+            if (valid_row) {
+                const uint64_t packed_row = packed_row0 + base + rr;
+                const uint64_t rope_base = packed_row * args.qk_rope;
+                const float2 y0 =
+                    glm_cache_load_rotated_rope_pair_f16_only(packed_k_rope_cache,
+                                                              rope_base,
+                                                              r,
+                                                              orig_row,
+                                                              args.qk_rope,
+                                                              args.freq_base,
+                                                              args.freq_scale,
+                                                              args.ext_factor,
+                                                              args.attn_factor,
+                                                              corr_dims[0],
+                                                              corr_dims[1]);
+                const float2 y1 =
+                    glm_cache_load_rotated_rope_pair_f16_only(packed_k_rope_cache,
+                                                              rope_base,
+                                                              r + 2u,
+                                                              orig_row,
+                                                              args.qk_rope,
+                                                              args.freq_base,
+                                                              args.freq_scale,
+                                                              args.ext_factor,
+                                                              args.attn_factor,
+                                                              corr_dims[0],
+                                                              corr_dims[1]);
+                rope_shared[off] = float4(y0.x, y0.y, y1.x, y1.y);
+            } else {
+                rope_shared[off] = float4(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint rr = 0u; rr < rows; rr++) {
+            const uint orig_row = token_selected[base + rr];
+            const bool valid_row = orig_row < args.cache_cap;
+            threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
+            threadgroup const float4 *rope_row = rope_shared + rr * rope_vecs;
+            float partial = 0.0f;
+            if (valid_head && valid_row) {
+                partial += dot(low0, (float4)kv_row[lane + 0u]);
+                partial += dot(low1, (float4)kv_row[lane + 32u]);
+                partial += dot(low2, (float4)kv_row[lane + 64u]);
+                partial += dot(low3, (float4)kv_row[lane + 96u]);
+                if (lane < rope_vecs) {
+                    partial += dot(qrope, rope_row[lane]);
+                }
+            }
+            const float sum = simd_sum(partial);
+            const float score =
+                (valid_head && valid_row) ? sum * args.scale : -FLT_MAX / 2.0f;
+            if (valid_head && valid_row) {
+                const float new_m = max(M, score);
+                const float old_scale = exp(M - new_m);
+                const float row_scale = exp(score - new_m);
+                o0 = o0 * old_scale + (float4)kv_row[lane + 0u] * row_scale;
+                o1 = o1 * old_scale + (float4)kv_row[lane + 32u] * row_scale;
+                o2 = o2 * old_scale + (float4)kv_row[lane + 64u] * row_scale;
+                o3 = o3 * old_scale + (float4)kv_row[lane + 96u] * row_scale;
+                S = S * old_scale + row_scale;
+                M = new_m;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (valid_head) {
+        const float inv_s = S > 0.0f ? 1.0f / S : 0.0f;
+        device float4 *out4 =
+            (device float4 *)(lora_out +
+                ((uint64_t)token * args.n_head + head) *
+                    args.kv_lora_dim * sizeof(float));
+        out4[lane + 0u] = o0 * inv_s;
+        out4[lane + 32u] = o1 * inv_s;
+        out4[lane + 64u] = o2 * inv_s;
+        out4[lane + 96u] = o3 * inv_s;
+    }
+}
+
+typedef decltype(kernel_glm_attention_indexed_batch_lora_group8_vec_packed_impl<false>)
+        glm_attention_indexed_batch_lora_group8_vec_packed_t;
+
+template [[host_name("kernel_glm_attention_indexed_batch_lora_group8_vec_packed")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_packed_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_packed_impl<false>;
+
+template [[host_name("kernel_glm_attention_indexed_batch_lora_group8_vec_packed_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_packed_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_packed_impl<true>;
 
 template <bool assume_valid_heads>
 kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_causal_impl(

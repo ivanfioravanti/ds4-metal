@@ -569,6 +569,21 @@ int ds4_gpu_glm_rope_tail_tensor(
         float           beta_fast,
         float           beta_slow);
 
+int ds4_gpu_glm_rope_tail_positions_tensor(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *positions,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              rot_dim,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow);
+
 int ds4_gpu_glm_kv_lora_rms_norm_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *kv_raw,
@@ -719,6 +734,13 @@ int ds4_gpu_glm_fill_selected_range_batch_tensor(
         uint32_t        n_selected,
         uint32_t        pad_row);
 
+int ds4_gpu_glm_fill_selected_range_positions_tensor(
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *positions,
+        uint32_t              n_tokens,
+        uint32_t              n_selected,
+        uint32_t              pad_row);
+
 int ds4_gpu_glm_indexer_rope_tail_tensor(
         ds4_gpu_tensor *x,
         uint32_t        n_tokens,
@@ -733,6 +755,21 @@ int ds4_gpu_glm_indexer_rope_tail_tensor(
         float           attn_factor,
         float           beta_fast,
         float           beta_slow);
+
+int ds4_gpu_glm_indexer_rope_tail_positions_tensor(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *positions,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              rot_dim,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow);
 
 int ds4_gpu_glm_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
@@ -882,6 +919,21 @@ int ds4_gpu_sort_i32_rows_asc_tensor(
         uint32_t              row_width,
         uint32_t              n_rows);
 
+int ds4_gpu_glm_pack_selected_kv_f16_tensor(
+        ds4_gpu_tensor       *dst_kv_lora_cache,
+        ds4_gpu_tensor       *dst_k_rope_cache,
+        ds4_gpu_tensor       *dst_selected,
+        const ds4_gpu_tensor *src_kv_lora_cache,
+        const ds4_gpu_tensor *src_k_rope_cache,
+        const ds4_gpu_tensor *src_selected,
+        uint32_t              src_n_selected,
+        uint32_t              dst_n_selected,
+        uint32_t              src_cache_cap,
+        uint32_t              dst_row0,
+        uint32_t              dst_cache_cap,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_rope);
+
 int ds4_gpu_glm_attention_indexed_batch_lora_tensor(
         ds4_gpu_tensor       *lora_out,
         const ds4_gpu_tensor *q,
@@ -893,6 +945,28 @@ int ds4_gpu_glm_attention_indexed_batch_lora_tensor(
         uint32_t              n_selected,
         uint32_t              cache_cap,
         bool                  cache_f16,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_nope,
+        uint32_t              qk_rope,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow);
+
+int ds4_gpu_glm_attention_indexed_batch_lora_packed_tensor(
+        ds4_gpu_tensor       *lora_out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *packed_kv_lora_cache,
+        const ds4_gpu_tensor *packed_k_rope_cache,
+        const ds4_gpu_tensor *selected,
+        uint32_t              n_tokens,
+        uint32_t              n_selected,
+        uint32_t              src_cache_cap,
         uint32_t              n_head,
         uint32_t              kv_lora_dim,
         uint32_t              qk_nope,

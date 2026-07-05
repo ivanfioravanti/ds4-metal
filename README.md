@@ -139,6 +139,20 @@ but must be enabled explicitly with `--mtp`. The current MTP/speculative
 decoding path is still experimental: it is correctness-gated and currently
 provides at most a slight speedup, not a meaningful generation-speed win.
 
+GLM 5.2 support is currently limited to the GGUF files tested by this branch:
+
+```sh
+./download_model.sh glm-unsloth-q4  # Unsloth UD-Q4_K_XL, 11 shards
+./download_model.sh glm-antirez-q2  # antirez routed Q2_K single-file GGUF
+./download_model.sh glm-antirez-q4  # antirez routed Q4_K single-file GGUF
+```
+
+The supported GLM layout keeps dense/model-control tensors in the existing
+Q8/F32 paths and supports routed expert gate/up tensors in `Q2_K`, `Q4_K`, or
+`Q5_K`; routed expert down tensors are supported in `Q2_K`, `Q4_K`, `Q5_K`, or
+`Q6_K`. Other GLM GGUF quant layouts should be treated as unsupported until they
+are added deliberately and scored against the official 100-case fixture.
+
 Then build:
 
 ```sh
@@ -206,14 +220,19 @@ more memory for context, set the routed expert cache explicitly:
 ./ds4 -m ./ds4flash.gguf --ssd-streaming --ssd-streaming-cache-experts 32GB
 ```
 
-The `32GB` value is a memory budget for complete routed experts, not a generic
-byte cache. DwarfStar converts it to the number of full experts that fit for the
-current GGUF. Non-routed weights, KV cache, graph scratch, and activations need
-additional memory. Only the automatic cache budget does the subtraction for you:
-it takes 80% of the Metal recommended working set, subtracts non-routed weights,
-then uses the rest for routed experts. Leave the hot expert preload enabled for
-normal use; use `--ssd-streaming-cold` and `--ssd-streaming-preload-experts N`
-only for measurements.
+The `32GB` value is a routed-expert memory budget, not a generic byte cache.
+DwarfStar first reserves headroom for the two full routed layers used by
+overlapped streaming prefill, then converts the remaining bytes to the number of
+dynamic cached experts that fit for the current GGUF. Explicit `NGB` budgets may
+also be capped after context/KV accounting so the Metal working set stays out of
+the slow pressure zone. A plain number such as
+`--ssd-streaming-cache-experts 4000` is different: it means exactly 4000 dynamic
+expert slots, with no extra accounting. Non-routed weights, KV cache, graph
+scratch, and activations need additional memory. The automatic cache budget takes
+80% of the Metal recommended working set, subtracts non-routed weights, then
+applies the same routed-prefill headroom before sizing the dynamic cache. Leave
+the hot expert preload enabled for normal use; use `--ssd-streaming-cold` and
+`--ssd-streaming-preload-experts N` only for measurements.
 
 ### Practical SSD streaming examples
 
@@ -245,15 +264,11 @@ and occasional work when you accept slow generation. Start with `--nothink`:
 
 On an M5 Max with 128GB of RAM, a short PRO q2 streaming decode benchmark found
 the automatic budget best: it selected about `59GB` of routed expert cache.
-Manual `64GB` to `75GB` caches were close on that machine. Larger explicit
-`NGB` requests are capped before inference so the expert buffers remain
-lockable instead of falling into macOS paging. If the system is under extra
-memory pressure and `mlock` still fails, ds4 refuses to install pageable
-expert-cache entries and releases a locked-cache margin before continuing with
-the measured lockable cache size. Prefer the automatic budget; if setting the
-cache manually on this class of machine, start around `48GB` to `64GB`, then
-increase only while the startup log reports a lockable cache. Once the machine
-is stable, re-enable thinking with a conservative generation limit:
+Manual `64GB` to `75GB` caches were close on that machine. Prefer the automatic
+budget; if setting the cache manually on this class of machine, start around
+`48GB` to `64GB`, then increase only while the machine remains responsive and
+the startup log shows the requested dynamic cache. Once the machine is stable,
+re-enable thinking with a conservative generation limit:
 
 ```sh
 ./ds4 \

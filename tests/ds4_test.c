@@ -860,7 +860,13 @@ static void test_logprob_vector_case(ds4_engine *engine, const test_vec_case *vc
     }
 
     char err[160];
-    TEST_ASSERT(ds4_session_sync(session, &prompt, err, sizeof(err)) == 0);
+    if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4-test: vector %s prefill failed: %s\n", vc->id, err);
+        TEST_ASSERT(false);
+        ds4_session_free(session);
+        ds4_tokens_free(&prompt);
+        return;
+    }
 
     ds4_token_score scores[20];
     for (int i = 0; i < vc->nsteps; i++) {
@@ -899,7 +905,12 @@ static void test_logprob_vector_case(ds4_engine *engine, const test_vec_case *vc
         }
 
         if (i + 1 < vc->nsteps) {
-            TEST_ASSERT(ds4_session_eval(session, token, err, sizeof(err)) == 0);
+            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-test: vector %s step %d eval failed: %s\n",
+                        vc->id, i, err);
+                TEST_ASSERT(false);
+                break;
+            }
         }
     }
 
@@ -907,7 +918,8 @@ static void test_logprob_vector_case(ds4_engine *engine, const test_vec_case *vc
     ds4_tokens_free(&prompt);
 }
 
-static bool test_logprob_vector_case_disabled(const test_vec_case *vc) {
+static bool test_logprob_vector_case_disabled(const char *path,
+                                              const test_vec_case *vc) {
     /*
      * This one long-context vector currently matches the public DeepSeek API less
      * after adding the official Hadamard+FP4 indexer path.  The public official
@@ -915,7 +927,8 @@ static bool test_logprob_vector_case_disabled(const test_vec_case *vc) {
      * slightly lower local perplexity on the A/B check we ran, so DS4 keeps that
      * implementation and only excludes this brittle API fixture for now.
      */
-    return !strcmp(vc->id, "long_memory_archive");
+    return !strcmp(path, "tests/test-vectors/official.vec") &&
+           !strcmp(vc->id, "long_memory_archive");
 }
 
 static void test_official_logprob_vectors_run(const char *case_filter) {
@@ -951,7 +964,7 @@ static void test_official_logprob_vectors_run(const char *case_filter) {
         if (case_filter && case_filter[0] && strcmp(vc.id, case_filter)) {
             continue;
         }
-        if (test_logprob_vector_case_disabled(&vc)) {
+        if (test_logprob_vector_case_disabled(path, &vc)) {
             fprintf(stderr, "ds4-test: vector %s skipped (API/official graph mismatch)\n",
                     vc.id);
             continue;

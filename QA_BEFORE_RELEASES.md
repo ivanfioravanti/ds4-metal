@@ -54,7 +54,43 @@ in this system.
   `./ds4_test --server`.
 - Run `./ds4-eval --self-test-extractors`.
 
-## 3. Metal Flash Path
+## 3. Official Continuation Quality Gates
+
+These tests are release-blocking after tokenizer, template, KV-cache, attention,
+MoE routing, quantization, logit, or model-graph changes.  They are
+teacher-forced continuation checks against hosted-model output and API
+top-logprob slices, so do not replace them with one sampled chat answer.
+
+- Build the scorer:
+  `make -C gguf-tools quality-score`.
+- Run the tracked DeepSeek V4 Flash smoke vectors:
+  `./ds4_test --logprob-vectors`.
+  This covers the official Flash API vectors in `tests/test-vectors/`, including
+  short prompts and long-prompt attention cases.
+- Run the 100-case DeepSeek V4 Flash fixture for every released Flash GGUF:
+  `gguf-tools/quality-testing/score_official /path/to/deepseek-v4-flash.gguf gguf-tools/quality-testing/data/flash/manifest.tsv /tmp/flash.tsv 4096`.
+- Run the 100-case GLM 5.2 OpenRouter fixture for every released GLM GGUF:
+  `gguf-tools/quality-testing/score_official models/GLM-5.2-UD-Q4_K_XL.gguf gguf-tools/quality-testing/data/glm52-openrouter-100/manifest.tsv /tmp/glm52-q4.tsv 4096`.
+  Current Q4 XL reference band: first-token match `95/100`, API top-1 agreement
+  about `0.942`, and API pair-order agreement about `0.880`.
+- Run the same GLM fixture for reduced-precision GLM release files.  The Q2
+  routed reference is lower quality but should stay near first-token match
+  `92/100`, API top-1 agreement about `0.890`, and API pair-order agreement
+  about `0.800` unless the quantization changed deliberately.
+- Run the 100-case DeepSeek V4 PRO fixture for every released PRO GGUF:
+  `gguf-tools/quality-testing/score_official /path/to/deepseek-v4-pro.gguf gguf-tools/quality-testing/data/pro/manifest.tsv /tmp/pro.tsv 4096`.
+- For SSD streaming, run the same official-continuation scorer once with full
+  residency and once with `--ssd-streaming` for the release model.  The summary
+  and API agreement should stay in the same quality band.
+- Compare any candidate against the previous release or last-known-good output:
+  `python3 gguf-tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv`.
+  Treat a large first-token-match drop, a clear NLL regression, or a material
+  API top-1/pair-order regression as a blocker unless the release notes call out
+  an intentional quality tradeoff.
+- Keep the raw `summary` and `api_summary` lines in the release notes or QA log.
+  Do not use stale manifests from `misc/` as release evidence.
+
+## 4. Metal Flash Path
 
 Use the normal Flash GGUF that 128 GB users run.
 
@@ -73,7 +109,7 @@ Use the normal Flash GGUF that 128 GB users run.
   generation speed, and KV bytes with the last known good numbers for the same
   machine.
 
-## 4. Metal PRO Path
+## 5. Metal PRO Path
 
 PRO support is experimental, but release builds must not break it silently.
 
@@ -84,7 +120,7 @@ PRO support is experimental, but release builds must not break it silently.
   touching model shape, tensor lookup, routed expert mapping, template logic,
   and KV payload compatibility.
 
-## 5. SSD Streaming
+## 6. SSD Streaming
 
 SSD streaming is a capacity path, so test both correctness and user experience.
 
@@ -103,7 +139,7 @@ SSD streaming is a capacity path, so test both correctness and user experience.
 - If streaming cache internals changed, test the same prompt twice and compare
   first-token/logprob sanity between runs.
 
-## 6. CUDA / DGX Spark
+## 7. CUDA / DGX Spark
 
 Before a release, ask the user for CUDA access if it is not already configured.
 Use the DGX Spark / GB10 host `toor@192.168.0.180`.  Do not claim CUDA is
@@ -121,7 +157,7 @@ release-ready without this pass.
 - Verify that any CUDA-only warning fixes are also clean on macOS and do not
   change Metal behavior.
 
-## 7. ROCm / Strix Halo
+## 8. ROCm / Strix Halo
 
 Use the Strix Halo Framework Desktop via the VPN hostname `strixhalo`
 (`antirez@strixhalo`).  This host validates the ROCm backend; do not use it as
@@ -142,7 +178,7 @@ a substitute for CUDA or Metal release testing.
 - Record startup memory/cache messages, prefill speed, generation speed, and
   whether the backend reports `ROCm backend initialized`.
 
-## 8. Distributed Inference
+## 9. Distributed Inference
 
 Distributed code has regressed around route setup, KV snapshots, request IDs,
 and split model loading.  Test it whenever distributed, KV, session, or model
@@ -160,7 +196,7 @@ loading code changes.
 - If CUDA distributed is relevant, test across the CUDA hosts and record
   generation speed, not just "it works".
 
-## 9. Disk KV Cache
+## 10. Disk KV Cache
 
 Disk KV cache bugs are high impact for server users.
 
@@ -174,7 +210,7 @@ Disk KV cache bugs are high impact for server users.
 - Test stripped agent sessions: `/strip <id>` then `/switch <id>` should rebuild
   by prefill and render sane history.
 
-## 10. Server APIs
+## 11. Server APIs
 
 The server must keep compatibility across OpenAI, Responses, and Anthropic
 clients.
@@ -187,7 +223,7 @@ clients.
 - Test `--trace` and confirm rendered prompts, cache decisions, generated text,
   and tool-parser events are useful without leaking unrelated state.
 
-## 11. ds4-agent
+## 12. ds4-agent
 
 The agent is the most stateful component.  Test it manually, not only by build.
 
@@ -219,7 +255,7 @@ The agent is the most stateful component.  Test it manually, not only by build.
   status bar fill to terminal width, syntax highlighting in Markdown/code blocks,
   and SSH/remote terminal flicker.
 
-## 12. Download Script And Model Files
+## 13. Download Script And Model Files
 
 - Test `download_model.sh` in a temporary directory so local weights are not
   overwritten.
@@ -228,7 +264,7 @@ The agent is the most stateful component.  Test it manually, not only by build.
 - Verify legacy removed targets fail clearly.
 - Verify README model names match the script and Hugging Face repository.
 
-## 13. Performance And Power
+## 14. Performance And Power
 
 - Run `ds4-bench` on the release machine and compare with tracked CSV baselines.
 - Test `--power 100` is not throttled.
@@ -237,11 +273,12 @@ The agent is the most stateful component.  Test it manually, not only by build.
 - Confirm context buffer size, raw KV rows, compressed KV rows, and mmap behavior
   match expectations for 32k, 100k, and any release-advertised context size.
 
-## 14. Release Sign-off
+## 15. Release Sign-off
 
 Do not sign off until:
 
 - macOS Metal Flash passed.
+- Official continuation quality gates passed for every released model family.
 - CUDA was tested on the CUDA machine or the release notes explicitly say CUDA
   was not validated.
 - ROCm was tested on Strix Halo or the release notes explicitly say ROCm was

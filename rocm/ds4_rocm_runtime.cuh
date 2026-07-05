@@ -4596,6 +4596,21 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
+extern "C" int ds4_gpu_commands_active(void) { return 0; }
+extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
+    if (event_value) *event_value = 1;
+    return 1;
+}
+extern "C" int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label) {
+    (void)event_value;
+    (void)label;
+    return cuda_ok(cudaDeviceSynchronize(), "selected readback");
+}
+extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label) {
+    (void)event_value;
+    (void)label;
+    return cuda_ok(cudaDeviceSynchronize(), "selected readback wait");
+}
 extern "C" int ds4_gpu_end_commands(void) {
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
 }

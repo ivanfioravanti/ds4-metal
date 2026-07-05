@@ -96,6 +96,7 @@ typedef struct {
     const char *mtp_path;
     ds4_backend backend;
     int n_threads;
+    int context_size;
     uint32_t prefill_chunk;
     int mtp_draft_tokens;
     float mtp_margin;
@@ -106,13 +107,17 @@ typedef struct {
     int power_percent;
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
+    uint32_t ssd_streaming_full_layers;
     uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;
     bool warm_weights;
     bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
+    bool ssd_streaming_full_layers_set;
     bool inspect_only;
+    bool first_token_test;
+    bool metal_graph_test;
     bool load_slice;
     uint32_t load_layer_start;
     uint32_t load_layer_end;
@@ -155,14 +160,24 @@ const char *ds4_engine_model_name(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
+bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
+                                        uint32_t layer,
+                                        uint32_t full_live,
+                                        uint32_t key_dim,
+                                        uint32_t value_dim,
+                                        uint32_t compact_live,
+                                        uint32_t index_live,
+                                        uint64_t *out);
 /* Stable id for cache compatibility.  0 is the original Flash shape, so old
  * KV files with the previously-zero reserved byte remain Flash-compatible;
  * Pro and later shapes must use nonzero ids. */
 int ds4_engine_model_id(ds4_engine *e);
+bool ds4_engine_is_glm_dsa(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
 const char *ds4_think_max_prefix(void);
+const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode);
 uint32_t ds4_think_max_min_context(void);
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size);
 /* Uses the active model shape selected by ds4_engine_open(); call after opening
@@ -172,6 +187,11 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill(
         ds4_backend backend,
         int ctx_size,
         uint32_t prefill_chunk);
+ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
+        ds4_backend backend,
+        int ctx_size,
+        uint32_t prefill_chunk,
+        bool ssd_streaming);
 bool ds4_log_is_tty(FILE *fp);
 void ds4_log(FILE *fp, ds4_log_type type, const char *fmt, ...);
 int ds4_engine_generate_argmax(ds4_engine *e, const ds4_tokens *prompt,
@@ -215,6 +235,11 @@ void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_thi
 
 char *ds4_token_text(ds4_engine *e, int token, size_t *len);
 int ds4_token_eos(ds4_engine *e);
+bool ds4_token_is_stop(ds4_engine *e, int token);
+bool ds4_token_is_thinking_control(ds4_engine *e, int token);
+bool ds4_token_is_stop_for_think_mode(ds4_engine *e,
+                                      int token,
+                                      ds4_think_mode mode);
 int ds4_token_user(ds4_engine *e);
 int ds4_token_assistant(ds4_engine *e);
 

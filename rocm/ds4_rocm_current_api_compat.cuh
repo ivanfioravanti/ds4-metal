@@ -170,6 +170,14 @@ extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_stream_batch_selected_cache.loaded = 0;
 }
 
+extern "C" void ds4_gpu_set_glm_model(bool enabled) {
+    (void)enabled;
+}
+
+extern "C" void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
+    (void)enabled;
+}
+
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     g_stream_expert_cache_budget = experts;
 }

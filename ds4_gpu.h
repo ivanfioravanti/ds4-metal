@@ -560,6 +560,12 @@ int ds4_gpu_argmax_tensor(
         ds4_gpu_tensor       *out_idx,
         const ds4_gpu_tensor *logits,
         uint32_t                n_vocab);
+/* A5: dedicated one-dispatch top-1 argmax (lexicographic reduce; identical
+ * index including lowest-index ties). */
+int ds4_gpu_argmax_top1_tensor(
+        ds4_gpu_tensor       *out_idx,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_vocab);
 
 int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,

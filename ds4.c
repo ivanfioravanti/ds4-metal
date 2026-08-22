@@ -31161,6 +31161,10 @@ static int metal_graph_greedy_chain(
      * closes. */
     const bool stage_counters = ds4_gpu_stage_counters_enabled() != 0;
     if (stage_counters) ds4_gpu_stage_counter_reset();
+    /* A5: the dedicated top-1 argmax replaces the full bitonic argsort for
+     * the chain's per-token pick; same index, lowest-index ties included. */
+    const bool chain_argmax_top1 =
+        getenv("DS4_METAL_DISABLE_DECODE_ARGMAX_TOP1") == NULL;
     bool ok = ds4_gpu_begin_commands() != 0;
     int encoded = 0;            /* evals committed: eval(j) for j in [0, encoded) */
     bool stop = false;
@@ -31183,7 +31187,9 @@ static int metal_graph_greedy_chain(
                                                    (uint64_t)(j + 1) * sizeof(int32_t),
                                                    sizeof(int32_t));
         ok = vout != NULL &&
-             ds4_gpu_argmax_tensor(vout, metal_graph_logits(g), DS4_N_VOCAB) != 0;
+             (chain_argmax_top1
+                  ? ds4_gpu_argmax_top1_tensor(vout, metal_graph_logits(g), DS4_N_VOCAB) != 0
+                  : ds4_gpu_argmax_tensor(vout, metal_graph_logits(g), DS4_N_VOCAB) != 0);
         ds4_gpu_tensor_free(vout);
         if (!ok) break;
         uint64_t ev = 0;

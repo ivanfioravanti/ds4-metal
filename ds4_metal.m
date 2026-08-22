@@ -360,6 +360,15 @@ static id<MTLBuffer> g_router_selection_buffer;
 static id<MTLBuffer> g_router_weight_sum_buffer;
 static id<MTLBuffer> g_indexer_head_scores_buffer;
 static id<MTLBuffer> g_indexer_topk_buffer;
+enum { DS4_ARGMAX_TOP1_SLOTS = 8u };
+/* Ring of per-call scratch sets: adjacent greedy-chain command buffers may
+ * be in flight together and would race on shared scratch.  The chain keeps
+ * <= 2 buffers in flight, so 8 slots is safely above. */
+static id<MTLBuffer> g_dsv4_argmax_top1_scratch_v[DS4_ARGMAX_TOP1_SLOTS];
+static id<MTLBuffer> g_dsv4_argmax_top1_scratch_i[DS4_ARGMAX_TOP1_SLOTS];
+static id<MTLComputePipelineState> g_dsv4_argmax_top1_stage1_pipeline;
+static id<MTLComputePipelineState> g_dsv4_argmax_top1_stage2_pipeline;
+static uint32_t g_dsv4_argmax_top1_seq;
 static id<MTLBuffer> g_indexed_topk_buffer;
 static id<MTLBuffer> g_f16_round_scratch_buffer;
 static id<MTLBuffer> g_raw_store_round_buffer;
@@ -5288,6 +5297,12 @@ typedef struct {
     float beta_fast;
     float beta_slow;
 } ds4_gpu_dsv4_head_norm_rope_args;
+
+/* Matches ds4_metal_args_dsv4_argmax_top1 in metal/argsort.metal. */
+typedef struct {
+    int32_t n_vocab;
+    int32_t n_tg;
+} ds4_gpu_dsv4_argmax_top1_args;
 
 _Static_assert(sizeof(ds4_gpu_dsv4_head_norm_rope_args) == 56,
                "Metal DSV4 head norm/RoPE argument ABI changed");
@@ -10646,6 +10661,13 @@ void ds4_gpu_cleanup(void) {
         g_router_weight_sum_buffer = nil;
         g_indexer_head_scores_buffer = nil;
         g_indexer_topk_buffer = nil;
+        for (uint32_t i = 0; i < DS4_ARGMAX_TOP1_SLOTS; i++) {
+            g_dsv4_argmax_top1_scratch_v[i] = nil;
+            g_dsv4_argmax_top1_scratch_i[i] = nil;
+        }
+        g_dsv4_argmax_top1_stage1_pipeline = nil;
+        g_dsv4_argmax_top1_stage2_pipeline = nil;
+        g_dsv4_argmax_top1_seq = 0;
         g_indexed_topk_buffer = nil;
         g_stream_expert_validate_status_buffer = nil;
         g_f16_round_scratch_buffer = nil;
@@ -18066,6 +18088,90 @@ int ds4_gpu_argmax_tensor(
     return ds4_gpu_indexer_topk_tensor(out_idx, logits, n_vocab, 1, 1);
 }
 
+/* A5: dedicated one-dispatch top-1 argmax for the decode head.  The generic
+ * path runs a full bitonic argsort for top_k == 1 (~86 us on M3 Ultra);
+ * this kernel is a lexicographic (value desc, index asc) reduce — a total
+ * order, so the result is tree-independent and matches sample_argmax's
+ * lowest-index tie-break by construction. */
+int ds4_gpu_argmax_top1_tensor(
+        ds4_gpu_tensor       *out_idx,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_vocab) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out_idx || !logits || n_vocab == 0) return 0;
+    if (ds4_gpu_tensor_bytes(out_idx) < sizeof(int32_t) ||
+        ds4_gpu_tensor_bytes(logits) < (uint64_t)n_vocab * sizeof(float)) {
+        fprintf(stderr, "ds4: Metal top-1 argmax received undersized buffers\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        enum { ARGMAX_TG = 256u, ARGMAX_THREADS = 256u };
+        const uint32_t slot = (g_dsv4_argmax_top1_seq++) % DS4_ARGMAX_TOP1_SLOTS;
+        if (!g_dsv4_argmax_top1_scratch_v[slot]) {
+            g_dsv4_argmax_top1_scratch_v[slot] =
+                [g_device newBufferWithLength:ARGMAX_TG * sizeof(float)
+                    options:MTLResourceStorageModeShared];
+            g_dsv4_argmax_top1_scratch_i[slot] =
+                [g_device newBufferWithLength:ARGMAX_TG * sizeof(int32_t)
+                    options:MTLResourceStorageModeShared];
+            if (!g_dsv4_argmax_top1_scratch_v[slot] ||
+                !g_dsv4_argmax_top1_scratch_i[slot]) {
+                return 0;
+            }
+        }
+        if (!g_dsv4_argmax_top1_stage1_pipeline) {
+            g_dsv4_argmax_top1_stage1_pipeline =
+                ds4_gpu_get_pipeline("kernel_dsv4_argmax_top1_stage1_f32");
+            g_dsv4_argmax_top1_stage2_pipeline =
+                ds4_gpu_get_pipeline("kernel_dsv4_argmax_top1_stage2_f32");
+            if (!g_dsv4_argmax_top1_stage1_pipeline ||
+                !g_dsv4_argmax_top1_stage2_pipeline) return 0;
+        }
+        if (g_dsv4_argmax_top1_stage1_pipeline.maxTotalThreadsPerThreadgroup <
+                ARGMAX_THREADS ||
+            g_dsv4_argmax_top1_stage2_pipeline.maxTotalThreadsPerThreadgroup <
+                ARGMAX_THREADS) {
+            return 0;
+        }
+
+        ds4_gpu_dsv4_argmax_top1_args args = {
+            .n_vocab = (int32_t)n_vocab,
+            .n_tg = (int32_t)ARGMAX_TG,
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        /* Two dispatches in one encoder: stage 2 is ordered after stage 1 by
+         * the dispatch boundary, so the scratch pairs need no atomics. */
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_dsv4_argmax_top1_stage1_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(logits)
+                offset:ds4_gpu_tensor_offset(logits) atIndex:1];
+        [enc setBuffer:g_dsv4_argmax_top1_scratch_v[slot] offset:0 atIndex:2];
+        [enc setBuffer:g_dsv4_argmax_top1_scratch_i[slot] offset:0 atIndex:3];
+        [enc setThreadgroupMemoryLength:64u atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(ARGMAX_TG, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(ARGMAX_THREADS, 1, 1)];
+
+        [enc setComputePipelineState:g_dsv4_argmax_top1_stage2_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:g_dsv4_argmax_top1_scratch_v[slot] offset:0 atIndex:1];
+        [enc setBuffer:g_dsv4_argmax_top1_scratch_i[slot] offset:0 atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out_idx)
+                offset:ds4_gpu_tensor_offset(out_idx) atIndex:3];
+        [enc setThreadgroupMemoryLength:64u atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(ARGMAX_THREADS, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "top-1 argmax")) return 0;
+    }
+    return 1;
+}
 int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,
         const ds4_gpu_tensor *topk,

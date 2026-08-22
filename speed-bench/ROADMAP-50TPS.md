@@ -178,5 +178,9 @@ Round 4 (this branch, measured): **A1 HC producer tail restructure** —
 parallel-lane Sinkhorn comb is not bit-exact (the serial 4-row-unrolled
 source compiles to row-position-dependent reduction trees; rows 0/3 land one
 ulp off) AND speed-neutral (45.90 vs 45.92 t/s); the stage cost is the
-dispatch floor + phase streams, not the completion tail. Details in
+dispatch floor + phase streams, not the completion tail. **A3 Q norm/RoPE
+deferral into the attention consumer** — plumbing and norm-tree emulation
+proven bit-exact (math-safe transcripts match exactly), but the YaRN rope
+tail's mul-add blends contract differently in the attention kernel context
+under the fast-math library; not landable bit-exactly. Details in
 speed-bench/README.md.

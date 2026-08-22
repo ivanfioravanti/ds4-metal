@@ -321,6 +321,30 @@ fences shrunk to single-lane release/acquire.  Two independent findings:
 Reverted; no rollback env retained because the variant was not bit-exact.
 A1's 0.7–1.0 ms estimate does not exist in the tail.
 
+### A3 probe — Q norm/RoPE deferral into the attention consumer: blocked by fast-math (Aug 22)
+
+Roadmap A3 (mirror of the landed inverse-RoPE deferral: drop the per-layer
+per-head Q RMS-norm + RoPE dispatch by having each packed32 attention
+threadgroup redo its head's 512-wide norm + rotation on the raw q_b row) was
+built and bisected.  Proven bit-exact: the deferral plumbing (skip at the q_b
+site, standalone re-run at the attention site; rollback env
+`DS4_METAL_DISABLE_DECODE_Q_NORM_ROPE_DEFER`, fallback-forcing diagnostic
+`DS4_METAL_FORCE_DECODE_Q_NORM_ROPE_DEFER_FALLBACK`) and the in-kernel norm
+tree emulation (4 simdgroups + zero-padded 32-slot plane + final 32-lane
+simd_sum — bitwise on all 64 heads, all layer ratios).  Under
+`DS4_METAL_MATH_SAFE=1` the fused path matched the rollback transcript
+exactly.  Under the production fast-math library the YaRN rope tail
+(three mul-add blend/rotation expressions) contracts differently inside the
+attention kernel than inside the standalone kernel: 1-ulp drifts on
+compressed layers, and source-level pinning (strict/fma/lerp forms, a
+noinline shared helper) either missed ~26 elements or cascaded the whole
+kernel's contraction (norm dots included).  Not landable bit-exactly;
+reverted.  The (divergent) fused build also measured slower in a single
+probe (43.77 vs ~45.5 t/s), so the win may not have been there regardless.
+Fusion rule for this codebase: only contraction-free code (explicit
+reduction trees, builtins, single muls) may move between kernels
+bit-exactly; mul-add chains and transcendental-adjacent blends may not.
+
 ### Metal decode schedule A/B
 
 Build the balanced, same-engine Metal decode comparison with:

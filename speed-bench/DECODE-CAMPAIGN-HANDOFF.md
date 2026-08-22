@@ -149,3 +149,24 @@ chain path (all md5 `db0c504c…`, `make test` 44/44):
   The stage's ~19.6 µs/call is dispatch floor + phase streams, not the
   tail. Do not retry the tail; any real hc_pre win must attack the dispatch
   boundary itself (fusion) or the phase-1/2 streams.
+- **A3 (defer Q head norm+RoPE into the packed32 attention consumer)**:
+  BLOCKED BY FAST-MATH, reverted. What was proven along the way:
+  (a) the plumbing is bit-exact — skipping the standalone norm+RoPE at the
+  q_b site and re-running it at the attention site (or the deferred
+  prologue's norm tree emulation: 4 simdgroups + zero-padded 32-slot plane
+  + 32-lane simd_sum) reproduces q bitwise on all 64 heads;
+  (b) under DS4_METAL_MATH_SAFE=1 the fully fused kernel matches the
+  rollback transcript exactly — the deferral logic is correct;
+  (c) under the production fast-math library the YaRN rope tail
+  (theta blend `interp*(1-mix)+extrap*mix`, mscale, rotation mul-adds)
+  contracts differently inside the 64-TG attention kernel than inside the
+  64-head standalone kernel — 1-ulp drifts on compressed layers, and every
+  source-level pin (strict/fma/lerp forms, noinline shared helper) either
+  misses by ~26 elements or cascades the whole kernel's contraction,
+  including the norm dots. Reproducing contraction-sensitive arithmetic
+  across kernel contexts is not source-controllable here. Rule of thumb for
+  future fusions: only contraction-free code (explicit reduction trees,
+  builtins, single muls) can move between kernels bit-exactly.
+  Timing signal from the (divergent) fused build was also not promising
+  (43.77 vs 45.5 t/s single-run): the in-place prologue + 3 extra barriers
+  may not even beat the removed dispatch.

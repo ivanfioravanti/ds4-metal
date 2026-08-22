@@ -34608,6 +34608,21 @@ static void gpu_graph_report_prefill_display_progress(
 }
 
 typedef struct {
+    ds4_session_progress_fn display_progress;
+    void                   *ud;
+    int                     current;
+    int                     total;
+} metal_graph_flush_progress_ctx;
+
+/* Runs on a Metal completion thread at GPU-true layer completion (P1's
+ * commit-only prefill split); the context is stack-owned by the prefill
+ * call, which drains all pending buffers before returning. */
+static void metal_graph_flush_progress_report(void *vctx) {
+    const metal_graph_flush_progress_ctx *ctx = vctx;
+    ctx->display_progress(ctx->ud, "prefill_display", ctx->current, ctx->total);
+}
+
+typedef struct {
     int tier;
     uint32_t first_layer;
     uint32_t end_layer;
@@ -34967,6 +34982,16 @@ static bool metal_graph_prefill_layer_major(
      */
     const bool throttle = graph_power_throttle_enabled(g);
     const bool callback_split = display_progress != NULL && n_tokens >= 32;
+    /* P1: when the per-layer split exists only to feed the display-progress
+     * bar, keep the GPU fed instead of draining per layer: commit each layer
+     * without waiting and report GPU-true progress from each command
+     * buffer's completion handler.  Zero arithmetic change.  Splits for
+     * >2048-token chunks (they also bound transient memory), streaming,
+     * throttle, imatrix, and split_profile keep the per-layer drains. */
+    const bool progress_flush =
+        callback_split && n_tokens <= 2048u && !g->ssd_streaming &&
+        !split_profile && !throttle && imatrix == NULL &&
+        getenv("DS4_METAL_DISABLE_PREFILL_FLUSH_PROGRESS") == NULL;
     const bool split_commands = g->ssd_streaming ||
                                 split_profile || throttle || callback_split ||
                                 n_tokens > 2048 || imatrix != NULL;
@@ -35196,6 +35221,13 @@ static bool metal_graph_prefill_layer_major(
     }
 
     if (stage_counters) ds4_gpu_stage_counter_reset();
+    /* P1 commit-only progress split: one batch command buffer is opened here
+     * and each layer's flush opens the next; progress rides the completion
+     * handlers, so no per-layer host drain. */
+    metal_graph_flush_progress_ctx flush_ctx[DS4_N_LAYER];
+    if (progress_flush && ok) {
+        ok = ds4_gpu_begin_commands() != 0;
+    }
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         double layer_elapsed = 0.0;
         const bool layer_selected_addr =
@@ -35398,7 +35430,7 @@ static bool metal_graph_prefill_layer_major(
                     (t_ffn_done - t_ffn_encoded) * 1000.0);
         } else {
             const double t_chunk0 = (profile || throttle) ? now_sec() : 0.0;
-            ok = ds4_gpu_begin_commands() != 0;
+            if (!progress_flush) ok = ds4_gpu_begin_commands() != 0;
             if (ok) ok = metal_graph_encode_layer_batch(g,
                                                         model,
                                                         &weights->layer[il],
@@ -35425,7 +35457,18 @@ static bool metal_graph_prefill_layer_major(
             }
 #endif
             const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
-            if (ok) ok = ds4_gpu_end_commands() != 0;
+            if (ok && progress_flush) {
+                uint64_t pdone = (uint64_t)n_tokens * (il + 1u) / (uint32_t)DS4_N_LAYER;
+                if (il + 1u == (uint32_t)DS4_N_LAYER) pdone = n_tokens;
+                flush_ctx[il] = (metal_graph_flush_progress_ctx){
+                    display_progress, display_progress_ud,
+                    (int)(start + (uint32_t)pdone), prompt->len };
+                ok = ds4_gpu_flush_commands_progress(
+                        metal_graph_flush_progress_report,
+                        &flush_ctx[il]) != 0;
+            } else if (ok) {
+                ok = ds4_gpu_end_commands() != 0;
+            }
             const double t_done = (profile || throttle) ? now_sec() : 0.0;
 #ifdef DS4_ROCM_BUILD
             if (ok) {
@@ -35497,12 +35540,14 @@ static bool metal_graph_prefill_layer_major(
             return false;
         }
         graph_power_note_prefill_layer(g, il, layer_elapsed);
-        gpu_graph_report_prefill_display_progress(display_progress,
-                                                  display_progress_ud,
-                                                  start,
-                                                  n_tokens,
-                                                  il + 1,
-                                                  prompt->len);
+        if (!progress_flush) {
+            gpu_graph_report_prefill_display_progress(display_progress,
+                                                      display_progress_ud,
+                                                      start,
+                                                      n_tokens,
+                                                      il + 1,
+                                                      prompt->len);
+        }
         if (show_progress) {
             fprintf(stderr, "ds4: gpu prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
             fflush(stderr);
@@ -35521,6 +35566,11 @@ static bool metal_graph_prefill_layer_major(
             fprintf(stderr, "ds4: Metal synchronize after layer-major prefill failure also failed\n");
         }
         return false;
+    }
+    /* Flush mode leaves an open (empty) batch buffer after the final layer;
+     * close and drain it when no output head follows this chunk. */
+    if (progress_flush && !logits) {
+        ok = ds4_gpu_end_commands() != 0;
     }
 #ifdef __APPLE__
     /* Zero-prefix masks are shared across the 43 per-layer command batches,
@@ -35590,7 +35640,10 @@ static bool metal_graph_prefill_layer_major(
     }
     if (ok && logits) {
         g->cur_hc_by_tier[g->active_tier] = last_hc;
-        ok = ds4_gpu_begin_commands() != 0;
+        /* Flush mode keeps a batch buffer open across the layer loop. */
+        if (!progress_flush || !ds4_gpu_commands_active()) {
+            ok = ds4_gpu_begin_commands() != 0;
+        }
     }
     if (ok && logits) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
     const double t_head_encoded = profile ? now_sec() : 0.0;

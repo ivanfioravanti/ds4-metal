@@ -9162,6 +9162,42 @@ int ds4_gpu_flush_commands(void) {
     return 1;
 }
 
+/* Commit-only boundary that also reports GPU-true progress: the completed
+ * handler fires when the committed batch actually finishes on the GPU, so a
+ * frontend progress bar tracks execution without a host-side drain.  The
+ * report context must stay valid until the next full drain (end_commands /
+ * synchronize), which the caller guarantees by stack-living it across the
+ * split-prefill chunk. */
+int ds4_gpu_flush_commands_progress(void (*report)(void *ctx), void *ctx) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    ds4_gpu_parallel_ffn_reset_state(YES);
+    if (!g_batch_cb) return 0;
+
+    ds4_gpu_close_batch_encoder();
+    id<MTLCommandBuffer> cb = g_batch_cb;
+    g_batch_cb = nil;
+    g_batch_has_work = NO;
+    if (report) {
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done_cb) {
+            (void)done_cb;
+            report(ctx);
+        }];
+    }
+    [cb commit];
+    [g_pending_cbs addObject:cb];
+    ds4_gpu_stream_expert_cache_note_batch_committed();
+
+    g_batch_cb = ds4_gpu_new_command_buffer();
+    g_batch_has_work = NO;
+    if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
+    if (!g_batch_cb) {
+        (void)ds4_gpu_wait_pending_command_buffers("command batch");
+        [g_transient_buffers removeAllObjects];
+        return 0;
+    }
+    return 1;
+}
+
 int ds4_gpu_commands_active(void) {
     return g_batch_cb != nil;
 }

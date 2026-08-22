@@ -77,6 +77,9 @@ int ds4_gpu_pack_slot_rows_f32_tensor(
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
+/* Flush plus a completion handler reporting GPU-true progress (P1: the
+ * commit-only replacement for per-layer prefill drains). */
+int ds4_gpu_flush_commands_progress(void (*report)(void *ctx), void *ctx);
 int ds4_gpu_commands_active(void);
 #ifdef __APPLE__
 int ds4_gpu_parallel_ffn_finish(void);

@@ -189,3 +189,11 @@ chain path (all md5 `db0c504c…`, `make test` 44/44):
   holds, make test OK, SSD streaming smoke OK). +2.7% prefill at ~250
   tokens, +1.8% at 637, control unchanged at 3092. Rollback
   `DS4_METAL_DISABLE_PREFILL_FLUSH_PROGRESS=1`.
+- **A2 (MXFP4 dequant constant-space LUT)**: MEASURED NEGATIVE, gated OFF.
+  Bit-identical (harness 529 rows/68.4M logits/528 ids exact) but −2.7%
+  decode (42.41 vs 43.59 t/s): divergent constant-cache gathers lose to the
+  threadgroup-staged LUT.  Other prescribed variants are structurally
+  blocked (17-byte block stride ⇒ unaligned loads; register select chains
+  raise ops/byte).  Opt-in kept: `DS4_METAL_ENABLE_MXFP4_CONST_LUT`.
+  The routed-MoE dequant stays issue-rate-bound with no safe lever found —
+  A2's 0.5–1.5 ms is not in this loop.

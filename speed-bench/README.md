@@ -382,6 +382,21 @@ passes, SSD streaming smoke OK.  Interleaved one-shot M3 Ultra prefill A/B:
 532.0), control at 3092 unchanged (650.7 vs 650.6) — ~17–20 ms per chunk of
 drain idle removed.
 
+### A2 probe — MXFP4 dequant constant-space LUT: measured negative, gated off (Aug 22)
+
+The prescribed inner-loop variant: read the 16-entry MXFP4 value LUT
+straight from constant space (no threadgroup staging, one less barrier per
+threadgroup) in the two decode fixed-route kernels (pair-SwiGLU static,
+sum6+HC4 static; templated `LUT_CONST` shares the same bodies).
+Bit-identical (harness: 529 rows / 68,389,120 logits / 528 ids exact),
+but **−2.7% decode** (42.41 vs 43.59 t/s at the harness's 2048-token
+prefix): divergent constant-cache gathers lose to the threadgroup-staged
+LUT on this GPU.  The other prescribed variants are blocked structurally:
+uchar loads can't vectorize (17-byte block stride ⇒ unaligned), and
+register select chains raise ops/byte.  Kept gated OFF (opt-in
+`DS4_METAL_ENABLE_MXFP4_CONST_LUT`), matching the direct-KV precedent.
+The routed-MoE dequant stays issue-rate-bound; no safe lever found here.
+
 ### Metal decode schedule A/B
 
 Build the balanced, same-engine Metal decode comparison with:

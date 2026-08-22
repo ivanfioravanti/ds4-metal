@@ -188,4 +188,13 @@ dispatch-neutral (5 FFN dispatches either way), the shared expert loses its
 free-ride overlap slot in the router matvec, and the landed sum6+HC4 tail
 fusion disqualifies itself (gates on router_shared_done != 0). The M5 win
 is inseparable from the IQ2-only parallel-FFN concurrent encoder.
-Details in speed-bench/README.md.
+**A2 MXFP4 dequant constant-LUT** — measured negative (bit-exact but −2.7%:
+constant-cache divergent gathers lose to threadgroup staging); the uint2
+and register-select variants are structurally blocked (17-byte stride ⇒
+unaligned loads; select chains raise ops/byte). Opt-in kept as
+`DS4_METAL_ENABLE_MXFP4_CONST_LUT`. Details in speed-bench/README.md.
+
+**Decode status after A1–A4 + item 0:** no bit-exact headroom landed in
+this round; decode stays ~45.5 t/s. The Part-1 decision point is reached:
+further decode gains require the requant track (attention projections +
+output head Q8_0→MXFP4, quality-gated by ds4-eval parity, not md5).

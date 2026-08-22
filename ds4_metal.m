@@ -142,8 +142,10 @@ static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_fixed_route_pipeline_nsg1;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_pipeline_nsg1;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_pipeline_nsg1;
+static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_lutconst_pipeline_nsg1;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_pipeline_nsg1;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_hc4_pipeline_nsg1;
+static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_hc4_lutconst_pipeline_nsg1;
 static id<MTLComputePipelineState> g_moe_mul_mv_slots6_mxfp4_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_slots6_mxfp4_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline;
@@ -7893,6 +7895,14 @@ int ds4_gpu_init(void) {
         g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_hc4_pipeline_nsg1 =
             ds4_gpu_new_mul_mv_tg_multiple_pipeline(
                 "kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_hc4_f32", 1);
+        /* A2 probe variants: same kernels with the MXFP4 LUT in constant
+         * space; not in the fatal check so a missing variant just falls back. */
+        g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_lutconst_pipeline_nsg1 =
+            ds4_gpu_new_mul_mv_tg_multiple_pipeline(
+                "kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_lutconst_f32", 1);
+        g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_hc4_lutconst_pipeline_nsg1 =
+            ds4_gpu_new_mul_mv_tg_multiple_pipeline(
+                "kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_hc4_lutconst_f32", 1);
         if (!g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline_nsg1 ||
             !g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1 ||
             !g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline_nsg1_tg_multiple ||
@@ -10445,6 +10455,8 @@ void ds4_gpu_cleanup(void) {
         g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_pipeline_nsg1 = nil;
         g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_pipeline_nsg1 = nil;
         g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_hc4_pipeline_nsg1 = nil;
+        g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_lutconst_pipeline_nsg1 = nil;
+        g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_hc4_lutconst_pipeline_nsg1 = nil;
         g_moe_mul_mv_slots6_mxfp4_pair_swiglu_pipeline = nil;
         g_moe_mul_mv_slots6_mxfp4_sum6_pipeline = nil;
         g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline = nil;
@@ -38927,6 +38939,12 @@ int ds4_gpu_routed_moe_one_tensor(
         int ok = 1;
         const bool write_clamped_moe =
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL;
+        /* A2 probe: MXFP4 value LUT from constant space.  Measured on M3
+         * Ultra: -2.7% decode (constant-cache divergent gathers lose to the
+         * threadgroup-staged LUT).  Kept gated OFF; opt in with
+         * DS4_METAL_ENABLE_MXFP4_CONST_LUT for A/B on other devices. */
+        const bool mxfp4_lut_const =
+            getenv("DS4_METAL_ENABLE_MXFP4_CONST_LUT") != NULL;
         /* The selected nsg=1 encoders dispatch exactly 32 threads. */
         const bool use_mxfp4_moe_decode_tg_multiple =
             ds4_gpu_device_is_pre_m5_apple_silicon() &&
@@ -39012,6 +39030,9 @@ int ds4_gpu_routed_moe_one_tensor(
             pair_swiglu_pipeline = g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline;
             if (ds4_gpu_mxfp4_moe_decode_nsg1_enabled(n_tokens)) {
                 pair_swiglu_pipeline =
+                    (use_mxfp4_moe_decode_static_trip_pair && mxfp4_lut_const &&
+                     g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_lutconst_pipeline_nsg1 != nil) ?
+                        g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_lutconst_pipeline_nsg1 :
                     use_mxfp4_moe_decode_static_trip_pair ?
                         g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_pipeline_nsg1 :
                     use_mxfp4_moe_decode_fixed_route_pair ?
@@ -39048,6 +39069,9 @@ int ds4_gpu_routed_moe_one_tensor(
             down_sum6_pipeline = g_moe_mul_mv_id_mxfp4_sum6_pipeline;
             if (ds4_gpu_mxfp4_moe_decode_nsg1_enabled(n_tokens)) {
                 down_sum6_pipeline =
+                    (use_mxfp4_moe_decode_sum6_hc4 && mxfp4_lut_const &&
+                     g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_hc4_lutconst_pipeline_nsg1 != nil) ?
+                        g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_hc4_lutconst_pipeline_nsg1 :
                     use_mxfp4_moe_decode_sum6_hc4 ?
                         g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_hc4_pipeline_nsg1 :
                     use_mxfp4_moe_decode_static_trip_down ?

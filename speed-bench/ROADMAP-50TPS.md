@@ -182,5 +182,10 @@ dispatch floor + phase streams, not the completion tail. **A3 Q norm/RoPE
 deferral into the attention consumer** — plumbing and norm-tree emulation
 proven bit-exact (math-safe transcripts match exactly), but the YaRN rope
 tail's mul-add blends contract differently in the attention kernel context
-under the fast-math library; not landable bit-exactly. Details in
-speed-bench/README.md.
+under the fast-math library; not landable bit-exactly. **A4
+router_project_select port to pre-M5/MXFP4** — closed by analysis, no code:
+dispatch-neutral (5 FFN dispatches either way), the shared expert loses its
+free-ride overlap slot in the router matvec, and the landed sum6+HC4 tail
+fusion disqualifies itself (gates on router_shared_done != 0). The M5 win
+is inseparable from the IQ2-only parallel-FFN concurrent encoder.
+Details in speed-bench/README.md.

@@ -345,6 +345,23 @@ Fusion rule for this codebase: only contraction-free code (explicit
 reduction trees, builtins, single muls) may move between kernels
 bit-exactly; mul-add chains and transcendental-adjacent blends may not.
 
+### A4 — router_project_select port to pre-M5/MXFP4: closed by analysis (Aug 22)
+
+The M5 kernel folds the top-6 select into the router matvec's last
+threadgroup, but computes no shared-expert work.  Traced the MXFP4 resident
+decode FFN flow: today 5 dispatches — router+shared gate/up fused (the
+shared expert free-rides as extra threadgroups in the router matvec),
+select, early shared-down (independent of the MoE), MoE pair-SwiGLU, and
+the landed sum6+HC4 tail (folds the shared_out add + HC expand).  Porting
+the fused select keeps the count at 5 (router+select, MoE pair, plain sum6,
+shared gate/up late, shared-down+HC expand) while losing both overlap slots
+and disqualifying the sum6+HC4 fusion (`fuse_moe_down_hc` gates on
+`router_shared_done != 0`).  The M5 win is inseparable from the IQ2-gated
+parallel-FFN concurrent encoder (`parallel_full_ffn_eligible`), which does
+not exist for MXFP4.  No code; not measured because the structure is
+dispatch-neutral by direct reading.  The overlap machinery (selected-id
+async loads) never engages for resident decode either way.
+
 ### Metal decode schedule A/B
 
 Build the balanced, same-engine Metal decode comparison with:

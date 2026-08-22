@@ -197,3 +197,8 @@ chain path (all md5 `db0c504c…`, `make test` 44/44):
   raise ops/byte).  Opt-in kept: `DS4_METAL_ENABLE_MXFP4_CONST_LUT`.
   The routed-MoE dequant stays issue-rate-bound with no safe lever found —
   A2's 0.5–1.5 ms is not in this loop.
+- **P5 (chunk sweep)**: DONE, no change. `metal_prefill_variant_bench` grew
+  `--prefill-chunk`. At 8192-token prefix (balanced, 8 runs): 615.9 t/s at
+  chunk 2048, 640.4 at 4096, 645.0 at 8192 — 4096 is near-optimal (8192's
+  +0.7% not worth 2x transients). At 32768 the blocks skew with thermal
+  soak; cross-config still shows no big lever. Keep 4096.

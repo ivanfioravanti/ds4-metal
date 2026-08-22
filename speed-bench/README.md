@@ -397,6 +397,18 @@ register select chains raise ops/byte.  Kept gated OFF (opt-in
 `DS4_METAL_ENABLE_MXFP4_CONST_LUT`), matching the direct-KV precedent.
 The routed-MoE dequant stays issue-rate-bound; no safe lever found here.
 
+### Metal prefill chunk-size sweep (Aug 22, 50 t/s campaign P5)
+
+`metal_prefill_variant_bench` grew a `--prefill-chunk N` option (the harness
+used to hardcode 4096).  Balanced A/B at the 8192-token prefix (8 runs each,
+control and a no-op candidate on the same path): **615.9 t/s at chunk 2048,
+640.4 at 4096, 645.0 at 8192**.  The 4096 default is near-optimal: −4% at
+2048, +0.7% at 8192 — not worth doubling the transient-buffer envelope the
+4096 choice was designed to bound.  At a 32768-token prefix the blocks skew
+with thermal soak (4096: 418–544 t/s within one process; 8192: 572–573),
+consistent with no large chunk lever at long context either.
+Recommendation: keep 4096.
+
 ### Metal decode schedule A/B
 
 Build the balanced, same-engine Metal decode comparison with:

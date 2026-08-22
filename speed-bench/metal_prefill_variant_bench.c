@@ -24,6 +24,7 @@ typedef struct {
     const char *prompt_path;
     const char *candidate_env;
     int prefix_tokens;
+    int prefill_chunk;
     int warmup_tokens;
     int ctx;
     int repeats;
@@ -43,6 +44,7 @@ static void usage(FILE *fp, const char *argv0) {
             "  --prompt-file PATH     token source (default: ds4.c)\n"
             "  --candidate-env NAME   unset NAME for control, set NAME=1 for candidate\n"
             "  --prefix-tokens N      timed prefill length (default: 8192)\n"
+            "  --prefill-chunk N      prefill chunk size (default: 4096)\n"
             "  --warmup-tokens N      untimed tokens per variant (default: 32; min: 32)\n"
             "  --ctx N                session allocation (default: max lengths + 1)\n"
             "  --repeats N            alternating ABBA/BAAB pairs (default: 2)\n",
@@ -78,6 +80,7 @@ static bench_config parse_options(int argc, char **argv) {
         .model_path = "ds4flash.gguf",
         .prompt_path = "ds4.c",
         .candidate_env = NULL,
+        .prefill_chunk = 4096,
         .prefix_tokens = DEFAULT_PREFIX_TOKENS,
         .warmup_tokens = DEFAULT_WARMUP_TOKENS,
         .ctx = 0,
@@ -95,6 +98,8 @@ static bench_config parse_options(int argc, char **argv) {
             cfg.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--candidate-env")) {
             cfg.candidate_env = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--prefill-chunk")) {
+            cfg.prefill_chunk = parse_int_arg(need_arg(&i, argc, argv, arg), arg, 32);
         } else if (!strcmp(arg, "--prefix-tokens")) {
             cfg.prefix_tokens =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg, 1);
@@ -291,7 +296,7 @@ int main(int argc, char **argv) {
         .model_path = cfg.model_path,
         .backend = DS4_BACKEND_METAL,
         .context_size = cfg.ctx,
-        .prefill_chunk = 4096,
+        .prefill_chunk = (uint32_t)cfg.prefill_chunk,
         .power_percent = 100,
         .warm_weights = true,
     };

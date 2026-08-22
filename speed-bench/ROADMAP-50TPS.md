@@ -18,6 +18,18 @@ the wall; norm/rope 21 µs/layer latency), attn_output 4.79 (at the wall),
 router 1.95, HC pre ×2 1.61 (~90% latency), attn core 1.42, head ~0.75–0.9,
 wall−GPU gap 0.1–0.15.
 
+**Round-4 status (this branch, all items measured/closed):** item 0 landed
+(head attributed: logits 0.769 at the wall, argmax 0.086, HC collapse 0.045;
+ledger now closes at 22.7 ms counter-total vs 21.96 wall). A1 neutral+not
+bit-exact (reverted). A3 blocked by fast-math contraction (reverted). A4
+dispatch-neutral on MXFP4 (closed by analysis). A2 const-LUT bit-exact but
+−2.7% (gated off). A5 revised: dedicated two-dispatch top-1 argmax landed
+(86 → ~14 µs/token in the ledger; e2e sub-noise). A6 deferred (gap
+0.1–0.15 ms, largest effort). **Track A landed no e2e decode gain this round;
+decode stays ~45.5 t/s. The requant decision point is REACHED.**
+
+<details><summary>Original Part-1 item text (superseded by round-4 results)</summary>
+
 0. **Pre-step: measure the output head explicitly** (~0.8 ms is unattributed
    in the ledger; chain flush doesn't record to `g_stage_cabs`). Boundary
    around the head or `DS4_METAL_GPU_BUSY_PROFILE`; settles whether
@@ -58,6 +70,7 @@ Expected: realistic +1.2–1.9 ms ⇒ ~48–48.7 t/s; optimistic ⇒ ~50.6 t/s.
 **Decision point: if 50 remains firm after A1+A3+A4 land, the honest route is
 the requant track (attention projections + output head Q8_0→MXFP4 ≈ −4.9 ms ⇒
 ~55 t/s) — a model change, quality-gated by ds4-eval parity, not md5.**
+</details>
 
 ## Part 2 — Prefill program
 
@@ -65,6 +78,21 @@ Findings: large-prefill is **compute-bound** (~19 TFLOPS effective ≈ 70% of
 the M3 Ultra FP16 MMA peak; 2048-token prefix = 663 t/s vs a 240 ms/pass byte
 floor ⇒ 12.9× above it), so big-N wins are ≤1.5× and only via GEMM kernels.
 The short/medium-prompt regime has real structural waste:
+
+**Round-4 status:** P1 landed (+2.7% at ~250 tokens, +1.8% at 637; the
+one-shot CLI passes its progress cb as display_progress unconditionally, so
+even piped runs paid the drains; rollback
+`DS4_METAL_DISABLE_PREFILL_FLUSH_PROGRESS`). P2 landed (commit-only counters
+ported to prefill; compute-bound estimate confirmed — 20.6 TFLOPS effective
+for routed MoE at n=3092; per-layer cost ≈ 8.5 ms fixed + 36 µs/token
+marginal). P3 closed by measurement (~4 ms/process of lazy PSO creates; new
+diagnostic `DS4_METAL_LOG_PIPELINE_CREATES` kept). P5 done (keep 4096; bench
+harness grew `--prefill-chunk`). P6 profiled: decay is the indexer machinery
+(O(n_comp) per chunk: score 18.7×, compressor, indexer_setup, topk), not the
+attention core — follow-on target named in the handoff. P4 scoped (bit-exact
+map in the handoff; the n=6 gap is matvec bandwidth, not re-reads).
+
+<details><summary>Original Part-2 item text</summary>
 
 1. **P1 — kill the 43 per-layer GPU drains in TTY chat prefill** (biggest
    chat win, bit-exact by construction — zero arithmetic change).
@@ -91,6 +119,7 @@ The short/medium-prompt regime has real structural waste:
 6. **P6 — long-context prefill decay** (596.8 t/s @2k ctx → 410.9 @59k for
    2048-token chunks; attention-KV growth). Profile first (P2), then look at
    the indexed-attention staging path at long prefixes.
+</details>
 
 Harnesses: `make metal-prefill-variant-bench` (ABBA, bit-identical abort),
 `ds4-bench` frontier increments (CSV in speed-bench/), CLI

@@ -214,6 +214,34 @@ chain path (all md5 `db0c504c…`, `make test` 44/44):
   arriving TGs the device-scope release/acquire chain did not reliably
   publish per-TG scratch before the last TG's read; the two-dispatch form
   orders by dispatch boundary instead.
+- **P4 (small-N grouped MoE GEMM, 6–31 tokens)**: SCOPED, not implemented.
+  What the N<32 path runs today (traced): a batch dispatch of the decode
+  matvec over (token, slot) pairs — gate/up/mid via
+  `kernel_mul_mv_id_mxfp4_pair_swiglu_f32` (n≤5) or `kernel_mul_mv_id_mxfp4_f32`
+  + `kernel_dsv4_moe_swiglu_weight` (6..31), down via
+  `kernel_mul_mv_id_mxfp4_sum6_f32` (n≤4, cross-slot accumulation) or
+  `kernel_mul_mv_id_mxfp4_f32` + `kernel_dsv4_moe_sum6_f32` (5..31, strict
+  left-to-right slot sum). The n=6 measured gap (1.82 vs 0.63 ms/layer) is
+  NOT re-reads (36 distinct experts at n=6 ⇒ no duplication) — it is the
+  64-thread matvec's ~275 GB/s effective bandwidth; duplication grows to
+  ~30% extra bytes by n=31. A grouped kernel (each distinct expert read
+  once, all selected tokens accumulated in one pass) is bit-exact-feasible
+  IFF it keeps the exact lane map (`ix=tiisg/2`, `it=tiisg&1`), ascending
+  block stride 16, in-block float4 order, the `((x+y)+(z+w))` horizontal
+  add, the scale-multiply position, and per-token `simd_sum` — sharing only
+  the block READ across token accumulators. Must reproduce BOTH down
+  sub-regimes (n≤4 cross-slot vs n≥5 per-slot+sum6). NOTE the hard
+  numerical boundary at n=32 (the mm_id path rounds activations to f16 and
+  uses MMA trees): P4 must match the N<32 reference, not N≥32. Watch the
+  all-tokens-one-expert corner (register pressure cap). Realistic win ~1.2
+  ms of the ~8.5 ms/layer small-N fixed map (~14% at n=6); a shared-expert
+  small-N follow-on is worth a similar amount (shared gate/up+down is 1.24
+  ms/layer at n=6).
+- **A6 (whole-token ICB replay)**: DEFERRED per the roadmap's own gate — the
+  wall−GPU gap is ~0.1–0.15 ms/token (item 0 closed the ledger); building
+  MTLIndirectCommandBuffer machinery from scratch for ~+0.2 t/s does not
+  clear its effort bar this round. Revisit only if the requant track lands
+  and the gap's share grows.
 - **C1 (flag-spin sync probe)**: MEASURED — **1.33 µs median round trip**
   (min 1.08, p90 1.38) for a full CPU-write → GPU-wake → GPU-answer →
   CPU-wake handshake over a Shared-memory flag spin at decode cadence

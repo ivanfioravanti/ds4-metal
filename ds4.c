@@ -28002,6 +28002,21 @@ static bool metal_graph_warmup_prefill_kernels(
 
 /* Encode the batched prefill attention half for one layer.  It mirrors the CPU
  * layer-major path: HC pre/norm, Q/KV, cache/compression, prefix attention. */
+/* Commit-only counter sample with a batch-aware label: prefill (n_tokens >
+ * 1) shares stage names across all layers, so qualify the label with the
+ * layer index to keep per-layer attribution possible.  Decode (n_tokens == 1)
+ * and the output head (il == DS4_N_LAYER) keep the established plain names. */
+static int metal_graph_stage_counter_sample_labeled(const char *stage,
+                                                    uint32_t    il,
+                                                    uint32_t    n_tokens) {
+    if (stage && n_tokens > 1 && il != DS4_N_LAYER) {
+        char label[40];
+        snprintf(label, sizeof(label), "l%02u:%s", il, stage);
+        return ds4_gpu_stage_counter_sample(label);
+    }
+    return ds4_gpu_stage_counter_sample(stage);
+}
+
 static bool metal_graph_indexer_stage_profile_boundary(
         const char *stage,
         uint32_t    il,
@@ -28010,7 +28025,7 @@ static bool metal_graph_indexer_stage_profile_boundary(
         uint32_t    n_comp,
         double     *stage_t0) {
     if (ds4_gpu_stage_counters_enabled()) {
-        return ds4_gpu_stage_counter_sample(stage) != 0;
+        return metal_graph_stage_counter_sample_labeled(stage, il, n_tokens) != 0;
     }
     if (ds4_gpu_end_commands() == 0) return false;
     const double now = now_sec();
@@ -28123,6 +28138,9 @@ static bool metal_graph_decode_stage_profile_enabled(uint32_t il) {
 
 static bool metal_graph_layer_stage_profile_start(uint32_t il) {
     if (!metal_graph_layer_stage_profile_enabled(il)) return true;
+    /* Commit-only counters sample at the stage boundaries; draining here
+     * would serialize the batch token for no added attribution. */
+    if (ds4_gpu_stage_counters_enabled()) return true;
     if (ds4_gpu_end_commands() == 0) return false;
     return ds4_gpu_begin_commands() != 0;
 }
@@ -28139,7 +28157,7 @@ static bool metal_graph_layer_stage_profile_boundary(
         uint32_t    n_tokens,
         double     *stage_t0) {
     if (ds4_gpu_stage_counters_enabled()) {
-        return ds4_gpu_stage_counter_sample(stage) != 0;
+        return metal_graph_stage_counter_sample_labeled(stage, il, n_tokens) != 0;
     }
     if (ds4_gpu_end_commands() == 0) return false;
     const double now = now_sec();
@@ -28164,7 +28182,7 @@ static bool metal_graph_q_stage_profile_boundary(
         uint32_t    n_tokens,
         double     *stage_t0) {
     if (ds4_gpu_stage_counters_enabled()) {
-        return ds4_gpu_stage_counter_sample(stage) != 0;
+        return metal_graph_stage_counter_sample_labeled(stage, il, n_tokens) != 0;
     }
     if (ds4_gpu_end_commands() == 0) return false;
     const double now = now_sec();
@@ -34956,6 +34974,7 @@ static bool metal_graph_prefill_layer_major(
         glm_graph_env_present("DS4_ROCM_GRAPH_PREFILL_PROFILE",
                               "DS4_METAL_GRAPH_PREFILL_PROFILE") ||
         split_profile;
+    const bool stage_counters = ds4_gpu_stage_counters_enabled() != 0;
     const double t0 = profile ? now_sec() : 0.0;
     double encode_s = 0.0;
     double execute_s = 0.0;
@@ -34987,6 +35006,7 @@ static bool metal_graph_prefill_layer_major(
                                                      prompt,
                                                      start,
                                                      n_tokens);
+        if (ok && stage_counters) ds4_gpu_stage_counter_reset();
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
             ok = metal_graph_encode_layer_batch(g,
@@ -35040,6 +35060,7 @@ static bool metal_graph_prefill_layer_major(
         const double t_encoded = profile ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_end_commands() != 0;
         const double t_done = profile ? now_sec() : 0.0;
+        if (ok && stage_counters) ds4_gpu_stage_counter_report(start);
         g->cur_hc_by_tier[src_tier] = saved_cur;
         if (last_hc) ds4_gpu_tensor_free(last_hc);
         if (!ok) {
@@ -35174,6 +35195,7 @@ static bool metal_graph_prefill_layer_major(
         return false;
     }
 
+    if (stage_counters) ds4_gpu_stage_counter_reset();
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         double layer_elapsed = 0.0;
         const bool layer_selected_addr =
@@ -35577,6 +35599,10 @@ static bool metal_graph_prefill_layer_major(
     g->cur_hc_by_tier[g->active_tier] = saved_cur;
     if (last_hc) ds4_gpu_tensor_free(last_hc);
     if (!ok) return false;
+    /* Split-path layers and the head were each drained by end_commands, so
+     * every sampled command buffer is timing-complete here.  Non-final
+     * chunks (logits == NULL) report their layer samples at the same point. */
+    if (stage_counters) ds4_gpu_stage_counter_report(start);
 
     const double t_before_read = profile ? now_sec() : 0.0;
     if (logits) {

@@ -130,3 +130,13 @@ chain path (all md5 `db0c504c…`, `make test` 44/44):
   Ledger fully closes: 6.86 MoE + 5.17 q_path + 4.79 attn_output + 1.92
   router + 1.37 attn core + 1.69 HC pre×2 + 0.90 head = 22.7 ms counter
   total (wall 21.96).
+- **P2 (prefill stage counters)**: commit-only counters ported to prefill —
+  `lNN:stage` labels, no per-layer drain under counters, per-chunk
+  reset/report in both prefill schedules. Settled: routed MoE at n=3092
+  runs 20.6 TFLOPS effective (compute-bound estimate confirmed); per-layer
+  cost ≈ 8.5 ms fixed + 36 µs/token marginal; small-N fixed map at n=6:
+  routed_moe 1.82 (≈3× its byte floor), hc_pre ×2 1.70, output_proj 0.82
+  ms/layer. Also found: the one-shot CLI passes its progress callback as
+  `display_progress` unconditionally, so the 43-drain `callback_split`
+  schedule hits every ≥32-token one-shot prefill regardless of TTY (P1's
+  exact target).

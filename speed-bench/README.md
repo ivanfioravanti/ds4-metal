@@ -261,6 +261,42 @@ line: routed_moe 6.86, q_path 5.17, attn_output 4.79, router 1.92, attention
 core 1.37, HC pre ×2 1.69, head 0.90 — 22.7 ms with the ~0.7 ms counter
 commit tax versus the 21.96 ms production wall.
 
+### Metal prefill stage counters (Aug 22, 50 t/s campaign P2)
+
+The commit-only stage counters now cover prefill.  The batch layer encode
+already carried per-stage boundaries; counter mode now labels them
+`lNN:stage`, `metal_graph_layer_stage_profile_start` no longer drains per
+layer under counters, and `metal_graph_prefill_layer_major` resets/reports
+per chunk in both the single-buffer and split schedules (split-path samples
+are timing-complete because each layer still ends in `end_commands`).  The
+full env set:
+
+```
+DS4_METAL_STAGE_COUNTERS=1 DS4_METAL_LAYER_STAGE_PROFILE=1 \
+  DS4_METAL_Q_STAGE_PROFILE=1 DS4_METAL_INDEXER_STAGE_PROFILE=1 \
+  DS4_METAL_OUTPUT_STAGE_PROFILE=1 ./ds4 -m ds4flash.gguf --prompt-file …
+```
+
+M3 Ultra MXFP4 warm-page ledgers (one-shot; the one-shot CLI passes its
+progress callback as `display_progress` unconditionally, so ≥32-token
+prefills take the per-layer-drain split schedule regardless of TTY — the
+P1 target; busy spans below are still faithful):
+
+- n=6 tokens, 337 ms/pass — the per-layer fixed-cost map: routed_moe 1.82
+  ms/layer (36 distinct experts × ~14 MB ≈ 0.50 GB ⇒ 0.63 ms byte floor;
+  ~3× above it — the small-N GEMM waste P4 targets), hc_pre ×2 1.70,
+  output_proj 0.82, shared gate/up+down 1.24, indexer_setup 0.93 per
+  ratio-4 layer, compressor 0.57, q_b 0.29, attention 0.26, router 0.25,
+  kv_path 0.19.
+- n=637, 1391 ms (32 ms/layer): routed_moe 44.4%, output_proj 13.9%,
+  attention 9.0%, hc_pre 6.6%, q_b 6.2%, shared_gate_up 4.0%, kv_path 4.0%.
+- n=3092, 5184 ms (121 ms/layer): routed_moe 37.6% at **20.6 TFLOPS
+  effective** — the compute-bound estimate (~19 TFLOPS ≈ 70% of FP16 MMA
+  peak) confirmed from stage data; attention 13.7%, output_proj 15.4%.
+
+Per-layer cost model from the three points: ~8.5 ms fixed + ~36 µs/token
+marginal.  Decode oracles unchanged (`db0c504c…` n=128), `make test` passes.
+
 ### Metal decode schedule A/B
 
 Build the balanced, same-engine Metal decode comparison with:

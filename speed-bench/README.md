@@ -362,6 +362,26 @@ not exist for MXFP4.  No code; not measured because the structure is
 dispatch-neutral by direct reading.  The overlap machinery (selected-id
 async loads) never engages for resident decode either way.
 
+### Metal commit-only prefill split for display progress (Aug 22, 50 t/s campaign P1)
+
+The `callback_split` schedule (`display_progress != NULL && n_tokens >= 32`)
+forced 43 per-layer `end_commands` drains per chunk solely so the progress
+bar updated — and because the one-shot CLI passes its progress callback as
+`display_progress` unconditionally, even piped one-shot runs paid them.
+When the split exists only for progress (`n_tokens <= 2048`, not
+streaming/throttle/imatrix/split-profile), each layer now commits without
+waiting via `ds4_gpu_flush_commands_progress`, and the bar rides each
+command buffer's completion handler (GPU-true timing, no host drain).
+>2048-token chunks keep draining (they also bound transient memory).
+Rollback: `DS4_METAL_DISABLE_PREFILL_FLUSH_PROGRESS=1`.
+
+Zero arithmetic change: md5 `ed17c76a…` on a 637-token prompt (-n 32) is
+identical with/without the flush, the `db0c504c…` oracle holds, `make test`
+passes, SSD streaming smoke OK.  Interleaved one-shot M3 Ultra prefill A/B:
+**+2.7% at ~250 tokens** (411.5 vs 400.7 t/s), **+1.8% at 637** (541.9 vs
+532.0), control at 3092 unchanged (650.7 vs 650.6) — ~17–20 ms per chunk of
+drain idle removed.
+
 ### Metal decode schedule A/B
 
 Build the balanced, same-engine Metal decode comparison with:

@@ -170,3 +170,22 @@ chain path (all md5 `db0c504c…`, `make test` 44/44):
   Timing signal from the (divergent) fused build was also not promising
   (43.77 vs 45.5 t/s single-run): the in-place prologue + 3 extra barriers
   may not even beat the removed dispatch.
+- **A4 (router_project_select port to pre-M5/MXFP4)**: CLOSED BY ANALYSIS,
+  no code. The fused select computes no shared-expert work; on MXFP4 decode
+  the FFN block is 5 dispatches either way, and the port would drop the
+  shared expert's free-ride overlap inside the router matvec AND disqualify
+  the landed sum6+HC4 tail fusion (`fuse_moe_down_hc` gates on
+  `router_shared_done != 0`). The M5 win requires the IQ2-only parallel-FFN
+  concurrent encoder, which MXFP4 does not have. Dispatch-neutral by direct
+  reading; not measured.
+- **P1 (prefill progress drains)**: LANDED. The callback_split schedule
+  (display_progress != NULL && n_tokens >= 32) forced 43 per-layer drains
+  per chunk just for the progress bar — and the one-shot CLI passes its
+  progress callback as display_progress unconditionally, so even piped
+  one-shot prefills paid them. Now: commit-only per-layer flush +
+  completion-handler progress (`ds4_gpu_flush_commands_progress`) for
+  n_tokens <= 2048; >2048 chunks keep draining (transient-memory bound).
+  Zero arithmetic change (md5 ed17c76a… long-prompt identical, db0c504c…
+  holds, make test OK, SSD streaming smoke OK). +2.7% prefill at ~250
+  tokens, +1.8% at 637, control unchanged at 3092. Rollback
+  `DS4_METAL_DISABLE_PREFILL_FLUSH_PROGRESS=1`.

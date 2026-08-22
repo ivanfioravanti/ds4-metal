@@ -202,3 +202,10 @@ chain path (all md5 `db0c504c…`, `make test` 44/44):
   chunk 2048, 640.4 at 4096, 645.0 at 8192 — 4096 is near-optimal (8192's
   +0.7% not worth 2x transients). At 32768 the blocks skew with thermal
   soak; cross-config still shows no big lever. Keep 4096.
+- **P3 (PSO pre-warm)**: CLOSED BY MEASUREMENT, no warmup-list change. New
+  env-gated diagnostic `DS4_METAL_LOG_PIPELINE_CREATES` (logs every lazy
+  PSO creation with its cost) shows a prefill lazily compiles 108 pipelines
+  for **~4.2 ms total**, once per process — harness/bench warmups already
+  absorb it, and a hardcoded pre-warm list would silently drift from the
+  encode path for a gain far below first-turn noise. Diagnostic kept;
+  nothing to warm.

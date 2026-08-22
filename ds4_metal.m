@@ -2258,7 +2258,13 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mm_pipeline(
     }
 
     error = nil;
+    const int log_creates = getenv("DS4_METAL_LOG_PIPELINE_CREATES") != NULL;
+    const double t0 = log_creates ? ds4_gpu_now_ms() : 0.0;
     id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    if (log_creates) {
+        fprintf(stderr, "ds4: pipeline create %s(fc) %.3f ms\n",
+                function_name, ds4_gpu_now_ms() - t0);
+    }
     if (!pipeline) {
         fprintf(stderr, "ds4: Metal %s pipeline failed: %s\n",
                 function_name, [[error localizedDescription] UTF8String]);
@@ -2292,7 +2298,13 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mm_id_pipeline(
     }
 
     error = nil;
+    const int log_creates = getenv("DS4_METAL_LOG_PIPELINE_CREATES") != NULL;
+    const double t0 = log_creates ? ds4_gpu_now_ms() : 0.0;
     id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    if (log_creates) {
+        fprintf(stderr, "ds4: pipeline create %s(fc) %.3f ms\n",
+                function_name, ds4_gpu_now_ms() - t0);
+    }
     if (!pipeline) {
         fprintf(stderr, "ds4: Metal %s pipeline failed: %s\n",
                 function_name, [[error localizedDescription] UTF8String]);
@@ -2309,6 +2321,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_pipeline(
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
     if (cached) return cached;
 
+    const int log_creates = getenv("DS4_METAL_LOG_PIPELINE_CREATES") != NULL;
     NSError *error = nil;
     NSString *name = [NSString stringWithUTF8String:function_name];
     id<MTLFunction> fn = [g_library newFunctionWithName:name];
@@ -2317,7 +2330,12 @@ static id<MTLComputePipelineState> ds4_gpu_get_pipeline(
         return nil;
     }
 
+    const double t0 = log_creates ? ds4_gpu_now_ms() : 0.0;
     id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    if (log_creates) {
+        fprintf(stderr, "ds4: pipeline create %s %.3f ms\n",
+                function_name, ds4_gpu_now_ms() - t0);
+    }
     if (!pipeline) {
         fprintf(stderr, "ds4: Metal %s pipeline failed: %s\n",
                 function_name, [[error localizedDescription] UTF8String]);
@@ -2873,7 +2891,13 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_pipeline(
     }
 
     error = nil;
+    const int log_creates = getenv("DS4_METAL_LOG_PIPELINE_CREATES") != NULL;
+    const double t0 = log_creates ? ds4_gpu_now_ms() : 0.0;
     id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    if (log_creates) {
+        fprintf(stderr, "ds4: pipeline create %s(fc) %.3f ms\n",
+                function_name, ds4_gpu_now_ms() - t0);
+    }
     if (!pipeline) {
         fprintf(stderr, "ds4: Metal %s pipeline failed: %s\n",
                 function_name, [[error localizedDescription] UTF8String]);
@@ -3148,7 +3172,13 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_ext_pipeline(
     }
 
     error = nil;
+    const int log_creates = getenv("DS4_METAL_LOG_PIPELINE_CREATES") != NULL;
+    const double t0 = log_creates ? ds4_gpu_now_ms() : 0.0;
     id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    if (log_creates) {
+        fprintf(stderr, "ds4: pipeline create %s(fc) %.3f ms\n",
+                function_name, ds4_gpu_now_ms() - t0);
+    }
     if (!pipeline) {
         fprintf(stderr, "ds4: Metal %s pipeline failed: %s\n",
                 function_name, [[error localizedDescription] UTF8String]);
@@ -3359,7 +3389,13 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_pipeline(
     }
 
     error = nil;
+    const int log_creates = getenv("DS4_METAL_LOG_PIPELINE_CREATES") != NULL;
+    const double t0 = log_creates ? ds4_gpu_now_ms() : 0.0;
     id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    if (log_creates) {
+        fprintf(stderr, "ds4: pipeline create %s(fc) %.3f ms\n",
+                function_name, ds4_gpu_now_ms() - t0);
+    }
     if (!pipeline) {
         fprintf(stderr, "ds4: Metal %s pipeline failed: %s\n",
                 function_name, [[error localizedDescription] UTF8String]);
@@ -3449,7 +3485,13 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_vec_pipeline(
     }
 
     error = nil;
+    const int log_creates = getenv("DS4_METAL_LOG_PIPELINE_CREATES") != NULL;
+    const double t0 = log_creates ? ds4_gpu_now_ms() : 0.0;
     id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    if (log_creates) {
+        fprintf(stderr, "ds4: pipeline create %s(fc) %.3f ms\n",
+                function_name, ds4_gpu_now_ms() - t0);
+    }
     if (!pipeline) {
         fprintf(stderr, "ds4: Metal %s pipeline failed: %s\n",
                 function_name, [[error localizedDescription] UTF8String]);

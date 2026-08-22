@@ -173,3 +173,10 @@ micro-variants (8 tried, ≤0.03%); split-schedule sweep; Wa+Wb fusion;
 pair+down single dispatch; expert prefetch/affinity; KV direct read (−7%);
 mid-layer CPU offload (sync math); HC tail fusion (landed, neutral);
 eight-row prefill staging (negative).
+
+Round 4 (this branch, measured): **A1 HC producer tail restructure** —
+parallel-lane Sinkhorn comb is not bit-exact (the serial 4-row-unrolled
+source compiles to row-position-dependent reduction trees; rows 0/3 land one
+ulp off) AND speed-neutral (45.90 vs 45.92 t/s); the stage cost is the
+dispatch floor + phase streams, not the completion tail. Details in
+speed-bench/README.md.

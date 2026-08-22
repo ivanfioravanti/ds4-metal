@@ -297,6 +297,30 @@ P1 target; busy spans below are still faithful):
 Per-layer cost model from the three points: ~8.5 ms fixed + ~36 µs/token
 marginal.  Decode oracles unchanged (`db0c504c…` n=128), `make test` passes.
 
+### A1 probe — HC producer tail restructure: measured neutral, reverted (Aug 22)
+
+The fused decode HC producer (`kernel_dsv4_hc_rms_norm_mix_f16_cluster2_
+pre_norm`, ~19.6 µs/call ×86/token) was restructured per roadmap A1: the
+4×4 Sinkhorn comb parallelized one-row-per-lane (double-buffered shmem
+staging, one simdgroup barrier per iteration, redundant per-lane column
+normalization in the original order) and the all-thread device seq_cst
+fences shrunk to single-lane release/acquire.  Two independent findings:
+
+- **Not bit-exact**: the serial comb's four unrolled rows compile to a
+  row-position-dependent reduction tree (cross-row SIMD reassociation); the
+  per-lane version lands rows 0/3 one ulp off (rows 1/2 exact), amplified to
+  ~6e-8 over the 20 iterations — deterministic, dump-bisected to the comb
+  slice (mixes and collapse outputs bitwise identical).  A per-lane rewrite
+  cannot reproduce the serial kernel's compiled arithmetic from source.
+- **Speed-neutral anyway**: interleaved CLI A/B, 45.90/45.87 vs
+  45.92/45.91 t/s — the completion protocol + serial Sinkhorn hold no
+  measurable latency; the stage's ~20 µs is dispatch/dependency floor plus
+  the phase-1/2 streams, not the tail.  (The one fused dispatch boundary
+  costs ~9 µs; cf. hc_flat_norm.)
+
+Reverted; no rollback env retained because the variant was not bit-exact.
+A1's 0.7–1.0 ms estimate does not exist in the tail.
+
 ### Metal decode schedule A/B
 
 Build the balanced, same-engine Metal decode comparison with:

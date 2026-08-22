@@ -140,3 +140,12 @@ chain path (all md5 `db0c504c…`, `make test` 44/44):
   `display_progress` unconditionally, so the 43-drain `callback_split`
   schedule hits every ≥32-token one-shot prefill regardless of TTY (P1's
   exact target).
+- **A1 (HC producer tail)**: MEASURED NEGATIVE, reverted. Parallel
+  4-lane Sinkhorn comb + shrunk completion fences: (a) not bit-exact —
+  the serial comb's four unrolled rows compile to row-position-dependent
+  reduction trees; per-lane rewrite lands rows 0/3 one ulp off
+  (dump-bisected: mixes and collapse bitwise identical, comb differs);
+  (b) speed-neutral anyway: 45.90/45.87 vs 45.92/45.91 t/s interleaved.
+  The stage's ~19.6 µs/call is dispatch floor + phase streams, not the
+  tail. Do not retry the tail; any real hc_pre win must attack the dispatch
+  boundary itself (fusion) or the phase-1/2 streams.

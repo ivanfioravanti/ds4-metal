@@ -197,6 +197,23 @@ chain path (all md5 `db0c504c…`, `make test` 44/44):
   raise ops/byte).  Opt-in kept: `DS4_METAL_ENABLE_MXFP4_CONST_LUT`.
   The routed-MoE dequant stays issue-rate-bound with no safe lever found —
   A2's 0.5–1.5 ms is not in this loop.
+- **A5 (logits/argmax)**: REVISED + LANDED. Item 0 measured the chain's GPU
+  argmax at 86 µs/token (a full bitonic argsort for top-1) — 4x the
+  roadmap's fusion estimate. Landed instead: a dedicated two-dispatch top-1
+  kernel (per-thread ascending scans + lexicographic value-desc/index-asc
+  reduce trees — a total order, so tree-independent and bit-exact with
+  sample_argmax's lowest-index ties by construction; stage 2 as its own tiny
+  dispatch, no atomics; 8-deep scratch ring for in-flight chain buffers).
+  Verified: standalone driver 200/200 serial + overlap PASS ×3, oracles
+  db0c504c…/ed17c76a… hold, chain-verify 0/256, harness bit-identical,
+  make test OK. Ledger: argmax 86 → ~14 µs/token. E2E flat within noise
+  (~0.3% sub-noise at 45.5 t/s); ledger-confirmed win. Rollback
+  `DS4_METAL_DISABLE_DECODE_ARGMAX_TOP1=1`.
+  Gotcha worth remembering: the single-dispatch completion-counter variant
+  was sporadically wrong under back-to-back command buffers — at 256
+  arriving TGs the device-scope release/acquire chain did not reliably
+  publish per-TG scratch before the last TG's read; the two-dispatch form
+  orders by dispatch boundary instead.
 - **P5 (chunk sweep)**: DONE, no change. `metal_prefill_variant_bench` grew
   `--prefill-chunk`. At 8192-token prefix (balanced, 8 runs): 615.9 t/s at
   chunk 2048, 640.4 at 4096, 645.0 at 8192 — 4096 is near-optimal (8192's

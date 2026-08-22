@@ -409,6 +409,18 @@ with thermal soak (4096: 418–544 t/s within one process; 8192: 572–573),
 consistent with no large chunk lever at long context either.
 Recommendation: keep 4096.
 
+### Long-context prefill decay profile (Aug 22, 50 t/s campaign P6)
+
+Profiled with the P2 commit-only counters on a ~59k-token prompt (15 chunks
+of 4096): per-chunk GPU busy grows 6.81 → 10.51 s monotonically.  The decay
+is **not** the attention core (1.29×); it is the indexer machinery, which is
+O(n_comp) per chunk: `score` 95→1782 ms/chunk (18.7×), `compressor`
+0→1700 ms, `indexer_setup` 102→1142 ms, `topk` 20→275 ms.  (Chunk-0 routed
+MoE reads ~25% high from first-touch page faults; steady-state compute
+stages are flat per chunk.)  Follow-on target: the indexer score pass
+(`ds4_gpu_indexer_scores_batch_tensor`) at long prefixes and the
+compressor's per-chunk work.
+
 ### Metal decode schedule A/B
 
 Build the balanced, same-engine Metal decode comparison with:

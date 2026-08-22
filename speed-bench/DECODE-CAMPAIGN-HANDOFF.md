@@ -209,3 +209,13 @@ chain path (all md5 `db0c504c…`, `make test` 44/44):
   absorb it, and a hardcoded pre-warm list would silently drift from the
   encode path for a gain far below first-turn noise. Diagnostic kept;
   nothing to warm.
+- **P6 (long-context prefill decay)**: PROFILED with the P2 counters. A
+  ~59k-token prompt (15 chunks of 4096) grows per-chunk GPU busy
+  6.81 → 10.51 s monotonically. The decay is NOT the attention core
+  (1.29x): it is the indexer machinery, which is O(n_comp) per chunk —
+  `score` 95→1782 ms/chunk (18.7x), `compressor` 0→1700, `indexer_setup`
+  102→1142, `topk` 20→275 (chunk-0 MoE-inflated ~25% by first-touch page
+  faults; steady-state compute stages are flat). Target for a follow-on:
+  the indexer score pass (`ds4_gpu_indexer_scores_batch_tensor` →
+  kernel_dsv4_indexer_scores_tiled_*) at long prefixes — its GEMM shape
+  versus n_comp, and the compressor's per-chunk work at long context.

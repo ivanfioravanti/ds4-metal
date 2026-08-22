@@ -230,6 +230,37 @@ fusion neutral, direct-KV negative, and the concurrent shared-expert stream
 remaining wall−GPU gap is ~0.1 ms/token; further gains need a cheaper MoE or
 attention core, not packaging.
 
+### Metal decode head attribution + chain-mode stage counters (Aug 22, 50 t/s campaign item 0)
+
+The ledger's last unattributed ~0.8 ms is now measured; two tooling gaps had
+hidden it.  The output head had no stage boundary after the vocab matvec, so
+the final `end_commands` command buffer absorbed it, and the greedy chain
+never reported counters at all (it also refused to engage under
+`DS4_METAL_DECODE_STAGE_PROFILE`).  A `logits` output-stage boundary
+(`DS4_METAL_OUTPUT_STAGE_PROFILE=1`) now closes the classic ledger, and the
+chain reports per-token counters itself: each token ends with an `argmax`
+sample covering the GPU argmax + event-signal tail, and a token's stages are
+reported only at its confirm wait (GPUEndTime is unset in flight), with the
+encode-ahead tokens' samples compacted for their own later reports.  The
+chain now engages under commit-only counters; end-and-wait profiling still
+forces the classic loop.
+
+```
+DS4_METAL_STAGE_COUNTERS=1 DS4_METAL_DECODE_STAGE_PROFILE=1 \
+  DS4_METAL_OUTPUT_STAGE_PROFILE=1 ./ds4 -m ds4flash.gguf \
+  -p "Write a short story." -c 8192 -n 24 --temp 0
+```
+
+M3 Ultra MXFP4 short-context chain decode (mean of 17 non-ratio-boundary
+tokens): the head costs **0.90 ms/token** — Q8_0 logits matvec 0.769
+(129280×4096, ~563 MB at ~730 GB/s: at the wall), GPU argmax 0.086 (a full
+bitonic descending argsort for top-1 over 505 KiB — ~10× a dedicated
+blockwise reduce, so A5's logits-epilogue top-1 fusion can recover most of
+it), HC collapse stages 0.045.  The ledger now sums to the total-cb-busy
+line: routed_moe 6.86, q_path 5.17, attn_output 4.79, router 1.92, attention
+core 1.37, HC pre ×2 1.69, head 0.90 — 22.7 ms with the ~0.7 ms counter
+commit tax versus the 21.96 ms production wall.
+
 ### Metal decode schedule A/B
 
 Build the balanced, same-engine Metal decode comparison with:

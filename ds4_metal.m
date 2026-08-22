@@ -1038,6 +1038,37 @@ void ds4_gpu_stage_counter_reset(void) {
     g_stage_cb_idx = 0;
 }
 
+uint32_t ds4_gpu_stage_counter_count(void) {
+    return g_stage_cb_idx;
+}
+
+/* Report entries [0, head) as one token's stages and compact the rest down.
+ * Greedy chain decode can only report a token after its confirm wait (a
+ * command buffer's GPUEndTime is unset while it is in flight), while the
+ * samples of the tokens encoded ahead of the confirm cursor must stay
+ * queued for their own later report. */
+void ds4_gpu_stage_counter_report_head(uint32_t pos, uint32_t head) {
+    if (head > g_stage_cb_idx) head = g_stage_cb_idx;
+    double total_busy = 0.0;
+    for (uint32_t i = 0; i < head; i++) {
+        const double busy =
+            g_stage_cbs[i].GPUEndTime - g_stage_cbs[i].GPUStartTime;
+        total_busy += busy;
+        fprintf(stderr, "ds4: stage-counter pos=%u seq=%u %s=%.4f ms\n",
+                pos, i, g_stage_names[i], busy * 1000.0);
+        g_stage_cbs[i] = nil;
+    }
+    fprintf(stderr, "ds4: stage-counter pos=%u total-cb-busy=%.4f ms n=%u\n",
+            pos, total_busy * 1000.0, head);
+    for (uint32_t i = head; i < g_stage_cb_idx; i++) {
+        g_stage_cbs[i - head] = g_stage_cbs[i];
+        g_stage_cbs[i] = nil;
+        snprintf(g_stage_names[i - head],
+                 sizeof(g_stage_names[0]), "%s", g_stage_names[i]);
+    }
+    g_stage_cb_idx -= head;
+}
+
 void ds4_gpu_stage_counter_report(uint32_t pos) {
     double total_busy = 0.0;
     for (uint32_t i = 0; i < g_stage_cb_idx; i++) {

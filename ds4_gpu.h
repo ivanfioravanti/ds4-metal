@@ -116,6 +116,10 @@ int ds4_gpu_stage_counters_enabled(void);
 int ds4_gpu_stage_counter_sample(const char *label);
 void ds4_gpu_stage_counter_reset(void);
 void ds4_gpu_stage_counter_report(uint32_t pos);
+uint32_t ds4_gpu_stage_counter_count(void);
+/* Report the oldest `head` samples as token `pos`'s stages, keeping later
+ * samples queued (greedy chain reports a token at its confirm wait). */
+void ds4_gpu_stage_counter_report_head(uint32_t pos, uint32_t head);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);

@@ -115,3 +115,18 @@ latency" was recoverable by keeping the token id on-device.
   stays contraindicated by the throttling evidence. Wall−GPU gap is ~0.1
   ms/token; the next real gain must come from the MoE or attention core
   itself.
+
+## Round-4 addendum (Aug 22, branch perf/decode-50tps): 50 t/s campaign
+
+Executing speed-bench/ROADMAP-50TPS.md. Ledger baseline re-verified on the
+chain path (all md5 `db0c504c…`, `make test` 44/44):
+
+- **Item 0 (head attribution tooling)**: `logits` output-stage boundary +
+  per-token stage-counter reporting inside the greedy chain (report at each
+  token's confirm wait, encode-ahead samples compacted; chain now engages
+  under commit-only counters). Head = **0.90 ms/token**: Q8_0 logits matvec
+  0.769 (at the wall), GPU argmax 0.086 (full bitonic sort for top-1 — a
+  dedicated reduce is ~10× cheaper; A5's ceiling), HC collapse 0.045.
+  Ledger fully closes: 6.86 MoE + 5.17 q_path + 4.79 attn_output + 1.92
+  router + 1.37 attn core + 1.69 HC pre×2 + 0.90 head = 22.7 ms counter
+  total (wall 21.96).

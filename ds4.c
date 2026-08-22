@@ -25332,6 +25332,7 @@ static bool metal_graph_encode_output_head(
                                                    metal_graph_output_norm(g),
                                                    1);
     }
+    DS4_METAL_PROFILE_OUTPUT_STAGE("logits");
     if (ok) {
         metal_graph_debug_dump_tensor("result_output", metal_graph_logits(g), vocab_dim, DS4_N_LAYER, 0);
     }
@@ -31132,11 +31133,23 @@ static int metal_graph_greedy_chain(
                 pos0, n_evals);
     }
 
+    /* Stage-counter reporting in chain mode: a token's command buffers are
+     * only timing-complete once its confirm wait returns (GPUEndTime is unset
+     * in flight), and the encode-ahead window keeps later tokens' samples
+     * queued behind them.  sc_ring records each token's first sample index;
+     * the confirm path reports and compacts exactly that token's samples.
+     * The per-flush tail (argmax + event signal, plus the head when the
+     * output stage profile is off) is sampled explicitly so the ledger
+     * closes. */
+    const bool stage_counters = ds4_gpu_stage_counters_enabled() != 0;
+    if (stage_counters) ds4_gpu_stage_counter_reset();
     bool ok = ds4_gpu_begin_commands() != 0;
     int encoded = 0;            /* evals committed: eval(j) for j in [0, encoded) */
     bool stop = false;
     uint64_t ev_ring[DS4_GREEDY_CHAIN_AHEAD] = {0};
+    uint32_t sc_ring[DS4_GREEDY_CHAIN_AHEAD] = {0};
     for (int j = 0; ok && j < n_evals && !stop; j++) {
+        if (stage_counters) sc_ring[j % DS4_GREEDY_CHAIN_AHEAD] = ds4_gpu_stage_counter_count();
         ds4_gpu_tensor *vin = ds4_gpu_tensor_view(ring,
                                                   (uint64_t)j * sizeof(int32_t),
                                                   sizeof(int32_t));
@@ -31158,6 +31171,10 @@ static int metal_graph_greedy_chain(
         uint64_t ev = 0;
         ok = ds4_gpu_signal_selected_readback_ready(&ev) != 0;
         if (!ok) break;
+        if (stage_counters) {
+            ok = ds4_gpu_stage_counter_sample("argmax") != 0;
+            if (!ok) break;
+        }
         ok = ds4_gpu_flush_commands() != 0;
         if (!ok) break;
         encoded = j + 1;
@@ -31173,6 +31190,10 @@ static int metal_graph_greedy_chain(
                                      &id,
                                      sizeof(id)) != 0;
             if (!ok) break;
+            if (stage_counters) {
+                ds4_gpu_stage_counter_report_head(pos0 + (uint32_t)k,
+                                                  sc_ring[j % DS4_GREEDY_CHAIN_AHEAD]);
+            }
             if (getenv("DS4_GREEDY_CHAIN_DUMP_IDS")) {
                 fprintf(stderr, "ds4: chain id[%d]=%d\n", k + 1, (int)id);
             }
@@ -31206,6 +31227,13 @@ static int metal_graph_greedy_chain(
                                  &id,
                                  sizeof(id)) != 0;
         if (!ok) break;
+        if (stage_counters) {
+            const uint32_t head =
+                (k + 1 < encoded)
+                    ? sc_ring[(k + 1) % DS4_GREEDY_CHAIN_AHEAD]
+                    : ds4_gpu_stage_counter_count();
+            ds4_gpu_stage_counter_report_head(pos0 + (uint32_t)k, head);
+        }
         if (getenv("DS4_GREEDY_CHAIN_DUMP_IDS")) {
             fprintf(stderr, "ds4: chain id[%d]=%d\n", k + 1, (int)id);
         }
@@ -31213,6 +31241,11 @@ static int metal_graph_greedy_chain(
         else approved++;
     }
     if (ds4_gpu_end_commands() == 0) ok = false;
+    /* An early stop leaves the discarded in-flight token's samples queued;
+     * drop them so a later chain starts clean. */
+    if (stage_counters && ds4_gpu_stage_counter_count() != 0) {
+        ds4_gpu_stage_counter_reset();
+    }
     if (ok && logits_out) {
         ok = ds4_gpu_tensor_read(metal_graph_logits(g),
                                  0,
@@ -49020,7 +49053,11 @@ static int generate_metal_graph_raw_swa(
         !trace_top &&
         !token_timing &&
         getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") == NULL &&
-        getenv("DS4_METAL_DECODE_STAGE_PROFILE") == NULL &&
+        /* End-and-wait decode stage profiling serializes every stage, so it
+         * keeps the classic loop; the commit-only stage counters do not
+         * disturb the chain and are reported per token inside it. */
+        !(getenv("DS4_METAL_DECODE_STAGE_PROFILE") != NULL &&
+          ds4_gpu_stage_counters_enabled() == 0) &&
         !graph_power_throttle_enabled(&g);
     if (chain_ok) {
         const int seed = sample_argmax(logits, DS4_N_VOCAB);

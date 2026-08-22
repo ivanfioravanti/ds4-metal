@@ -214,6 +214,18 @@ chain path (all md5 `db0c504c…`, `make test` 44/44):
   arriving TGs the device-scope release/acquire chain did not reliably
   publish per-TG scratch before the last TG's read; the two-dispatch form
   orders by dispatch boundary instead.
+- **C1 (flag-spin sync probe)**: MEASURED — **1.33 µs median round trip**
+  (min 1.08, p90 1.38) for a full CPU-write → GPU-wake → GPU-answer →
+  CPU-wake handshake over a Shared-memory flag spin at decode cadence
+  (self-contained microbenchmark, 1968 iterations, one spinning kernel).
+  So the roadmap's <5 µs revisit threshold is met: MTLSharedEvent wake
+  (100s of µs) was the blocker, not flag spin. BUT the CPU question still
+  closes: the HC-pre producer stage is *serially dependent* — the GPU has
+  no other work in the layer to overlap a CPU computation with; offload
+  just moves the same latency and burns shared fabric, with CPU compute of
+  the mix+collapse not clearly faster than the GPU's latency-bound kernel.
+  No HC-pre CPU offload. (Probe source kept at speed-bench level: it was a
+  one-off /tmp microbenchmark, self-contained Metal + mach_absolute_time.)
 - **P5 (chunk sweep)**: DONE, no change. `metal_prefill_variant_bench` grew
   `--prefill-chunk`. At 8192-token prefix (balanced, 8 runs): 615.9 t/s at
   chunk 2048, 640.4 at 4096, 645.0 at 8192 — 4096 is near-optimal (8192's

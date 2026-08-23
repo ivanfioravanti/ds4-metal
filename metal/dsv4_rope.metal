@@ -723,7 +723,10 @@ kernel void kernel_flash_attn_ext_vec_reduce_rope(
 struct ds4_metal_args_dsv4_comp_finalize {
     ds4_metal_args_dsv4_rope_affine_pair rope;
     float    rms_eps;
-    uint32_t pad0;
+    /* 0 = both compressors (decode), 1 = attention only, 2 = indexer only.
+     * The single-compressor modes serve the DSpark verify loops, where the
+     * two compressors emit from separate per-token loops. */
+    uint32_t mode;
 };
 
 /* Decode-only emit-path fusion.  Every ratio-th token, each layer finalizes
@@ -731,6 +734,12 @@ struct ds4_metal_args_dsv4_comp_finalize {
  * then the FP8 round-trip + F16 commit copy (attention, 512 floats) or the
  * Hadamard+FP4 QAT (indexer, 128 floats).  Those were seven single-row
  * dispatches; this kernel is one dispatch with two threadgroups.
+ *
+ * args.mode selects the work: 0 runs both compressors plus both ratio-4
+ * shifts (decode), 1 runs attention only, 2 runs indexer only.  The
+ * single-compressor modes exist for the DSpark verify loops, where the
+ * attention and indexer compressors emit from separate per-token loops; the
+ * per-phase arithmetic is identical in every mode.
  *
  * Each phase reproduces its standalone kernel bit-exactly:
  *  - norm: kernel_rms_norm_mul_f32_4's tree (float4 lanes, simd_sum, zero-
@@ -764,6 +773,9 @@ kernel void kernel_dsv4_comp_row_finalize_f32(
 
     if (tgpig == 0) {
         /* -------- attention compressor row (512 floats) -------- */
+        if (args.mode == 2u) {
+            return;
+        }
         {
             device float4 * y4 = (device float4 *)attn_row;
             device const float4 * x4 = (device const float4 *)attn_row;
@@ -834,8 +846,23 @@ kernel void kernel_dsv4_comp_row_finalize_f32(
     if (tgpig >= 2u) {
         /* Ratio-4 state shifts for both compressors (elementwise row move,
          * so the flat gid mapping is bit-exact): 4*1024 attention elements
-         * then 4*256 indexer elements. */
+         * then 4*256 indexer elements.  Single-compressor modes map gid
+         * directly onto that compressor's shift range. */
         const uint gid = (tgpig - 2u) * 256u + tiitg;
+        if (args.mode == 1u) {
+            const uint n0 = 4u * 1024u;
+            if (gid >= n0) return;
+            attn_state_kv[gid] = attn_state_kv[n0 + gid];
+            attn_state_score[gid] = attn_state_score[n0 + gid];
+            return;
+        }
+        if (args.mode == 2u) {
+            const uint n1 = 4u * 256u;
+            if (gid >= n1) return;
+            index_state_kv[gid] = index_state_kv[n1 + gid];
+            index_state_score[gid] = index_state_score[n1 + gid];
+            return;
+        }
         const uint n0 = 4u * 1024u;
         if (gid < n0) {
             attn_state_kv[gid] = attn_state_kv[n0 + gid];
@@ -851,6 +878,9 @@ kernel void kernel_dsv4_comp_row_finalize_f32(
     }
 
     /* -------- indexer compressor row (128 floats) -------- */
+    if (args.mode == 1u) {
+        return;
+    }
     {
         device float4 * y4 = (device float4 *)index_row;
         device const float4 * x4 = (device const float4 *)index_row;

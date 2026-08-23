@@ -4636,6 +4636,98 @@ kernel void kernel_glm_router_select_one(
     }
 }
 
+/* DSpark verify batch router select (n_tokens 2..6, bias layers): one
+ * 256-thread threadgroup per token fuses the sqrt(softplus) probability
+ * transform and the 256-wide bitonic top-6 selection, replacing the
+ * softplus + sqrt + bias-add + two top-k argsort dispatches of the generic
+ * batch path.  The transform writes probs to device memory and reloads
+ * through a device barrier (the same store/load rounding boundary as the
+ * standalone dispatches), the score bias add matches
+ * kernel_dsv4_router_finalize_one_simd, and the bitonic network is verbatim.
+ * The denominator/weight pass stays in kernel_dsv4_router_weights_batch, so
+ * its rounding sequence is untouched.  Tie order inside the bitonic network
+ * can differ from the argsort merge it replaces; router scores are distinct
+ * in practice. */
+kernel void kernel_dsv4_router_select_batch_fused(
+        constant ds4_metal_args_dsv4_router_select_one & args,
+        device const float *logits,
+        device float *probs,
+        device const float *bias,
+        device int32_t *selected,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    device const float *logits_row = logits + (uint64_t)row * 256u;
+    device float *probs_row = probs + (uint64_t)row * 256u;
+    if (tid < 64) {
+        device const float4 *s = (device const float4 *)logits_row;
+        device float4 *d = (device float4 *)probs_row;
+        const float4 x = s[tid];
+        const float4 sp = select(log(1.0f + exp(x)), x, x > 20.0f);
+        d[tid] = sqrt(sp);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    device volatile const float *reloaded_probs =
+        (device volatile const float *)probs_row;
+
+    threadgroup float *score0_tg = scratch;
+    threadgroup int32_t *idx0_tg =
+        (threadgroup int32_t *)(scratch + 256);
+    threadgroup float *score1_tg = scratch + 512;
+    threadgroup int32_t *idx1_tg =
+        (threadgroup int32_t *)(scratch + 768);
+    const float p = reloaded_probs[tid];
+    float score = args.has_bias ? p + bias[tid] : p;
+    int32_t idx = (int32_t)tid;
+    uint cross_stage = 0;
+
+    for (uint k = 2; k <= 256; k <<= 1) {
+        for (uint j = k >> 1; j > 0; j >>= 1) {
+            float peer_score;
+            int32_t peer_idx;
+            bool take_peer;
+            const bool lower = (tid & j) == 0;
+            const bool descending = (tid & k) == 0;
+
+            if (j < 32) {
+                peer_score = simd_shuffle_xor(score, (ushort)j);
+                peer_idx = simd_shuffle_xor(idx, (ushort)j);
+                take_peer = descending
+                    ? (lower ? score < peer_score : score > peer_score)
+                    : (lower ? score > peer_score : score < peer_score);
+                if (take_peer) {
+                    score = peer_score;
+                    idx = peer_idx;
+                }
+            } else {
+                threadgroup float *score_tg =
+                    (cross_stage & 1u) != 0u ? score1_tg : score0_tg;
+                threadgroup int32_t *idx_tg =
+                    (cross_stage & 1u) != 0u ? idx1_tg : idx0_tg;
+                score_tg[tid] = score;
+                idx_tg[tid] = idx;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const uint other = tid ^ j;
+                peer_score = score_tg[other];
+                peer_idx = idx_tg[other];
+                take_peer = descending
+                    ? (lower ? score < peer_score : score > peer_score)
+                    : (lower ? score > peer_score : score < peer_score);
+                if (take_peer) {
+                    score = peer_score;
+                    idx = peer_idx;
+                }
+                cross_stage++;
+            }
+        }
+    }
+
+    if (tid < 6) {
+        selected[(uint64_t)row * 6u + tid] = idx;
+    }
+}
+
 // Batched Flash-router weight finalization after selection is already known.
 // Six active lanes deliberately match kernel_sum_rows_f32_f32's reduction
 // topology. The denominator and divided weights cross threadgroup storage

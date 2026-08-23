@@ -1221,6 +1221,10 @@ typedef struct {
     bool plain;
     bool warm_weights;
     bool quality;
+    bool dspark;
+    bool dspark_strict;
+    bool dspark_confidence_threshold_set;
+    float dspark_confidence_threshold;
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
@@ -1554,6 +1558,16 @@ static eval_config parse_options(int argc, char **argv) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dspark")) {
+            c.dspark = true;
+        } else if (!strcmp(arg, "--dspark-confidence")) {
+            c.dspark = true;
+            c.dspark_confidence_threshold =
+                parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+            c.dspark_confidence_threshold_set = true;
+        } else if (!strcmp(arg, "--dspark-strict")) {
+            c.dspark = true;
+            c.dspark_strict = true;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
@@ -3851,6 +3865,13 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
      * cannot intervene, so chained and classic decode pick identical tokens. */
     const bool chain_burst_ok =
         cfg->temperature <= 0.0f && ds4_session_chain_greedy_supported(session);
+    /* A loaded support model (DSpark) disables chain bursts; run the same
+     * speculative cycle the CLI uses instead, feeding accepted tokens through
+     * the chain bookkeeping so the emitted stream is identical. */
+    const bool spec_burst_ok =
+        cfg->temperature <= 0.0f &&
+        ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        getenv("DS4_MTP_SPEC_DISABLE") == NULL;
     for (int i = 0; i < generation_limit; i++) {
         if (tty) {
             tui_consume_input(ui);
@@ -3996,6 +4017,66 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                 if (cctx.stop) break;
                 if (cctx.quit || cctx.switch_case) continue; /* handled above */
                 i += n - 1; /* keep i in lockstep with ui->generated */
+                continue;
+            }
+        }
+        /* Speculative burst (DSpark): like the chain burst, stay out of the
+         * think-close window, then commit the cycle and run every accepted
+         * token through the shared bookkeeping callback. */
+        if (token < 0 && spec_burst_ok && remaining_budget >= 2) {
+            int burst = remaining_budget;
+            if (generation_in_think && think_close_tokens.len > 0) {
+                const int window = think_close_tokens.len == 1
+                    ? cfg->soft_limit_reply_budget
+                    : cfg->hard_limit_reply_budget;
+                burst = remaining_budget - window;
+            }
+            if (burst >= 2) {
+                token = ds4_session_sample(session, cfg->temperature, 0,
+                                           cfg->top_p, cfg->min_p, rng);
+                if (ds4_token_is_stop(engine, token)) break;
+                eval_chain_ctx cctx = {
+                    .engine = engine,
+                    .ui = ui,
+                    .idx = idx,
+                    .generation_limit = generation_limit,
+                    .raw = &raw,
+                    .generation_in_think = &generation_in_think,
+                    .plain_in_think = &plain_in_think,
+                    .think_close = &think_close,
+                    .t0 = &t0,
+                    .tty = tty,
+                    .use_plain_color = use_plain_color,
+                };
+                int toks[17];
+                const int ntok = ds4_session_eval_speculative_argmax(
+                    session, token, burst, ds4_token_eos(engine),
+                    toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                    err, sizeof(err));
+                if (ntok < 0) {
+                    plain_reset_color(use_plain_color);
+                    ui->generated_tokens[idx] = ui->generated;
+                    tui_run_clock_stop(ui);
+                    fprintf(stderr, "ds4-eval: decode failed for %s: %s\n",
+                            tc->id, err);
+                    trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR",
+                                     err, system, question,
+                                     raw.v ? raw.v : "", think_mode,
+                                     prompt_tokens, ui->generated,
+                                     now_sec() - t0, "?", &think_close);
+                    free(question);
+                    ds4_tokens_free(&think_close_tokens);
+                    buf_free(&raw);
+                    return EVAL_RUN_ERROR;
+                }
+                int consumed = 0;
+                for (int k = 0; k < ntok; k++) {
+                    if (!eval_chain_on_token(&cctx, toks[k])) break;
+                    consumed++;
+                }
+                if (cctx.stop) break;
+                if (cctx.quit || cctx.switch_case) continue; /* handled above */
+                i += consumed - 1; /* keep i in lockstep with ui->generated */
                 continue;
             }
         }
@@ -4297,6 +4378,10 @@ int main(int argc, char **argv) {
         .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .dspark = cfg.dspark,
+        .dspark_strict = cfg.dspark_strict,
+        .dspark_confidence_threshold = cfg.dspark_confidence_threshold,
+        .dspark_confidence_threshold_set = cfg.dspark_confidence_threshold_set,
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,

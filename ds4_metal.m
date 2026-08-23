@@ -203,6 +203,7 @@ static id<MTLComputePipelineState> g_dsv4_router_finalize_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_finalize_one_simd_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_finalize_weights_one_simd_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_transform_finalize_weights_one_simd_pipeline;
+static id<MTLComputePipelineState> g_dsv4_router_select_batch_fused_pipeline;
 static NSCache<NSString *, id<MTLBuffer>> *g_dsv4_completion_cache;
 static __weak id<MTLBuffer> g_dsv4_hc_producer_last_mix_buffer;
 static NSUInteger g_dsv4_hc_producer_last_mix_offset;
@@ -369,6 +370,31 @@ static id<MTLBuffer> g_dsv4_argmax_top1_scratch_i[DS4_ARGMAX_TOP1_SLOTS];
 static id<MTLComputePipelineState> g_dsv4_argmax_top1_stage1_pipeline;
 static id<MTLComputePipelineState> g_dsv4_argmax_top1_stage2_pipeline;
 static uint32_t g_dsv4_argmax_top1_seq;
+/* One scratch pair: the DSpark markov chain serializes its dispatches on
+ * buffer hazards, so a single set both is safe and forms the dependency. */
+static id<MTLBuffer> g_dsv4_dspark_markov_scratch_v;
+static id<MTLBuffer> g_dsv4_dspark_markov_scratch_i;
+static id<MTLComputePipelineState> g_dsv4_dspark_markov_stage1_pipeline;
+static id<MTLComputePipelineState> g_dsv4_dspark_markov_stage2_pipeline;
+static id<MTLComputePipelineState> g_dsv4_verify_moe_group_map_pipeline;
+static id<MTLComputePipelineState> g_dsv4_verify_moe_gate_up_grouped_pipeline;
+static id<MTLComputePipelineState> g_dsv4_verify_moe_down_grouped_pipeline;
+static id<MTLBuffer> g_dsv4_verify_moe_group_map_buffer;
+/* Set around the DSpark verify layer loop: routes the small-N Q8 matmuls
+ * through the nrow matvec. */
+static int g_dspark_nrow_active = 0;
+static id<MTLComputePipelineState> g_q8_nrow_pipelines[7];
+static id<MTLComputePipelineState> g_q8_nrow_so_pipelines[7];
+static id<MTLComputePipelineState> g_f16_nrow_pipelines[7];
+static id<MTLComputePipelineState> g_attn_out_low_nrow_pipelines[7];
+
+void ds4_gpu_set_dspark_nrow_active(int active) {
+    g_dspark_nrow_active = active;
+}
+
+int ds4_gpu_dspark_nrow_active(void) {
+    return g_dspark_nrow_active;
+}
 static id<MTLBuffer> g_indexed_topk_buffer;
 static id<MTLBuffer> g_f16_round_scratch_buffer;
 static id<MTLBuffer> g_raw_store_round_buffer;
@@ -5304,6 +5330,73 @@ typedef struct {
     int32_t n_tg;
 } ds4_gpu_dsv4_argmax_top1_args;
 
+/* Matches ds4_metal_args_dsv4_dspark_markov_argmax in metal/argsort.metal. */
+typedef struct {
+    int32_t vocab;
+    int32_t rank_blocks;
+    int32_t n_tg;
+    int32_t row_index;
+} ds4_gpu_dsv4_dspark_markov_args;
+
+_Static_assert(sizeof(ds4_gpu_dsv4_dspark_markov_args) == 16,
+               "Metal DSpark markov argmax argument ABI changed");
+
+/* Matches ds4_metal_args_verify_moe_group_map /
+ * ds4_metal_args_verify_moe_grouped in metal/moe.metal. */
+typedef struct {
+    int32_t n_tokens;
+    int32_t n_expert_used;
+    int32_t n_total_expert;
+    int32_t pad;
+} ds4_gpu_verify_moe_group_map_args;
+
+typedef struct {
+    int32_t n_expert_used;
+    int32_t in_dim;
+    int32_t out_dim;
+    int32_t pad0;
+    uint64_t expert_bytes;
+    uint64_t row_bytes;
+    uint64_t x_row_bytes;
+    uint64_t mid_row_bytes;
+    float clamp_value;
+    float pad1;
+} ds4_gpu_verify_moe_grouped_args;
+
+_Static_assert(sizeof(ds4_gpu_verify_moe_group_map_args) == 16,
+               "Metal verify group map argument ABI changed");
+_Static_assert(sizeof(ds4_gpu_verify_moe_grouped_args) == 56,
+               "Metal verify grouped MoE argument ABI changed");
+
+/* Matches ds4_metal_args_mul_mv_nrow in metal/dense.metal. */
+typedef struct {
+    int32_t ne00;
+    int32_t ne01;
+    uint64_t nb01;
+    uint64_t x_row_bytes;
+    uint64_t dst_row_bytes;
+} ds4_gpu_mul_mv_nrow_args;
+
+_Static_assert(sizeof(ds4_gpu_mul_mv_nrow_args) == 32,
+               "Metal nrow matvec argument ABI changed");
+
+/* Matches ds4_metal_args_attn_out_low_nrow in metal/dense.metal. */
+typedef struct {
+    int32_t ne00;
+    int32_t ne01;
+    int32_t n_groups;
+    int32_t pad;
+    uint64_t nb01;
+    uint64_t group_weight_bytes;
+    uint64_t x_group_bytes;
+    uint64_t x_row_bytes;
+    uint64_t dst_group_bytes;
+    uint64_t dst_row_bytes;
+} ds4_gpu_attn_out_low_nrow_args;
+
+_Static_assert(sizeof(ds4_gpu_attn_out_low_nrow_args) == 64,
+               "Metal attention-output nrow argument ABI changed");
+
 _Static_assert(sizeof(ds4_gpu_dsv4_head_norm_rope_args) == 56,
                "Metal DSV4 head norm/RoPE argument ABI changed");
 
@@ -5791,7 +5884,7 @@ typedef struct {
 typedef struct {
     ds4_gpu_rope_affine_pair_args rope;
     float    rms_eps;
-    uint32_t pad0;
+    uint32_t mode;   /* 0 = both compressors, 1 = attention only, 2 = indexer only */
 } ds4_gpu_comp_finalize_args;
 
 /* Set by ds4.c immediately before the decode attention call when the inverse
@@ -8647,6 +8740,8 @@ int ds4_gpu_init(void) {
         g_dsv4_router_transform_finalize_weights_one_simd_pipeline =
             ds4_gpu_get_pipeline(
                 "kernel_dsv4_router_transform_finalize_weights_one_simd");
+        g_dsv4_router_select_batch_fused_pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv4_router_select_batch_fused");
         g_dsv4_router_weights_one_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_router_weights_one");
         g_glm_router_select_one_pipeline =
@@ -10571,6 +10666,7 @@ void ds4_gpu_cleanup(void) {
         g_dsv4_router_finalize_one_simd_pipeline = nil;
         g_dsv4_router_finalize_weights_one_simd_pipeline = nil;
         g_dsv4_router_transform_finalize_weights_one_simd_pipeline = nil;
+        g_dsv4_router_select_batch_fused_pipeline = nil;
         g_dsv4_hc_producer_last_completion = nil;
         g_dsv4_hc_producer_last_mix_buffer = nil;
         g_dsv4_hc_producer_last_mix_offset = 0;
@@ -18172,6 +18268,137 @@ int ds4_gpu_argmax_top1_tensor(
     }
     return 1;
 }
+
+/* Fused DSpark Markov bias + argmax over all draft rows of one propose
+ * round, chained through the out_ring key slots so everything rides a single
+ * command buffer (the per-row commit+wait version costs more than it saves).
+ * Ring slot 0 must be pre-seeded with ~prev_token in its low bits; slots
+ * 1..n_rows receive the CUDA-contract keys
+ * (monotonic_float(score) << 32) | ~index.  Runs the dot against the Q8_0
+ * markov head straight from the mapped support model; the caller falls back
+ * to the CPU path when this returns 0. */
+int ds4_gpu_dspark_markov_argmax_chain_tensor(
+        ds4_gpu_tensor       *out_ring,
+        const ds4_gpu_tensor *logits,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              w1_offset,
+        uint64_t              w2_offset,
+        uint32_t              n_rows,
+        uint32_t              vocab,
+        uint32_t              rank) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out_ring || !logits || !model_map || vocab == 0 || n_rows == 0 ||
+        rank == 0 || (rank & 31u) != 0u || rank > 256u ||
+        ds4_gpu_tensor_bytes(out_ring) <
+            ((uint64_t)n_rows + 1u) * sizeof(uint64_t) ||
+        ds4_gpu_tensor_bytes(logits) <
+            (uint64_t)n_rows * vocab * sizeof(float)) {
+        return 0;
+    }
+    const uint32_t rank_blocks = rank / 32u;
+    const uint64_t row_bytes = (uint64_t)rank_blocks * 34u;
+    if (w1_offset > model_size ||
+        (uint64_t)vocab * row_bytes > model_size - w1_offset ||
+        w2_offset > model_size ||
+        (uint64_t)vocab * row_bytes > model_size - w2_offset) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        enum { MARKOV_TG = 256u, MARKOV_THREADS = 256u };
+        /* A single scratch pair: the chain's dispatches serialize on buffer
+         * hazards anyway (each row reads the previous row's ring slot), so
+         * one set is both safe and dependency-forming. */
+        if (!g_dsv4_dspark_markov_scratch_v) {
+            g_dsv4_dspark_markov_scratch_v =
+                [g_device newBufferWithLength:MARKOV_TG * sizeof(float)
+                    options:MTLResourceStorageModeShared];
+            g_dsv4_dspark_markov_scratch_i =
+                [g_device newBufferWithLength:MARKOV_TG * sizeof(int32_t)
+                    options:MTLResourceStorageModeShared];
+            if (!g_dsv4_dspark_markov_scratch_v ||
+                !g_dsv4_dspark_markov_scratch_i) {
+                return 0;
+            }
+        }
+        if (!g_dsv4_dspark_markov_stage1_pipeline) {
+            g_dsv4_dspark_markov_stage1_pipeline =
+                ds4_gpu_get_pipeline("kernel_dsv4_dspark_markov_argmax_stage1");
+            g_dsv4_dspark_markov_stage2_pipeline =
+                ds4_gpu_get_pipeline("kernel_dsv4_dspark_markov_argmax_stage2");
+            if (!g_dsv4_dspark_markov_stage1_pipeline ||
+                !g_dsv4_dspark_markov_stage2_pipeline) return 0;
+        }
+        if (g_dsv4_dspark_markov_stage1_pipeline.maxTotalThreadsPerThreadgroup <
+                MARKOV_THREADS ||
+            g_dsv4_dspark_markov_stage2_pipeline.maxTotalThreadsPerThreadgroup <
+                MARKOV_THREADS) {
+            return 0;
+        }
+
+        uint64_t w1_inner = 0;
+        uint64_t w2_inner = 0;
+        id<MTLBuffer> w1buf = ds4_gpu_wrap_model_range(
+                model_map, model_size,
+                w1_offset, (uint64_t)vocab * row_bytes,
+                &w1_inner);
+        id<MTLBuffer> w2buf = ds4_gpu_wrap_model_range(
+                model_map, model_size,
+                w2_offset, (uint64_t)vocab * row_bytes,
+                &w2_inner);
+        if (!w1buf || !w2buf) return 0;
+
+        /* Zero the result slots: the caller's "key != 0" validity check must
+         * never see a stale value from an earlier round. */
+        memset((uint8_t *)[ds4_gpu_tensor_buffer(out_ring) contents] +
+               ds4_gpu_tensor_offset(out_ring) + sizeof(uint64_t), 0,
+               (size_t)n_rows * sizeof(uint64_t));
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        for (uint32_t row = 0; row < n_rows; row++) {
+            ds4_gpu_dsv4_dspark_markov_args args = {
+                .vocab = (int32_t)vocab,
+                .rank_blocks = (int32_t)rank_blocks,
+                .n_tg = (int32_t)MARKOV_TG,
+                .row_index = (int32_t)row,
+            };
+            [enc setComputePipelineState:g_dsv4_dspark_markov_stage1_pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(logits)
+                    offset:(NSUInteger)(ds4_gpu_tensor_offset(logits) +
+                           (uint64_t)row * vocab * sizeof(float)) atIndex:1];
+            [enc setBuffer:w1buf offset:(NSUInteger)w1_inner atIndex:2];
+            [enc setBuffer:w2buf offset:(NSUInteger)w2_inner atIndex:3];
+            [enc setBuffer:ds4_gpu_tensor_buffer(out_ring)
+                    offset:ds4_gpu_tensor_offset(out_ring) atIndex:4];
+            [enc setBuffer:g_dsv4_dspark_markov_scratch_v offset:0 atIndex:5];
+            [enc setBuffer:g_dsv4_dspark_markov_scratch_i offset:0 atIndex:6];
+            [enc setThreadgroupMemoryLength:1088u atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(MARKOV_TG, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(MARKOV_THREADS, 1, 1)];
+
+            [enc setComputePipelineState:g_dsv4_dspark_markov_stage2_pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:g_dsv4_dspark_markov_scratch_v offset:0 atIndex:1];
+            [enc setBuffer:g_dsv4_dspark_markov_scratch_i offset:0 atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(out_ring)
+                    offset:(NSUInteger)(ds4_gpu_tensor_offset(out_ring) +
+                           (uint64_t)(row + 1u) * sizeof(uint64_t)) atIndex:3];
+            [enc setThreadgroupMemoryLength:64u atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(MARKOV_THREADS, 1, 1)];
+        }
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "dspark markov chain")) return 0;
+    }
+    return 1;
+}
 int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,
         const ds4_gpu_tensor *topk,
@@ -18336,6 +18563,92 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             ds4_gpu_end_compute_encoder(cb, enc);
 
             if (!ds4_gpu_finish_command_buffer(cb, owned, "Q8_0 tensor matvec")) {
+                return 0;
+            }
+            return 1;
+        }
+
+        /* DSpark verify only, small output extents (router 4096->256): the
+         * NR0=2 nrow grid starves here (out/2 threadgroups), so route to the
+         * wide-NSG small-out nrow variant (one row per threadgroup, NSG=8).
+         * Not bit-exact with mul_mv (different per-lane block subsets); the
+         * verify tolerates that order difference by design.  in_dim >= 2048
+         * keeps at least one weight block per lane. */
+        if (g_dspark_nrow_active && n_tok >= 2u && n_tok <= 6u &&
+            (in_dim % 32u) == 0 && in_dim >= 2048u && in_dim <= UINT32_MAX &&
+            out_dim >= 64u && out_dim < 512u &&
+            getenv("DS4_METAL_DISABLE_Q8_NROW_MATMUL") == NULL &&
+            getenv("DS4_METAL_DISABLE_Q8_NROW_SMALLOUT") == NULL) {
+            id<MTLComputePipelineState> pipeline = g_q8_nrow_so_pipelines[n_tok];
+            if (!pipeline) {
+                char name[64];
+                snprintf(name, sizeof(name),
+                         "kernel_mul_mv_q8_0_nrow_f32_so_n%u", (unsigned)n_tok);
+                pipeline = ds4_gpu_get_pipeline(name);
+                g_q8_nrow_so_pipelines[n_tok] = pipeline;
+            }
+            if (!pipeline) return 0;
+            ds4_gpu_mul_mv_nrow_args nrow_args = {
+                .ne00 = (int32_t)in_dim,
+                .ne01 = (int32_t)out_dim,
+                .nb01 = row_bytes,
+                .x_row_bytes = in_dim * sizeof(float),
+                .dst_row_bytes = out_dim * sizeof(float),
+            };
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:pipeline];
+            [enc setBytes:&nrow_args length:sizeof(nrow_args) atIndex:0];
+            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+            [enc setThreadgroupMemoryLength:8u * 1u * 32u * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim, 1u, 1u)
+                threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            if (!ds4_gpu_finish_command_buffer(cb, owned, "Q8_0 nrow small-out matvec")) {
+                return 0;
+            }
+            return 1;
+        }
+
+        /* DSpark verify only: the 2..6-row Q8 matmuls run far below the
+         * single-row matvec's bandwidth on mv_ext.  The nrow matvec keeps the
+         * single-row kernel's exact per-element math and shares the weight
+         * read across the token rows (bit-exact with mul_mv per token; the
+         * verify tolerates the mv_ext-order difference by design).  Tiny
+         * output extents (hc projections, router) starve the no-k-split
+         * grid, so those stay on mv_ext. */
+        if (g_dspark_nrow_active && n_tok >= 2u && n_tok <= 6u &&
+            (in_dim % 32u) == 0 && in_dim <= UINT32_MAX &&
+            out_dim >= 512u && out_dim <= UINT32_MAX &&
+            getenv("DS4_METAL_DISABLE_Q8_NROW_MATMUL") == NULL) {
+            id<MTLComputePipelineState> pipeline = g_q8_nrow_pipelines[n_tok];
+            if (!pipeline) {
+                char name[64];
+                snprintf(name, sizeof(name),
+                         "kernel_mul_mv_q8_0_nrow_f32_n%u", (unsigned)n_tok);
+                pipeline = ds4_gpu_get_pipeline(name);
+                g_q8_nrow_pipelines[n_tok] = pipeline;
+            }
+            if (!pipeline) return 0;
+            ds4_gpu_mul_mv_nrow_args nrow_args = {
+                .ne00 = (int32_t)in_dim,
+                .ne01 = (int32_t)out_dim,
+                .nb01 = row_bytes,
+                .x_row_bytes = in_dim * sizeof(float),
+                .dst_row_bytes = out_dim * sizeof(float),
+            };
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:pipeline];
+            [enc setBytes:&nrow_args length:sizeof(nrow_args) atIndex:0];
+            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+            [enc setThreadgroupMemoryLength:8u * 2u * 32u * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake((out_dim + 1u) / 2u, 1u, 1u)
+                threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            if (!ds4_gpu_finish_command_buffer(cb, owned, "Q8_0 nrow matvec")) {
                 return 0;
             }
             return 1;
@@ -19917,6 +20230,47 @@ int ds4_gpu_matmul_f16_tensor(
             return 1;
         }
 
+        /* DSpark verify only, small output extents (router 4096->256, HC
+         * projections 16384->24): the f16 mv_ext grid starves at
+         * (out/8) x (n/3) threadgroups, so route to the nrow F16 matvec (one
+         * 256-thread threadgroup per output row).  Not bit-exact with mv_ext
+         * (different chunk-to-lane assignment and reduction tree); the verify
+         * tolerates the order difference by design.  in_dim >= 2048 keeps at
+         * least two half4 chunks per lane. */
+        if (g_dspark_nrow_active && n_tok >= 2u && n_tok <= 6u &&
+            (in_dim % 4u) == 0 && in_dim >= 2048u &&
+            out_dim >= 24u && out_dim < 512u &&
+            getenv("DS4_METAL_DISABLE_F16_NROW_SMALLOUT") == NULL) {
+            id<MTLComputePipelineState> pipeline = g_f16_nrow_pipelines[n_tok];
+            if (!pipeline) {
+                char name[64];
+                snprintf(name, sizeof(name),
+                         "kernel_mul_mv_f16_nrow_f32_n%u", (unsigned)n_tok);
+                pipeline = ds4_gpu_get_pipeline(name);
+                g_f16_nrow_pipelines[n_tok] = pipeline;
+            }
+            if (!pipeline) return 0;
+            ds4_gpu_mul_mv_nrow_args nrow_args = {
+                .ne00 = (int32_t)in_dim,
+                .ne01 = (int32_t)out_dim,
+                .nb01 = row_bytes,
+                .x_row_bytes = in_dim * sizeof(float),
+                .dst_row_bytes = out_dim * sizeof(float),
+            };
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:pipeline];
+            [enc setBytes:&nrow_args length:sizeof(nrow_args) atIndex:0];
+            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+            [enc setThreadgroupMemoryLength:8u * 32u * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim, 1u, 1u)
+                threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            if (!ds4_gpu_finish_command_buffer(cb, owned, "F16 nrow matvec")) return 0;
+            return 1;
+        }
+
         if (n_tok <= 8 && (in_dim % 128u) == 0) {
             const int16_t nsg = 2;
             const int16_t nxpsg = ds4_gpu_mv_ext_nxpsg(in_dim, n_tok);
@@ -20397,7 +20751,7 @@ int ds4_gpu_matmul_f16_quad_compressor_store_tensor(
  * indexer compressor rows (norm + rope + fp8/commit + qat) in one dispatch
  * instead of seven.  Bit-exact vs the separate dispatches; see the kernel
  * comment.  Returns 1 when the fused dispatch ran, 0 to fall back. */
-int ds4_gpu_dsv4_comp_row_finalize_tensor(
+int ds4_gpu_dsv4_comp_row_finalize_mode_tensor(
         ds4_gpu_tensor       *attn_stage,
         ds4_gpu_tensor       *attn_cache,
         uint32_t              attn_comp_row,
@@ -20420,9 +20774,11 @@ int ds4_gpu_dsv4_comp_row_finalize_tensor(
         float                 attn_factor,
         float                 beta_fast,
         float                 beta_slow,
-        float                 rms_eps) {
+        float                 rms_eps,
+        uint32_t              mode) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!attn_stage || !attn_cache || !index_cache || !model_map) return 0;
+    if (mode > 2u) return 0;
 
     @autoreleasepool {
         const uint64_t attn_norm_bytes = 512u * sizeof(float);
@@ -20478,7 +20834,7 @@ int ds4_gpu_dsv4_comp_row_finalize_tensor(
                 .beta_slow = beta_slow,
             },
             .rms_eps = rms_eps,
-            .pad0 = 0,
+            .mode = mode,
         };
 
         int owned = 0;
@@ -20506,7 +20862,10 @@ int ds4_gpu_dsv4_comp_row_finalize_tensor(
         [enc setBuffer:ds4_gpu_tensor_buffer(index_state_score)
                 offset:ds4_gpu_tensor_offset(index_state_score) atIndex:9];
         [enc setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(2u + (4u * 1024u + 4u * 256u + 255u) / 256u, 1, 1)
+        const NSUInteger shift_elems = mode == 1u ? 4u * 1024u
+                                     : mode == 2u ? 4u * 256u
+                                                  : 4u * 1024u + 4u * 256u;
+        [enc dispatchThreadgroups:MTLSizeMake(2u + (shift_elems + 255u) / 256u, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -20516,6 +20875,39 @@ int ds4_gpu_dsv4_comp_row_finalize_tensor(
     }
 
     return 1;
+}
+
+int ds4_gpu_dsv4_comp_row_finalize_tensor(
+        ds4_gpu_tensor       *attn_stage,
+        ds4_gpu_tensor       *attn_cache,
+        uint32_t              attn_comp_row,
+        uint64_t              attn_norm_offset,
+        ds4_gpu_tensor       *index_cache,
+        uint32_t              index_comp_row,
+        uint64_t              index_norm_offset,
+        ds4_gpu_tensor       *attn_state_kv,
+        ds4_gpu_tensor       *attn_state_score,
+        ds4_gpu_tensor       *index_state_kv,
+        ds4_gpu_tensor       *index_state_score,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint32_t              pos,
+        uint32_t              n_rot,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        float                 rms_eps) {
+    return ds4_gpu_dsv4_comp_row_finalize_mode_tensor(
+            attn_stage, attn_cache, attn_comp_row, attn_norm_offset,
+            index_cache, index_comp_row, index_norm_offset,
+            attn_state_kv, attn_state_score, index_state_kv, index_state_score,
+            model_map, model_size, pos, n_rot, n_ctx_orig,
+            freq_base, freq_scale, ext_factor, attn_factor,
+            beta_fast, beta_slow, rms_eps, 0u);
 }
 
 /* Decode-only fusion: q_a/kv Q8 pair projection + F16 quad compressor
@@ -25042,6 +25434,53 @@ static int ds4_gpu_attention_output_q8_batch_impl(
                                                 ds4_gpu_tensor_offset(low),
                                                 group_ids_buffer,
                                                 0) != 0;
+            } else if (use_direct_low &&
+                       g_dspark_nrow_active &&
+                       n_tokens >= 2u && n_tokens <= 6u &&
+                       getenv("DS4_METAL_DISABLE_Q8_NROW_MATMUL") == NULL) {
+                /* DSpark verify: all eight group projections ride one
+                 * dispatch of the grouped nrow matvec (shared weight read
+                 * across the token rows, mul_mv-exact per token). */
+                id<MTLComputePipelineState> pipeline =
+                    g_attn_out_low_nrow_pipelines[n_tokens];
+                if (!pipeline) {
+                    char name[80];
+                    snprintf(name, sizeof(name),
+                             "kernel_dsv4_attn_out_low_q8_0_nrow_f32_n%u",
+                             (unsigned)n_tokens);
+                    pipeline = ds4_gpu_get_pipeline(name);
+                    g_attn_out_low_nrow_pipelines[n_tokens] = pipeline;
+                }
+                if (!pipeline) return 0;
+                const ds4_gpu_attn_out_low_nrow_args nrow_args = {
+                    .ne00 = (int32_t)group_dim,
+                    .ne01 = (int32_t)rank,
+                    .n_groups = (int32_t)n_groups,
+                    .pad = 0,
+                    .nb01 = row_a_bytes,
+                    .group_weight_bytes = (uint64_t)rank * row_a_bytes,
+                    .x_group_bytes = group_dim * sizeof(float),
+                    .x_row_bytes =
+                        (uint64_t)n_groups * group_dim * sizeof(float),
+                    .dst_group_bytes = (uint64_t)rank * sizeof(float),
+                    .dst_row_bytes =
+                        (uint64_t)n_groups * rank * sizeof(float),
+                };
+                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:pipeline];
+                [enc setBytes:&nrow_args length:sizeof(nrow_args) atIndex:0];
+                [enc setBuffer:out_a_buf offset:(NSUInteger)out_a_inner atIndex:1];
+                [enc setBuffer:ds4_gpu_tensor_buffer(heads)
+                        offset:ds4_gpu_tensor_offset(heads) atIndex:2];
+                [enc setBuffer:ds4_gpu_tensor_buffer(low)
+                        offset:ds4_gpu_tensor_offset(low) atIndex:3];
+                [enc setThreadgroupMemoryLength:8u * 2u * 32u * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:
+                        MTLSizeMake(((NSUInteger)rank + 1u) / 2u,
+                                    (NSUInteger)n_groups, 1u)
+                    threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+                ok = 1;
             } else if (use_direct_low) {
                 ds4_gpu_mul_mv_id_args args = {
                     .nei0 = (int32_t)n_groups,
@@ -33018,7 +33457,50 @@ static int ds4_gpu_encode_router_select(
         return 1;
     }
 
-    if (flash_router_fast_path && !g_quality_mode && n_tokens == 1) {
+    /* DSpark verify only (nrow scope, 2..6 rows, bias layers): fuse the
+     * sqrt(softplus) transform and the 256-wide bitonic top-6 select into one
+     * threadgroup per token, replacing the softplus + sqrt + bias-add + two
+     * argsort dispatches.  The weight finalization below is unchanged. */
+    int batch_select_fused = 0;
+    if (flash_router_fast_path && !g_quality_mode &&
+        n_tokens > 1u && n_tokens <= 6u && !hash_mode &&
+        g_dspark_nrow_active &&
+        ds4_gpu_device_is_pre_m5_apple_silicon() &&
+        getenv("DS4_METAL_DISABLE_ROUTER_SELECT_BATCH_FUSION") == NULL) {
+        id<MTLComputePipelineState> fused_pipeline =
+            ds4_gpu_hot_pipeline(g_dsv4_router_select_batch_fused_pipeline,
+                                    "kernel_dsv4_router_select_batch_fused");
+        if (fused_pipeline &&
+            fused_pipeline.threadExecutionWidth == 32u &&
+            fused_pipeline.maxTotalThreadsPerThreadgroup >= 256u &&
+            (!has_bias || biasbuf)) {
+            ds4_gpu_dsv4_router_select_one_args fused_args = {
+                .has_bias = has_bias ? 1u : 0u,
+            };
+            const float zero_f32 = 0.0f;
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:fused_pipeline];
+            [enc setBytes:&fused_args length:sizeof(fused_args) atIndex:0];
+            [enc setBuffer:logitsbuf offset:logits_off atIndex:1];
+            [enc setBuffer:probsbuf offset:probs_off atIndex:2];
+            if (has_bias) {
+                [enc setBuffer:biasbuf offset:bias_off atIndex:3];
+            } else {
+                [enc setBytes:&zero_f32 length:sizeof(zero_f32) atIndex:3];
+            }
+            [enc setBuffer:selectedbuf offset:selected_off atIndex:4];
+            [enc setThreadgroupMemoryLength:2u * (256u * sizeof(float) + 256u * sizeof(int32_t))
+                                       atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            batch_select_fused = 1;
+        }
+    }
+
+    if (batch_select_fused) {
+        ok = 1;
+    } else if (flash_router_fast_path && !g_quality_mode && n_tokens == 1) {
         id<MTLComputePipelineState> softplus_sqrt_pipeline =
             ds4_gpu_hot_pipeline(g_dsv4_softplus_sqrt_pipeline,
                                     "kernel_dsv4_softplus_sqrt_f32_4");
@@ -33072,7 +33554,7 @@ static int ds4_gpu_encode_router_select(
                                                       hash_rows,
                                                       n_expert_used,
                                                       n_tokens);
-    } else {
+    } else if (!batch_select_fused) {
         ds4_gpu_tensor *score_tensor = probs;
         DS4MetalTensor *selection_view = nil;
 
@@ -42872,6 +43354,203 @@ int ds4_gpu_routed_moe_batch_tensor(
 #undef DS4_METAL_PROFILE_MOE_STAGE
     }
 
+    return 1;
+}
+
+/* Grouped (expert-major) routed MoE for the DSpark verify path at N<=8 rows.
+ * One threadgroup per distinct expert shares the weight block read and the
+ * LUT gathers across all (token,slot) pairs selecting it, instead of the
+ * per-pair dispatch that re-reads shared experts.  MXFP4 only, single
+ * device.  Gate/up is bit-exact with the reference pair kernel per pair;
+ * down keeps the reference dot per pair and reuses the strict sum6 for the
+ * cross-slot reduction. */
+int ds4_gpu_routed_moe_batch_grouped_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !gate || !up || !mid || !experts || !x || !model_map ||
+        !selected || !weights ||
+        n_tokens == 0 || n_tokens > 8u ||
+        n_expert == 0 || n_expert > 8u ||
+        n_total_expert == 0 || n_total_expert > 256u ||
+        (expert_in_dim & 31u) != 0 || (expert_mid_dim & 31u) != 0 ||
+        gate_expert_bytes == 0 || gate_row_bytes == 0 ||
+        down_expert_bytes == 0 || down_row_bytes == 0 ||
+        gate_row_bytes != (uint64_t)(expert_in_dim / 32u) * 17u ||
+        down_row_bytes != (uint64_t)(expert_mid_dim / 32u) * 17u ||
+        g_tp_split_world > 1) {
+        return 0;
+    }
+    const uint64_t x_bytes = (uint64_t)n_tokens * expert_in_dim * sizeof(float);
+    const uint64_t mid_bytes =
+        (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)n_tokens * out_dim * sizeof(float);
+    const uint64_t down_scratch_bytes =
+        (uint64_t)n_tokens * n_expert * out_dim * sizeof(float);
+    const uint64_t selected_bytes =
+        (uint64_t)n_tokens * n_expert * sizeof(int32_t);
+    const uint64_t weights_bytes =
+        (uint64_t)n_tokens * n_expert * sizeof(float);
+    if (ds4_gpu_tensor_bytes(x) < x_bytes ||
+        ds4_gpu_tensor_bytes(gate) < mid_bytes ||
+        ds4_gpu_tensor_bytes(up) < mid_bytes ||
+        ds4_gpu_tensor_bytes(mid) < mid_bytes ||
+        ds4_gpu_tensor_bytes(out) < out_bytes ||
+        ds4_gpu_tensor_bytes(experts) < down_scratch_bytes ||
+        ds4_gpu_tensor_bytes(selected) < selected_bytes ||
+        ds4_gpu_tensor_bytes(weights) < weights_bytes) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        if (!g_dsv4_verify_moe_group_map_pipeline) {
+            g_dsv4_verify_moe_group_map_pipeline =
+                ds4_gpu_get_pipeline("kernel_dsv4_verify_moe_group_map");
+            g_dsv4_verify_moe_gate_up_grouped_pipeline =
+                ds4_gpu_get_pipeline("kernel_dsv4_verify_moe_gate_up_grouped_f32");
+            g_dsv4_verify_moe_down_grouped_pipeline =
+                ds4_gpu_get_pipeline("kernel_dsv4_verify_moe_down_grouped_f32");
+            if (!g_dsv4_verify_moe_group_map_pipeline ||
+                !g_dsv4_verify_moe_gate_up_grouped_pipeline ||
+                !g_dsv4_verify_moe_down_grouped_pipeline) return 0;
+        }
+        if (!g_dsv4_verify_moe_group_map_buffer) {
+            g_dsv4_verify_moe_group_map_buffer =
+                [g_device newBufferWithLength:16384u
+                    options:MTLResourceStorageModeShared];
+            if (!g_dsv4_verify_moe_group_map_buffer) return 0;
+        }
+
+        uint64_t gate_inner = 0;
+        uint64_t up_inner = 0;
+        uint64_t down_inner = 0;
+        id<MTLBuffer> gate_buf = ds4_gpu_wrap_model_range(
+                model_map, model_size, gate_offset,
+                (uint64_t)n_total_expert * gate_expert_bytes, &gate_inner);
+        id<MTLBuffer> up_buf = ds4_gpu_wrap_model_range(
+                model_map, model_size, up_offset,
+                (uint64_t)n_total_expert * gate_expert_bytes, &up_inner);
+        id<MTLBuffer> down_buf = ds4_gpu_wrap_model_range(
+                model_map, model_size, down_offset,
+                (uint64_t)n_total_expert * down_expert_bytes, &down_inner);
+        if (!gate_buf || !up_buf || !down_buf) return 0;
+
+        ds4_gpu_verify_moe_group_map_args map_args = {
+            .n_tokens = (int32_t)n_tokens,
+            .n_expert_used = (int32_t)n_expert,
+            .n_total_expert = (int32_t)n_total_expert,
+            .pad = 0,
+        };
+        ds4_gpu_verify_moe_grouped_args gate_args = {
+            .n_expert_used = (int32_t)n_expert,
+            .in_dim = (int32_t)expert_in_dim,
+            .out_dim = (int32_t)expert_mid_dim,
+            .pad0 = 0,
+            .expert_bytes = gate_expert_bytes,
+            .row_bytes = gate_row_bytes,
+            .x_row_bytes = (uint64_t)expert_in_dim * sizeof(float),
+            .mid_row_bytes = 0,
+            .clamp_value = clamp,
+            .pad1 = 0.0f,
+        };
+        ds4_gpu_verify_moe_grouped_args down_args = {
+            .n_expert_used = (int32_t)n_expert,
+            .in_dim = (int32_t)expert_mid_dim,
+            .out_dim = (int32_t)out_dim,
+            .pad0 = 0,
+            .expert_bytes = down_expert_bytes,
+            .row_bytes = down_row_bytes,
+            .x_row_bytes = 0,
+            .mid_row_bytes = (uint64_t)expert_mid_dim * sizeof(float),
+            .clamp_value = 0.0f,
+            .pad1 = 0.0f,
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        const uint32_t max_groups = n_tokens * n_expert;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_dsv4_verify_moe_group_map_pipeline];
+        [enc setBytes:&map_args length:sizeof(map_args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(selected)
+                offset:ds4_gpu_tensor_offset(selected) atIndex:1];
+        [enc setBuffer:g_dsv4_verify_moe_group_map_buffer offset:0 atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+        [enc setComputePipelineState:g_dsv4_verify_moe_gate_up_grouped_pipeline];
+        [enc setBytes:&gate_args length:sizeof(gate_args) atIndex:0];
+        [enc setBuffer:gate_buf offset:(NSUInteger)gate_inner atIndex:1];
+        [enc setBuffer:up_buf offset:(NSUInteger)up_inner atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x)
+                offset:ds4_gpu_tensor_offset(x) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(gate)
+                offset:ds4_gpu_tensor_offset(gate) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(up)
+                offset:ds4_gpu_tensor_offset(up) atIndex:5];
+        [enc setBuffer:ds4_gpu_tensor_buffer(mid)
+                offset:ds4_gpu_tensor_offset(mid) atIndex:6];
+        [enc setBuffer:g_dsv4_verify_moe_group_map_buffer offset:0 atIndex:7];
+        [enc setBuffer:ds4_gpu_tensor_buffer(weights)
+                offset:ds4_gpu_tensor_offset(weights) atIndex:8];
+        [enc setThreadgroupMemoryLength:64u atIndex:0];
+        [enc dispatchThreadgroups:
+                MTLSizeMake((expert_mid_dim + 3u) / 4u, max_groups, 1u)
+            threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
+
+        [enc setComputePipelineState:g_dsv4_verify_moe_down_grouped_pipeline];
+        [enc setBytes:&down_args length:sizeof(down_args) atIndex:0];
+        [enc setBuffer:down_buf offset:(NSUInteger)down_inner atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(mid)
+                offset:ds4_gpu_tensor_offset(mid) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(experts)
+                offset:ds4_gpu_tensor_offset(experts) atIndex:3];
+        [enc setBuffer:g_dsv4_verify_moe_group_map_buffer offset:0 atIndex:4];
+        [enc setThreadgroupMemoryLength:64u atIndex:0];
+        [enc dispatchThreadgroups:
+                MTLSizeMake((out_dim + 3u) / 4u, max_groups, 1u)
+            threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_encode_moe_sum_experts(
+                    cb,
+                    ds4_gpu_tensor_buffer(experts),
+                    ds4_gpu_tensor_offset(experts),
+                    ds4_gpu_tensor_buffer(out),
+                    ds4_gpu_tensor_offset(out),
+                    out_dim,
+                    n_expert,
+                    n_tokens)) {
+            return 0;
+        }
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "verify grouped MoE")) {
+            return 0;
+        }
+    }
     return 1;
 }
 

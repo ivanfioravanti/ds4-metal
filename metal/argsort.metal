@@ -377,3 +377,149 @@ kernel void kernel_dsv4_argmax_top1_stage2_f32(
         if (tiisg == 0) dst[0] = fi;
     }
 }
+
+/* DSpark fused Markov bias + top-1 argmax over one logits row.  The support
+ * model's markov head scores vocab entry i as logits[i] + dot(w2[i], w1[prev])
+ * with both weights Q8_0; the dot dequantizes both sides to f32 and
+ * accumulates per-lane before one simd_sum, mirroring the CUDA kernel's
+ * numerics (which may differ from the CPU q8-quantized-state path at ulp
+ * level — acceptable for draft proposals, the target verifier stays
+ * authoritative).  Same two-dispatch structure as the top-1 argmax above:
+ * stage 1 writes one (value, index) pair per threadgroup, stage 2 reduces
+ * them and packs the CUDA-compatible monotonic key
+ * (key = (monotonic_float(score) << 32) | ~index, so ties keep the lowest
+ * index and key != 0 means valid).
+ *
+ * Chained form: the previous token comes from out_ring[row_index] (slot 0 is
+ * the host-seeded ~prev_token, later slots are prior rows' keys), so all
+ * draft rows of one propose round can be encoded back-to-back in a single
+ * command buffer — each row's stage 1 is ordered after the previous row's
+ * stage 2 by the dispatch boundary. */
+struct ds4_metal_args_dsv4_dspark_markov_argmax {
+    int32_t vocab;
+    int32_t rank_blocks;   /* markov_rank / 32, 1..8 */
+    int32_t n_tg;
+    int32_t row_index;     /* which ring slot holds the previous token key */
+};
+
+kernel void kernel_dsv4_dspark_markov_argmax_stage1(
+        constant ds4_metal_args_dsv4_dspark_markov_argmax & args,
+        device const float   *logits,
+        device const char    *w1,
+        device const char    *w2,
+        device const uint64_t *ring,
+        device float         *scratch_v,
+        device int32_t       *scratch_i,
+        threadgroup char     *shmem_raw [[threadgroup(0)]],
+        uint   tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    /* Q8_0 rows of 34-byte blocks: half scale + 32 int8. */
+    threadgroup float  *state = (threadgroup float *)shmem_raw;         /* 256 */
+    threadgroup float  *tg_v  = state + 256;
+    threadgroup int32_t *tg_i = (threadgroup int32_t *)(tg_v + 8);
+
+    const uint rb = (uint)args.rank_blocks;
+    const uint n = (uint)args.vocab;
+    const uint prev =
+        ~((uint)(ring[(uint)args.row_index] & 0xffffffffu));
+    device const char *w1_row =
+        w1 + (uint64_t)min(prev, n - 1u) * rb * 34u;
+    for (uint k = (uint)tiitg; k < rb * 32u; k += 256u) {
+        device const char *blk = w1_row + (k >> 5) * 34u;
+        const float d = (float)(*(device const half *)blk);
+        state[k] = d * (float)((device const signed char *)(blk + 2))[k & 31u];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint ntg = (uint)args.n_tg;
+    const uint chunk = (n + ntg - 1u) / ntg;
+    const uint begin = tgpig * chunk;
+    const uint end = min(n, begin + chunk);
+
+    /* One simdgroup per row: lane covers block tiisg/4, quarter tiisg%4
+     * (8 consecutive int8), stepping 8 blocks so any rb <= 8 fits. */
+    const uint qb = (uint)(tiisg >> 2);
+    const uint ql = (uint)(tiisg & 3u);
+    float bv = -INFINITY;
+    int bi = -1;
+    for (uint row = begin + (uint)sgitg; row < end; row += 8u) {
+        device const char *wrow = w2 + (uint64_t)row * rb * 34u;
+        float acc = 0.0f;
+        for (uint b = qb; b < rb; b += 8u) {
+            device const char *blk = wrow + b * 34u;
+            const float d = (float)(*(device const half *)blk);
+            device const signed char *qs =
+                (device const signed char *)(blk + 2) + ql * 8u;
+            const uint sbase = b * 32u + ql * 8u;
+            float sumq = 0.0f;
+            for (uint i = 0; i < 8u; i++) {
+                sumq += (float)qs[i] * state[sbase + i];
+            }
+            acc += d * sumq;
+        }
+        const float v = logits[row] + simd_sum(acc);
+        if (tiisg == 0 && v > bv) { bv = v; bi = (int)row; }
+    }
+    for (ushort off = 16u; off > 0; off >>= 1) {
+        ds4_argmax_top1_merge(simd_shuffle_xor(bv, off),
+                              simd_shuffle_xor(bi, off), &bv, &bi);
+    }
+    if (tiisg == 0) {
+        tg_v[sgitg] = bv;
+        tg_i[sgitg] = bi;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        if (tiisg >= 8u) { bv = -INFINITY; bi = -1; }
+        else { bv = tg_v[tiisg]; bi = tg_i[tiisg]; }
+        for (ushort off = 4u; off > 0; off >>= 1) {
+            ds4_argmax_top1_merge(simd_shuffle_xor(bv, off),
+                                  simd_shuffle_xor(bi, off), &bv, &bi);
+        }
+        if (tiisg == 0) {
+            scratch_v[tgpig] = bv;
+            scratch_i[tgpig] = bi;
+        }
+    }
+}
+
+kernel void kernel_dsv4_dspark_markov_argmax_stage2(
+        constant ds4_metal_args_dsv4_dspark_markov_argmax & args,
+        device const float   *scratch_v,
+        device const int32_t *scratch_i,
+        device uint64_t      *dst,
+        threadgroup char     *shmem_raw [[threadgroup(0)]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float *tg_v = (threadgroup float *)shmem_raw;
+    threadgroup int32_t *tg_i = (threadgroup int32_t *)(tg_v + 8);
+
+    const uint ntg = (uint)args.n_tg;
+    float fv = -INFINITY;
+    int fi = -1;
+    if ((uint)tiitg < ntg) {
+        fv = scratch_v[tiitg];
+        fi = scratch_i[tiitg];
+    }
+    for (ushort off = 16u; off > 0; off >>= 1) {
+        ds4_argmax_top1_merge(simd_shuffle_xor(fv, off),
+                              simd_shuffle_xor(fi, off), &fv, &fi);
+    }
+    if (tiisg == 0) { tg_v[sgitg] = fv; tg_i[sgitg] = fi; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        if (tiisg >= 8u) { fv = -INFINITY; fi = -1; }
+        else { fv = tg_v[tiisg]; fi = tg_i[tiisg]; }
+        for (ushort off = 4u; off > 0; off >>= 1) {
+            ds4_argmax_top1_merge(simd_shuffle_xor(fv, off),
+                                  simd_shuffle_xor(fi, off), &fv, &fi);
+        }
+        if (tiisg == 0) {
+            const uint f = as_type<uint>(fv);
+            const uint fkey = (f & 0x80000000u) ? ~f : (f | 0x80000000u);
+            dst[0] = ((uint64_t)fkey << 32) | (uint64_t)(~(uint)fi);
+        }
+    }
+}

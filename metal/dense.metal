@@ -197,6 +197,295 @@ kernel void kernel_mul_mv_q8_0_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+/* Small-N Q8_0 matvec (N_TOK activation rows, one weight stream).  The
+ * decode mv_ext path used for 2..16 rows runs far below the single-row
+ * matvec's bandwidth on these shapes; this kernel keeps the single-row
+ * kernel's exact per-element math (lane map, ascending block stride,
+ * sequential per-lane sumq*scale accumulation, the same two-stage simd_sum
+ * epilogue tree per row) with one accumulator per token, so the weight
+ * block read is shared across the token rows.  Used by the DSpark verify
+ * path; per token the result is bit-exact with kernel_mul_mv_q8_0_f32. */
+struct ds4_metal_args_mul_mv_nrow {
+    int32_t ne00;
+    int32_t ne01;
+    uint64_t nb01;
+    uint64_t x_row_bytes;
+    uint64_t dst_row_bytes;
+};
+
+template<int N_TOK, short NSG, short NR0>
+void kernel_mul_mv_q8_0_nrow_f32_impl(
+        const ds4_metal_args_mul_mv_nrow args,
+        device const char *src0,
+        device const char *src1,
+        device char *dst,
+        threadgroup char *shmem,
+        uint3 tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+
+    const int nb = args.ne00 / QK8_0;
+    const int r0 = tgpig.x * NR0;
+    const short ix = tiisg / (NW / NQ);
+    const short il = tiisg % (NW / NQ);
+    const int ib0 = sgitg * NQ + ix;
+
+    device const block_q8_0 *ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_q8_0 *)(src0 + (uint64_t)(r0 + row) * args.nb01);
+    }
+    float sumf[N_TOK][NR0];
+    FOR_UNROLL (short t = 0; t < N_TOK; ++t) {
+        sumf[t][0] = 0.0f;
+        sumf[t][1] = 0.0f;
+    }
+
+    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+        float yl[N_TOK][NQ];
+        FOR_UNROLL (short t = 0; t < N_TOK; ++t) {
+            device const float *yb =
+                (device const float *)(src1 + (uint64_t)t * args.x_row_bytes) +
+                ib * QK8_0 + il * NQ;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) yl[t][i] = yb[i];
+        }
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const int8_t *qs = ax[row][ib].qs + il * NQ;
+            const float d = ax[row][ib].d;
+            float sumq[N_TOK] = { 0.0f };
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                const float q = (float)qs[i];
+                FOR_UNROLL (short t = 0; t < N_TOK; ++t) sumq[t] += q * yl[t][i];
+            }
+            FOR_UNROLL (short t = 0; t < N_TOK; ++t) sumf[t][row] += sumq[t] * d;
+        }
+    }
+
+    threadgroup float *sh = (threadgroup float *)shmem;
+    FOR_UNROLL (short t = 0; t < N_TOK; ++t) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            threadgroup float *sf = sh + ((short)t * NR0 + row) * NW;
+            if (sgitg == 0) sf[tiisg] = 0.0f;
+            sumf[t][row] = simd_sum(sumf[t][row]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    FOR_UNROLL (short t = 0; t < N_TOK; ++t) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            if (tiisg == 0) sh[((short)t * NR0 + row) * NW + sgitg] = sumf[t][row];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    FOR_UNROLL (short t = 0; t < N_TOK; ++t) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            if (r0 + row < args.ne01) {
+                const float tot = simd_sum(sh[((short)t * NR0 + row) * NW + tiisg]);
+                if (tiisg == 0 && sgitg == 0) {
+                    ((device float *)(dst + (uint64_t)t * args.dst_row_bytes))[r0 + row] = tot;
+                }
+            }
+        }
+    }
+}
+
+#define DS4_MUL_MV_Q8_0_NROW_INSTANTIATE(n_) \
+[[host_name("kernel_mul_mv_q8_0_nrow_f32_n" #n_)]] \
+kernel void kernel_mul_mv_q8_0_nrow_f32_n##n_( \
+        constant ds4_metal_args_mul_mv_nrow & args, \
+        device const char * src0, \
+        device const char * src1, \
+        device       char * dst, \
+        threadgroup  char * shmem [[threadgroup(0)]], \
+        uint3  tgpig[[threadgroup_position_in_grid]], \
+        ushort tiisg[[thread_index_in_simdgroup]], \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+    kernel_mul_mv_q8_0_nrow_f32_impl<n_, 2, N_R0_Q8_0>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); \
+}
+
+DS4_MUL_MV_Q8_0_NROW_INSTANTIATE(2)
+DS4_MUL_MV_Q8_0_NROW_INSTANTIATE(3)
+DS4_MUL_MV_Q8_0_NROW_INSTANTIATE(4)
+DS4_MUL_MV_Q8_0_NROW_INSTANTIATE(5)
+DS4_MUL_MV_Q8_0_NROW_INSTANTIATE(6)
+
+#undef DS4_MUL_MV_Q8_0_NROW_INSTANTIATE
+
+/* Small-out sibling of the nrow matvec (DSpark support-chain router shape:
+ * the MTP stages carry a Q8_0 4096->256 ffn_gate_inp; the resident model's
+ * router is F16 and uses the f16 nrow below).  With out_dim < 512 the NR0=2
+ * grid tops out at 256/2 threadgroups and starves the GPU; this variant
+ * widens to NSG=8 simdgroups per threadgroup and one output row per
+ * threadgroup, so the 4096->256 router projection dispatches 256
+ * threadgroups of 256 threads with two weight blocks per lane.  The per-lane
+ * block subsets differ from the NSG=2 form (same deterministic two-stage
+ * epilogue tree over the simdgroup partials), so it is NOT bit-exact with
+ * mul_mv — the DSpark paths tolerate that order difference by design, as
+ * they already did for mv_ext. */
+#define DS4_MUL_MV_Q8_0_NROW_SO_INSTANTIATE(n_) \
+[[host_name("kernel_mul_mv_q8_0_nrow_f32_so_n" #n_)]] \
+kernel void kernel_mul_mv_q8_0_nrow_f32_so_n##n_( \
+        constant ds4_metal_args_mul_mv_nrow & args, \
+        device const char * src0, \
+        device const char * src1, \
+        device       char * dst, \
+        threadgroup  char * shmem [[threadgroup(0)]], \
+        uint3  tgpig[[threadgroup_position_in_grid]], \
+        ushort tiisg[[thread_index_in_simdgroup]], \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+    kernel_mul_mv_q8_0_nrow_f32_impl<n_, 8, 1>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); \
+}
+
+DS4_MUL_MV_Q8_0_NROW_SO_INSTANTIATE(2)
+DS4_MUL_MV_Q8_0_NROW_SO_INSTANTIATE(3)
+DS4_MUL_MV_Q8_0_NROW_SO_INSTANTIATE(4)
+DS4_MUL_MV_Q8_0_NROW_SO_INSTANTIATE(5)
+DS4_MUL_MV_Q8_0_NROW_SO_INSTANTIATE(6)
+
+#undef DS4_MUL_MV_Q8_0_NROW_SO_INSTANTIATE
+
+/* Small-N F16 matvec for tiny output extents (DSpark verify router,
+ * 4096->256 at N_TOK 2..6).  The f16 mv_ext path dispatches
+ * (out_dim/8) x (n_tok/3) threadgroups — 64 for the router shape — and
+ * starves the GPU; this variant gives every output row its own 256-thread
+ * threadgroup (NSG=8), one weight row per threadgroup, four half4 chunks per
+ * lane at in_dim 4096.  Per-element math matches the mv_ext family (half4
+ * chunk widened to float4, float4 dot into a per-token accumulator), but the
+ * chunk-to-lane assignment and the two-stage reduction tree differ, so it is
+ * NOT bit-exact with mv_ext — the verify path tolerates that order
+ * difference by design. */
+template<int N_TOK>
+void kernel_mul_mv_f16_nrow_f32_impl(
+        const ds4_metal_args_mul_mv_nrow args,
+        device const char *src0,
+        device const char *src1,
+        device char *dst,
+        threadgroup char *shmem,
+        uint3 tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    constexpr short NSG = 8;
+    constexpr short NW = N_SIMDWIDTH;
+
+    const int nchunk = args.ne00 / 4;
+    device const half4 *wrow =
+        (device const half4 *)(src0 + (uint64_t)tgpig.x * args.nb01);
+    device const float4 *xrow[N_TOK];
+    FOR_UNROLL (short t = 0; t < N_TOK; ++t) {
+        xrow[t] = (device const float4 *)(src1 + (uint64_t)t * args.x_row_bytes);
+    }
+
+    const short lane = sgitg * NW + tiisg;
+    float sumf[N_TOK] = { 0.0f };
+    for (int c = lane; c < nchunk; c += NSG * NW) {
+        const float4 w = (float4)wrow[c];
+        FOR_UNROLL (short t = 0; t < N_TOK; ++t) {
+            sumf[t] += dot(w, xrow[t][c]);
+        }
+    }
+
+    threadgroup float *sh = (threadgroup float *)shmem;
+    FOR_UNROLL (short t = 0; t < N_TOK; ++t) {
+        threadgroup float *sf = sh + (short)t * NW;
+        if (sgitg == 0) sf[tiisg] = 0.0f;
+        sumf[t] = simd_sum(sumf[t]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    FOR_UNROLL (short t = 0; t < N_TOK; ++t) {
+        if (tiisg == 0) sh[(short)t * NW + sgitg] = sumf[t];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    FOR_UNROLL (short t = 0; t < N_TOK; ++t) {
+        const float tot = simd_sum(sh[(short)t * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            ((device float *)(dst + (uint64_t)t * args.dst_row_bytes))[tgpig.x] = tot;
+        }
+    }
+}
+
+#define DS4_MUL_MV_F16_NROW_INSTANTIATE(n_) \
+[[host_name("kernel_mul_mv_f16_nrow_f32_n" #n_)]] \
+kernel void kernel_mul_mv_f16_nrow_f32_n##n_( \
+        constant ds4_metal_args_mul_mv_nrow & args, \
+        device const char * src0, \
+        device const char * src1, \
+        device       char * dst, \
+        threadgroup  char * shmem [[threadgroup(0)]], \
+        uint3  tgpig[[threadgroup_position_in_grid]], \
+        ushort tiisg[[thread_index_in_simdgroup]], \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+    kernel_mul_mv_f16_nrow_f32_impl<n_>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); \
+}
+
+DS4_MUL_MV_F16_NROW_INSTANTIATE(2)
+DS4_MUL_MV_F16_NROW_INSTANTIATE(3)
+DS4_MUL_MV_F16_NROW_INSTANTIATE(4)
+DS4_MUL_MV_F16_NROW_INSTANTIATE(5)
+DS4_MUL_MV_F16_NROW_INSTANTIATE(6)
+
+#undef DS4_MUL_MV_F16_NROW_INSTANTIATE
+
+/* Grouped sibling of the nrow matvec for the batched attention-output
+ * low-rank A projection: tgpig.y selects the head group, so all eight
+ * 4096->1024 group projections ride one dispatch with the same shared
+ * weight-read structure. */
+struct ds4_metal_args_attn_out_low_nrow {
+    int32_t ne00;
+    int32_t ne01;
+    int32_t n_groups;
+    int32_t pad;
+    uint64_t nb01;
+    uint64_t group_weight_bytes;
+    uint64_t x_group_bytes;
+    uint64_t x_row_bytes;
+    uint64_t dst_group_bytes;
+    uint64_t dst_row_bytes;
+};
+
+template<int N_TOK>
+void kernel_dsv4_attn_out_low_q8_0_nrow_f32(
+        constant ds4_metal_args_attn_out_low_nrow & gargs,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const ds4_metal_args_mul_mv_nrow args = {
+        gargs.ne00, gargs.ne01, gargs.nb01,
+        gargs.x_row_bytes, gargs.dst_row_bytes };
+    device const char *src0_g =
+        src0 + (uint64_t)tgpig.y * gargs.group_weight_bytes;
+    device const char *src1_g =
+        src1 + (uint64_t)tgpig.y * gargs.x_group_bytes;
+    device char *dst_g = dst + (uint64_t)tgpig.y * gargs.dst_group_bytes;
+    kernel_mul_mv_q8_0_nrow_f32_impl<N_TOK, 2, N_R0_Q8_0>(args, src0_g, src1_g, dst_g,
+                                            shmem, tgpig, tiisg, sgitg);
+}
+
+#define DS4_ATTN_OUT_LOW_NROW_INSTANTIATE(n_) \
+[[host_name("kernel_dsv4_attn_out_low_q8_0_nrow_f32_n" #n_)]] \
+kernel void kernel_dsv4_attn_out_low_q8_0_nrow_f32_n##n_( \
+        constant ds4_metal_args_attn_out_low_nrow & args, \
+        device const char * src0, \
+        device const char * src1, \
+        device       char * dst, \
+        threadgroup  char * shmem [[threadgroup(0)]], \
+        uint3  tgpig[[threadgroup_position_in_grid]], \
+        ushort tiisg[[thread_index_in_simdgroup]], \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+    kernel_dsv4_attn_out_low_q8_0_nrow_f32<n_>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); \
+}
+
+DS4_ATTN_OUT_LOW_NROW_INSTANTIATE(2)
+DS4_ATTN_OUT_LOW_NROW_INSTANTIATE(3)
+DS4_ATTN_OUT_LOW_NROW_INSTANTIATE(4)
+DS4_ATTN_OUT_LOW_NROW_INSTANTIATE(5)
+DS4_ATTN_OUT_LOW_NROW_INSTANTIATE(6)
+
+#undef DS4_ATTN_OUT_LOW_NROW_INSTANTIATE
+
 
 // Decode Q-A/KV pair. Both projections consume the same activation row but
 // have independent weight ranges and output extents. Keep the standalone Q8_0

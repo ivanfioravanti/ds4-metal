@@ -9468,3 +9468,301 @@ kernel_attn_out_low_mpp_direct_rhs<
 #undef N_R0_Q5_K
 #undef N_R0_Q6_K
 #undef N_R0_IQ2_XXS
+
+/* --------------------------------------------------------------------------
+ * DSpark verify grouped routed MoE (expert-major, N<=8 rows).
+ *
+ * The batch verify path dispatches the reference matvec per (token,slot)
+ * pair, so an expert selected by k tokens is read k times and every pair
+ * pays the full dequant+LUT issue cost.  These kernels invert the grid: one
+ * threadgroup handles ONE expert and all (token,slot) pairs that selected
+ * it, so the weight block read and the LUT gathers are shared across the
+ * pairs while every pair keeps the reference kernel's exact per-element
+ * arithmetic (same lane map ix=tiisg/2, it=tiisg&1, ascending K-block
+ * stride 16, the y4[0]/y4[4]/y4[1]/y4[5] load order, the same FMA chain,
+ * scale*((x+y)+(z+w)), and a per-pair simd_sum).  Gate/up is therefore
+ * bit-exact with kernel_mul_mv_mxfp4_pair_swiglu_impl per pair.  Down keeps
+ * ds4_mxfp4_accumulate_rows' math per pair and leaves the cross-slot sum to
+ * kernel_dsv4_moe_sum6_f32 (matches the n>=5 batch regime; for n<=4 the
+ * batch regime accumulates across slots in-lane instead — a small FP-order
+ * difference the DSpark verifier tolerates by design).
+ * The verify-only callers gate the whole path; prefill keeps the reference
+ * dispatch.  Layout: ids are [token][slot], pair_row = token*slots+slot,
+ * mid/partial rows are pair-major.  The map scratch is 10.3 KiB laid out as
+ * [total, pad, experts[256], counts[256], pairs[256][8]]; entries beyond the
+ * group count up to n_tokens*slots are sentinel (-1) so the host can launch
+ * a fixed grid without a readback.
+ * ------------------------------------------------------------------------ */
+struct ds4_metal_args_verify_moe_group_map {
+    int32_t n_tokens;
+    int32_t n_expert_used;
+    int32_t n_total_expert;
+    int32_t pad;
+};
+
+struct ds4_metal_args_verify_moe_grouped {
+    int32_t n_expert_used;
+    int32_t in_dim;
+    int32_t out_dim;
+    int32_t pad0;
+    uint64_t expert_bytes;
+    uint64_t row_bytes;
+    uint64_t x_row_bytes;
+    uint64_t mid_row_bytes;
+    float clamp_value;
+    float pad1;
+};
+
+kernel void kernel_dsv4_verify_moe_group_map(
+        constant ds4_metal_args_verify_moe_group_map &args,
+        device const int32_t *selected,
+        device int32_t *map,
+        ushort tiitg [[thread_index_in_threadgroup]]) {
+    if (tiitg != 0) return;
+    device int32_t *total = map;
+    device int32_t *experts = map + 8;
+    device int32_t *counts = map + 8 + 256;
+    device uint32_t *pairs = (device uint32_t *)(map + 8 + 512);
+    const uint max_groups = (uint)args.n_tokens * (uint)args.n_expert_used;
+    for (uint e = 0; e < 256u; e++) counts[e] = 0;
+    uint ng = 0;
+    for (uint t = 0; t < (uint)args.n_tokens; t++) {
+        for (uint s = 0; s < (uint)args.n_expert_used; s++) {
+            const int32_t e = selected[t * (uint)args.n_expert_used + s];
+            if (e < 0 || e >= args.n_total_expert) continue;
+            const uint c = (uint)counts[e];
+            if (c == 0) experts[ng++] = e;
+            counts[e] = (int32_t)(c + 1u);
+            if (c < 8u) pairs[(uint)e * 8u + c] = (t << 4) | (uint)s;
+        }
+    }
+    for (uint i = ng; i < max_groups; i++) experts[i] = -1;
+    *total = (int32_t)ng;
+}
+
+kernel void kernel_dsv4_verify_moe_gate_up_grouped_f32(
+        constant ds4_metal_args_verify_moe_grouped &args,
+        device const char *src0_gate,
+        device const char *src0_up,
+        device const char *src1,
+        device char *dst_gate,
+        device char *dst_up,
+        device char *dst_mid,
+        device const int32_t *map,
+        device const char *weights,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    device const int32_t *experts = map + 8;
+    device const int32_t *counts = map + 8 + 256;
+    device const uint32_t *pairs = (device const uint32_t *)(map + 8 + 512);
+    const int32_t expert = experts[tgpig.y];
+    if (expert < 0) return;
+    const uint npair = (uint)counts[expert];
+    uint pair_tokens[8];
+    for (uint p = 0; p < npair; p++) {
+        pair_tokens[p] = pairs[(uint)expert * 8u + p] >> 4;
+    }
+
+    const short NSG = 2;
+    const int first_row = ((int)tgpig.x * NSG + (int)sgitg) * N_R0_MXFP4;
+    const int nb = args.in_dim / QK_MXFP4;
+    const int row_blocks = (int)(args.row_bytes / sizeof(block_mxfp4));
+    const short ix = tiisg / 2;
+    const short it = tiisg & 1;
+
+    threadgroup float *lut = (threadgroup float *)shmem;
+    if (sgitg == 0) lut[tiisg] = ds4_metal_mxfp4_values[tiisg & 15];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device const block_mxfp4 *xg =
+        (device const block_mxfp4 *)(src0_gate +
+            (uint64_t)expert * args.expert_bytes +
+            (uint64_t)first_row * args.row_bytes);
+    device const block_mxfp4 *xu =
+        (device const block_mxfp4 *)(src0_up +
+            (uint64_t)expert * args.expert_bytes +
+            (uint64_t)first_row * args.row_bytes);
+
+    float sumg[8][N_R0_MXFP4];
+    float sumu[8][N_R0_MXFP4];
+    for (uint p = 0; p < npair; p++) {
+        sumg[p][0] = 0.0f; sumg[p][1] = 0.0f;
+        sumu[p][0] = 0.0f; sumu[p][1] = 0.0f;
+    }
+
+    /* The block read (qs bytes, scale) and the 16 LUT gathers are shared
+     * across the pairs; each pair's FMA chain, reduce shape and scale
+     * multiply reproduce the reference pair kernel per element. */
+    for (int ib = ix; ib < nb; ib += 16) {
+        FOR_UNROLL (short row = 0; row < N_R0_MXFP4; row++) {
+            device const block_mxfp4 &bg = xg[row * row_blocks + ib];
+            device const block_mxfp4 &bu = xu[row * row_blocks + ib];
+            device const uchar *qg = bg.qs + 8 * it;
+            device const uchar *qu = bu.qs + 8 * it;
+            const float eg = ds4_metal_e8m0_to_f32(bg.e);
+            const float eu = ds4_metal_e8m0_to_f32(bu.e);
+            const float4 lg0 = float4(lut[qg[0] & 15], lut[qg[1] & 15],
+                                      lut[qg[2] & 15], lut[qg[3] & 15]);
+            const float4 lg1 = float4(lut[qg[0] >> 4], lut[qg[1] >> 4],
+                                      lut[qg[2] >> 4], lut[qg[3] >> 4]);
+            const float4 lg2 = float4(lut[qg[4] & 15], lut[qg[5] & 15],
+                                      lut[qg[6] & 15], lut[qg[7] & 15]);
+            const float4 lg3 = float4(lut[qg[4] >> 4], lut[qg[5] >> 4],
+                                      lut[qg[6] >> 4], lut[qg[7] >> 4]);
+            const float4 lu0 = float4(lut[qu[0] & 15], lut[qu[1] & 15],
+                                      lut[qu[2] & 15], lut[qu[3] & 15]);
+            const float4 lu1 = float4(lut[qu[0] >> 4], lut[qu[1] >> 4],
+                                      lut[qu[2] >> 4], lut[qu[3] >> 4]);
+            const float4 lu2 = float4(lut[qu[4] & 15], lut[qu[5] & 15],
+                                      lut[qu[6] & 15], lut[qu[7] & 15]);
+            const float4 lu3 = float4(lut[qu[4] >> 4], lut[qu[5] >> 4],
+                                      lut[qu[6] >> 4], lut[qu[7] >> 4]);
+            for (uint p = 0; p < npair; p++) {
+                device const float *yb =
+                    (device const float *)(src1 +
+                        (uint64_t)pair_tokens[p] * args.x_row_bytes) +
+                    ib * QK_MXFP4 + it * 8;
+                device const float4 *y4 = (device const float4 *)yb;
+                const float4 yl0 = y4[0];
+                const float4 yl1 = y4[4];
+                const float4 yl2 = y4[1];
+                const float4 yl3 = y4[5];
+                float4 ag = yl0 * lg0;
+                ag += yl1 * lg1;
+                ag += yl2 * lg2;
+                ag += yl3 * lg3;
+                float4 au = yl0 * lu0;
+                au += yl1 * lu1;
+                au += yl2 * lu2;
+                au += yl3 * lu3;
+                sumg[p][row] += eg * ((ag.x + ag.y) + (ag.z + ag.w));
+                sumu[p][row] += eu * ((au.x + au.y) + (au.z + au.w));
+            }
+        }
+    }
+
+    device float *gate_f32 = (device float *)dst_gate;
+    device float *up_f32 = (device float *)dst_up;
+    device float *mid_f32 = (device float *)dst_mid;
+    for (uint p = 0; p < npair; p++) {
+        const uint slot = pairs[(uint)expert * 8u + p] & 15u;
+        const uint pair_row =
+            pair_tokens[p] * (uint)args.n_expert_used + slot;
+        const float route_w = ((device const float *)weights)[pair_row];
+        FOR_UNROLL (short row = 0; row < N_R0_MXFP4; row++) {
+            if (first_row + row < args.out_dim) {
+                const float gate = simd_sum(sumg[p][row]);
+                const float up = simd_sum(sumu[p][row]);
+                if (tiisg == 0) {
+                    const uint out_row = (uint)first_row + (uint)row;
+                    float g = gate;
+                    float u = up;
+                    if (args.clamp_value > 1.0e-6f) {
+                        g = min(g, args.clamp_value);
+                        u = clamp(u, -args.clamp_value, args.clamp_value);
+                    }
+                    gate_f32[(uint64_t)pair_row * (uint)args.out_dim + out_row] = gate;
+                    up_f32[(uint64_t)pair_row * (uint)args.out_dim + out_row] = up;
+                    mid_f32[(uint64_t)pair_row * (uint)args.out_dim + out_row] =
+                        (g / (1.0f + exp(-g))) * u * route_w;
+                }
+            }
+        }
+    }
+    (void)tiitg;
+}
+
+kernel void kernel_dsv4_verify_moe_down_grouped_f32(
+        constant ds4_metal_args_verify_moe_grouped &args,
+        device const char *src0_down,
+        device const char *src1,
+        device char *dst,
+        device const int32_t *map,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    device const int32_t *experts = map + 8;
+    device const int32_t *counts = map + 8 + 256;
+    device const uint32_t *pairs = (device const uint32_t *)(map + 8 + 512);
+    const int32_t expert = experts[tgpig.y];
+    if (expert < 0) return;
+    const uint npair = (uint)counts[expert];
+    uint pair_rows[8];
+    for (uint p = 0; p < npair; p++) {
+        const uint packed = pairs[(uint)expert * 8u + p];
+        pair_rows[p] =
+            (packed >> 4) * (uint)args.n_expert_used + (packed & 15u);
+    }
+
+    const short NSG = 2;
+    const int first_row = ((int)tgpig.x * NSG + (int)sgitg) * N_R0_MXFP4;
+    const int nb = args.in_dim / QK_MXFP4;
+    const int row_blocks = (int)(args.row_bytes / sizeof(block_mxfp4));
+    const short ix = tiisg / 2;
+    const short it = tiisg & 1;
+
+    threadgroup float *lut = (threadgroup float *)shmem;
+    if (sgitg == 0) lut[tiisg] = ds4_metal_mxfp4_values[tiisg & 15];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device const block_mxfp4 *x =
+        (device const block_mxfp4 *)(src0_down +
+            (uint64_t)expert * args.expert_bytes +
+            (uint64_t)first_row * args.row_bytes);
+
+    float sums[8][N_R0_MXFP4];
+    for (uint p = 0; p < npair; p++) {
+        sums[p][0] = 0.0f; sums[p][1] = 0.0f;
+    }
+
+    for (int ib = ix; ib < nb; ib += 16) {
+        FOR_UNROLL (short row = 0; row < N_R0_MXFP4; row++) {
+            device const block_mxfp4 &b = x[row * row_blocks + ib];
+            device const uchar *q = b.qs + 8 * it;
+            const float e = ds4_metal_e8m0_to_f32(b.e);
+            const float4 l0 = float4(lut[q[0] & 15], lut[q[1] & 15],
+                                     lut[q[2] & 15], lut[q[3] & 15]);
+            const float4 l1 = float4(lut[q[0] >> 4], lut[q[1] >> 4],
+                                     lut[q[2] >> 4], lut[q[3] >> 4]);
+            const float4 l2 = float4(lut[q[4] & 15], lut[q[5] & 15],
+                                     lut[q[6] & 15], lut[q[7] & 15]);
+            const float4 l3 = float4(lut[q[4] >> 4], lut[q[5] >> 4],
+                                     lut[q[6] >> 4], lut[q[7] >> 4]);
+            for (uint p = 0; p < npair; p++) {
+                device const float *yb =
+                    (device const float *)(src1 +
+                        (uint64_t)pair_rows[p] * args.mid_row_bytes) +
+                    ib * QK_MXFP4 + it * 8;
+                device const float4 *y4 = (device const float4 *)yb;
+                const float4 yl0 = y4[0];
+                const float4 yl1 = y4[4];
+                const float4 yl2 = y4[1];
+                const float4 yl3 = y4[5];
+                float4 acc = yl0 * l0;
+                acc += yl1 * l1;
+                acc += yl2 * l2;
+                acc += yl3 * l3;
+                sums[p][row] += e * ((acc.x + acc.y) + (acc.z + acc.w));
+            }
+        }
+    }
+
+    device float *out = (device float *)dst;
+    for (uint p = 0; p < npair; p++) {
+        FOR_UNROLL (short row = 0; row < N_R0_MXFP4; row++) {
+            if (first_row + row < args.out_dim) {
+                const float v = simd_sum(sums[p][row]);
+                if (tiisg == 0) {
+                    out[(uint64_t)pair_rows[p] * (uint)args.out_dim +
+                        (uint)first_row + (uint)row] = v;
+                }
+            }
+        }
+    }
+    (void)tiitg;
+}

@@ -15101,6 +15101,10 @@ typedef struct {
     ds4_gpu_tensor *dspark_stage0_proj;
     ds4_gpu_tensor *dspark_main_x;
     ds4_gpu_tensor *dspark_draft_tokens;
+    /* (DS4_DSPARK_MAX_BLOCK_SIZE+1) u64 key ring for the chained Metal
+     * markov+argmax: slot 0 seeds the previous token, slots 1..block_size
+     * receive each draft row's result key. */
+    ds4_gpu_tensor *dspark_markov_ring;
     ds4_gpu_tensor *dspark_draft_hc;
     ds4_gpu_tensor *dspark_target_hc;
     ds4_gpu_tensor *dspark_stage_input_hc;
@@ -15873,6 +15877,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->dspark_target_hc);
     ds4_gpu_tensor_free(g->dspark_draft_hc);
     ds4_gpu_tensor_free(g->dspark_draft_tokens);
+    ds4_gpu_tensor_free(g->dspark_markov_ring);
     for (uint32_t stage = 0; stage < DS4_DSPARK_MAX_STAGES; stage++) {
         ds4_gpu_tensor_free(g->dspark_raw_cache[stage]);
     }
@@ -16041,6 +16046,9 @@ static bool metal_graph_configure_dspark_capture(
         const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
         g->dspark_draft_tokens =
             ds4_gpu_tensor_alloc((uint64_t)dw->block_size * sizeof(int32_t));
+        g->dspark_markov_ring =
+            ds4_gpu_tensor_alloc((uint64_t)(DS4_DSPARK_MAX_BLOCK_SIZE + 1u) *
+                                 sizeof(uint64_t));
         g->dspark_draft_hc =
             ds4_gpu_tensor_alloc((uint64_t)dw->block_size * hc_dim * sizeof(float));
         g->dspark_target_hc =
@@ -16054,7 +16062,8 @@ static bool metal_graph_configure_dspark_capture(
         g->dspark_position_ids =
             ds4_gpu_tensor_alloc((uint64_t)(dw->block_size + 1u) *
                                  sizeof(int32_t));
-        if (!g->dspark_draft_tokens || !g->dspark_draft_hc ||
+        if (!g->dspark_draft_tokens || !g->dspark_markov_ring ||
+            !g->dspark_draft_hc ||
             !g->dspark_target_hc || !g->dspark_stage_input_hc ||
             !g->dspark_stage_output_hc || !g->dspark_position_ids) {
             return false;
@@ -28233,6 +28242,33 @@ static bool metal_graph_tp_subgate_pipeline(void) {
     return cached != 0;
 }
 
+/* DSpark verify emit-path fusion gate.  The batch (verify/prefill-short)
+ * per-token compressor loops spend ~20 dispatches per emit on pool + norm +
+ * rope + shift + quantize + commit; the decode path already proved a
+ * bit-exact one-dispatch exact pool plus the fused comp-row finalize.  Under
+ * the DSpark nrow gate the verify loops route each emit through those same
+ * kernels using the finalize's single-compressor modes (attention and
+ * indexer emit from separate loops).  Bit-exact vs the standalone chain.
+ * Rollback DS4_METAL_DISABLE_DSPARK_COMP_FINALIZE_FUSE. */
+static bool metal_graph_verify_comp_finalize_fuse(
+        const ds4_gpu_graph     *g,
+        const ds4_layer_weights *layer,
+        uint32_t                 ratio) {
+    return ratio == 4u && DS4_GPU_ATTN_COMP_CACHE_F16 &&
+           ds4_gpu_dspark_nrow_active() &&
+           !g->ssd_streaming && !g->ssd_streaming_cold &&
+           DS4_N_HEAD_DIM == 512u && DS4_N_INDEXER_HEAD_DIM == 128u &&
+           layer->attn_compressor_norm &&
+           layer->attn_compressor_norm->type == DS4_TENSOR_F32 &&
+           layer->indexer_compressor_norm &&
+           layer->indexer_compressor_norm->type == DS4_TENSOR_F32 &&
+           ds4_gpu_kv_rope_fp8_fuse_available() != 0 &&
+           metal_graph_ported_m5_decode_feature_enabled(
+               "DS4_METAL_DISABLE_PRE_M5_COMP_FINALIZE_FUSE",
+               "DS4_METAL_DISABLE_M5_COMP_FINALIZE_FUSE") &&
+           getenv("DS4_METAL_DISABLE_DSPARK_COMP_FINALIZE_FUSE") == NULL;
+}
+
 static bool metal_graph_encode_layer_attention_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -29061,9 +29097,12 @@ static bool metal_graph_encode_layer_attention_batch(
                 }
                 metal_graph_attn_comp_prefill_target_free(attn_comp_target);
             } else {
+                const bool verify_comp_fuse =
+                    metal_graph_verify_comp_finalize_fuse(g, layer, ratio);
                 for (uint32_t t = 0; ok && t < n_tokens; t++) {
                     const uint32_t pos = pos0 + t;
                     const bool emit = ((pos + 1u) % ratio) == 0u;
+                    const bool comp_fuse = emit && verify_comp_fuse;
                     if (emit && g->layer_n_comp[il] >= g->layer_comp_cap[il]) {
                         fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
                         ok = false;
@@ -29098,9 +29137,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             DS4_ROPE_YARN_BETA_SLOW,
                                                             DS4_RMS_EPS,
                                                             false,
-                                                            false,
-                                                            false) != 0;
-                    if (ok && emit) {
+                                                            comp_fuse,
+                                                            comp_fuse) != 0;
+                    if (ok && emit && !comp_fuse) {
                         ds4_gpu_tensor *comp_row_view = metal_graph_attn_comp_row_view(g, il, comp_row);
                         ok = comp_row_view &&
                              ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view,
@@ -29116,6 +29155,37 @@ static bool metal_graph_encode_layer_attention_batch(
                         }
                         ds4_gpu_tensor_free(comp_row_view);
                         if (ok) ok = metal_graph_commit_attn_comp_stage(g, il, comp_row, 1);
+                    }
+                    if (ok && comp_fuse) {
+                        /* Fused finalize (attention half): norm + rope + fp8
+                         * + F16 commit + the ratio-4 state shift in one
+                         * dispatch; the update above stopped after the exact
+                         * pool.  Bit-exact vs the skipped dispatches. */
+                        ok = ds4_gpu_dsv4_comp_row_finalize_mode_tensor(
+                                metal_graph_attn_comp_stage(g),
+                                g->layer_attn_comp_cache[il],
+                                comp_row,
+                                layer->attn_compressor_norm->abs_offset,
+                                g->layer_index_comp_cache[il],
+                                0u,
+                                layer->indexer_compressor_norm->abs_offset,
+                                g->layer_attn_state_kv[il],
+                                g->layer_attn_state_score[il],
+                                g->layer_index_state_kv[il],
+                                g->layer_index_state_score[il],
+                                model->map,
+                                model->size,
+                                pos + 1u - ratio,
+                                DS4_N_ROT,
+                                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0u,
+                                freq_base,
+                                freq_scale,
+                                ext_factor,
+                                attn_factor,
+                                DS4_ROPE_YARN_BETA_FAST,
+                                DS4_ROPE_YARN_BETA_SLOW,
+                                DS4_RMS_EPS,
+                                1u) == 1;
                     }
                     if (ok && emit) g->layer_n_comp[il]++;
                     if (comp_counts) comp_counts[t] = g->layer_n_comp[il];
@@ -29381,9 +29451,12 @@ static bool metal_graph_encode_layer_attention_batch(
                     }
                     ds4_gpu_tensor_free(index_view);
                 } else {
+                    const bool verify_comp_fuse =
+                        metal_graph_verify_comp_finalize_fuse(g, layer, ratio);
                     for (uint32_t t = 0; ok && t < n_tokens; t++) {
                         const uint32_t pos = pos0 + t;
                         const bool emit = ((pos + 1u) % ratio) == 0u;
+                        const bool comp_fuse = emit && verify_comp_fuse;
                         if (emit && g->layer_n_index_comp[il] >= g->layer_comp_cap[il]) {
                             fprintf(stderr, "ds4: Metal graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
                             ok = false;
@@ -29418,9 +29491,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 DS4_ROPE_YARN_BETA_SLOW,
                                                                 DS4_RMS_EPS,
                                                                 false,
-                                                                false,
-                                                                false) != 0;
-                        if (ok && emit) {
+                                                                comp_fuse,
+                                                                comp_fuse) != 0;
+                        if (ok && emit && !comp_fuse) {
                             ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
                                     g->layer_index_comp_cache[il],
                                     (uint64_t)index_row * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
@@ -29433,6 +29506,37 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                       DS4_N_INDEXER_HEAD_DIM) != 0;
                                 ds4_gpu_tensor_free(index_row_view);
                             }
+                        }
+                        if (ok && comp_fuse) {
+                            /* Fused finalize (indexer half): norm + rope +
+                             * QAT in place + the ratio-4 state shift in one
+                             * dispatch; the update stopped after the exact
+                             * pool.  Bit-exact vs the skipped dispatches. */
+                            ok = ds4_gpu_dsv4_comp_row_finalize_mode_tensor(
+                                    metal_graph_attn_comp_stage(g),
+                                    g->layer_attn_comp_cache[il],
+                                    0u,
+                                    layer->attn_compressor_norm->abs_offset,
+                                    g->layer_index_comp_cache[il],
+                                    index_row,
+                                    layer->indexer_compressor_norm->abs_offset,
+                                    g->layer_attn_state_kv[il],
+                                    g->layer_attn_state_score[il],
+                                    g->layer_index_state_kv[il],
+                                    g->layer_index_state_score[il],
+                                    model->map,
+                                    model->size,
+                                    pos + 1u - ratio,
+                                    DS4_N_ROT,
+                                    compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0u,
+                                    freq_base,
+                                    freq_scale,
+                                    ext_factor,
+                                    attn_factor,
+                                    DS4_ROPE_YARN_BETA_FAST,
+                                    DS4_ROPE_YARN_BETA_SLOW,
+                                    DS4_RMS_EPS,
+                                    2u) == 1;
                         }
                         if (ok && emit) g->layer_n_index_comp[il]++;
                         if (index_counts) index_counts[t] = g->layer_n_index_comp[il];
@@ -30147,6 +30251,8 @@ static bool metal_graph_encode_mixed_routed_rows(
  * experts, sum, and HC post.  A non-empty decode tail has already been
  * prepared in rows [n_tokens, n_tokens + decode_count); only the routed
  * expert dispatch is shared between the two arithmetic paths. */
+static bool dspark_verify_grouped_moe_enabled(void);
+
 static bool metal_graph_encode_layer_ffn_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -30640,7 +30746,47 @@ static bool metal_graph_encode_layer_ffn_batch(
                                     (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
         }
     } else if (ok) {
-        ok = ds4_gpu_routed_moe_batch_tensor(metal_graph_batch_routed_out(g),
+        /* DSpark verify only, opt-in: swap the per-(token,slot) routed MoE
+         * dispatch for the expert-major grouped kernels (one read per
+         * distinct expert).  Measured negative on M3 Ultra (verify
+         * 74 -> 92 ms/pass); kept behind DS4_DSPARK_ENABLE_VERIFY_GROUPED_MOE
+         * for re-measurement at other overlaps. */
+        const bool verify_grouped_moe =
+            ds4_gpu_dspark_nrow_active() &&
+            dspark_verify_grouped_moe_enabled() &&
+            n_tokens <= 8u &&
+            layer->ffn_gate_exps->type == DS4_TENSOR_MXFP4 &&
+            layer->ffn_up_exps->type == DS4_TENSOR_MXFP4 &&
+            layer->ffn_down_exps->type == DS4_TENSOR_MXFP4;
+        if (verify_grouped_moe) {
+            ok = ds4_gpu_routed_moe_batch_grouped_tensor(
+                                               metal_graph_batch_routed_out(g),
+                                               metal_graph_batch_routed_gate(g),
+                                               metal_graph_batch_routed_up(g),
+                                               metal_graph_batch_routed_mid(g),
+                                               metal_graph_batch_routed_down(g),
+                                               model->map,
+                                               model->size,
+                                               layer->ffn_gate_exps->abs_offset,
+                                               layer->ffn_up_exps->abs_offset,
+                                               layer->ffn_down_exps->abs_offset,
+                                               gate_expert_bytes,
+                                               gate_row_bytes,
+                                               down_expert_bytes,
+                                               down_row_bytes,
+                                               (uint32_t)expert_in_dim,
+                                               (uint32_t)down_in_dim,
+                                               (uint32_t)routed_out_dim,
+                                               metal_graph_batch_router_selected(g),
+                                               metal_graph_batch_router_weights(g),
+                                               DS4_N_EXPERT,
+                                               DS4_N_EXPERT_USED,
+                                               DS4_SWIGLU_CLAMP_EXP,
+                                               metal_graph_batch_ffn_norm(g),
+                                               n_tokens) != 0;
+            g->batch_routed_mid_is_f16 = false;
+        } else {
+            ok = ds4_gpu_routed_moe_batch_tensor(metal_graph_batch_routed_out(g),
                                                metal_graph_batch_routed_gate(g),
                                                metal_graph_batch_routed_up(g),
                                                metal_graph_batch_routed_mid(g),
@@ -30670,6 +30816,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                &g->batch_routed_mid_is_f16,
                                                fuse_moe_sum6_hc,
                                                false) != 0;
+        }
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", metal_graph_batch_routed_gate(g),
@@ -33856,6 +34003,19 @@ static bool dspark_disable_reuse_confidence0_markov(void) {
     return cache != 0;
 }
 
+static bool dspark_verify_grouped_moe_enabled(void) {
+    static int cache = -1;
+    if (cache < 0) {
+        /* Measured negative on M3 Ultra (verify 74.0 -> 91.9 ms/pass): the
+         * per-pair batch dispatch already dedups shared experts through L2,
+         * and at ~2.3 pairs/expert the grouped kernels' overheads exceed the
+         * issue sharing.  Kept opt-in for re-measurement at other overlaps. */
+        const char *env = getenv("DS4_DSPARK_ENABLE_VERIFY_GROUPED_MOE");
+        cache = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return cache != 0;
+}
+
 static bool dspark_apply_markov_greedy_probe(
         float                  *logits,
         const ds4_model        *dspark_model,
@@ -34028,6 +34188,55 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
     int32_t prev_token = first_prev_token;
     uint32_t produced = 0;
     uint32_t confident = 0;
+#ifdef __APPLE__
+    /* Chained GPU markov+argmax: one command buffer scores every draft row,
+     * each kernel reading the previous row's token from the key ring.  The
+     * per-row confidence gate below is unaffected — it only decides how many
+     * of the already-computed tokens the proposal keeps; rows past the gate
+     * are computed and discarded (same values, some wasted GPU on gated
+     * rounds).  Numerics follow the GPU kernel's dequantized-f32 dot, which
+     * may differ from the CPU q8-state path at ulp level; a rare tie flip
+     * only changes a draft proposal, which the target verifier then accepts
+     * or rejects as usual.  Failure or DS4_DSPARK_NO_GPU_MARKOV falls back
+     * to the per-row CPU path. */
+    int32_t gpu_tokens[DS4_DSPARK_MAX_BLOCK_SIZE];
+    uint32_t gpu_chain_len = 0;
+    if (!dspark_markov_bias_disabled() &&
+        getenv("DS4_DSPARK_NO_GPU_MARKOV") == NULL &&
+        g->dspark_markov_ring &&
+        dw->block_size <= DS4_DSPARK_MAX_BLOCK_SIZE &&
+        dw->markov_rank != 0 && (dw->markov_rank & 31u) == 0 &&
+        final->markov_w1->type == DS4_TENSOR_Q8_0 &&
+        final->markov_w2->type == DS4_TENSOR_Q8_0) {
+        const uint64_t seed = (uint64_t)(~(uint32_t)first_prev_token);
+        uint64_t keys[DS4_DSPARK_MAX_BLOCK_SIZE];
+        if (ds4_gpu_tensor_write(g->dspark_markov_ring,
+                                 0,
+                                 &seed,
+                                 sizeof(seed)) != 0 &&
+            ds4_gpu_dspark_markov_argmax_chain_tensor(
+                    g->dspark_markov_ring,
+                    g->spec_logits,
+                    dspark_model->map,
+                    dspark_model->size,
+                    final->markov_w1->abs_offset,
+                    final->markov_w2->abs_offset,
+                    dw->block_size,
+                    DS4_N_VOCAB,
+                    dw->markov_rank) != 0 &&
+            ds4_gpu_tensor_read(g->dspark_markov_ring,
+                                sizeof(uint64_t),
+                                keys,
+                                dw->block_size * sizeof(uint64_t)) != 0) {
+            for (uint32_t i = 0; i < dw->block_size; i++) {
+                const uint32_t t = ~(uint32_t)(keys[i] & 0xffffffffu);
+                if (keys[i] == 0 || t >= DS4_N_VOCAB) break;
+                gpu_tokens[i] = (int32_t)t;
+                gpu_chain_len = i + 1u;
+            }
+        }
+    }
+#endif
     for (uint32_t draft = 0; ok && draft < dw->block_size; draft++) {
         if (prev_token < 0 || (uint32_t)prev_token >= DS4_N_VOCAB) {
             ok = false;
@@ -34061,9 +34270,11 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
         }
 
         int32_t token = -1;
-#ifndef __APPLE__
+#ifdef __APPLE__
+        if (draft < gpu_chain_len) token = gpu_tokens[draft];
+#else
         /* CUDA can apply the Markov bias and argmax without reading back the
-         * full logits row. Metal currently falls through to the CPU path. */
+         * full logits row. */
         if (ok && !dspark_markov_bias_disabled() &&
             getenv("DS4_DSPARK_NO_GPU_MARKOV") == NULL &&
             g->dspark_draft_tokens &&
@@ -34102,7 +34313,7 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
             }
         }
 #endif
-        if (ok) {
+        if (ok && token < 0) {
             ok = ds4_gpu_tensor_read(g->spec_logits,
                                      (uint64_t)draft * logits_bytes,
                                      logits,
@@ -35982,6 +36193,14 @@ static bool metal_graph_verify_suffix_tops_impl(
                         n_tokens <= (uint32_t)DS4_TP_BATCH_MAX_ROWS)
                        ? n_tokens : 0;
     const double layer_t0 = timing ? now_sec() : 0.0;
+    /* The decode eval resets the commit-only counter buffer at every token
+     * start (metal_graph_eval_token_raw_swa), so a verify pass would never
+     * survive to a report.  Bracket the verify with its own reset/report to
+     * make its batch stage map visible under DS4_METAL_STAGE_COUNTERS. */
+    if (ds4_gpu_stage_counters_enabled()) ds4_gpu_stage_counter_reset();
+    /* Enables the nrow small-N matvec routing (and the opt-in grouped MoE)
+     * for the verify's batch layers only; prefill keeps reference paths. */
+    ds4_gpu_set_dspark_nrow_active(1);
     ok = ds4_gpu_begin_commands() != 0;
     const bool dspark_capture_active =
         ok &&
@@ -36060,6 +36279,8 @@ static bool metal_graph_verify_suffix_tops_impl(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
+    if (ds4_gpu_stage_counters_enabled()) ds4_gpu_stage_counter_report(start);
+    ds4_gpu_set_dspark_nrow_active(0);
     g->spec_capture_prefixes = saved_capture;
     if (!ok && dspark_capture_active) {
         metal_graph_dspark_capture_invalidate(g);
@@ -49946,6 +50167,7 @@ struct ds4_session {
     uint32_t dspark_sched_cycles;
     uint32_t dspark_sched_accepted;
     uint32_t dspark_sched_no_draft;
+    uint32_t dspark_sched_no_draft_streak;
     uint32_t dspark_sched_skip;
     uint32_t dspark_sched_lifetime_accepted;
     double dspark_sched_life_extra_ms;
@@ -50036,6 +50258,15 @@ static uint32_t ds4_dspark_scheduler_no_draft_skip_cycles(void) {
     return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_NO_DRAFT_SKIP", 3);
 }
 
+/* Consecutive no-draft cycles escalate the pause up to this cap: transitional
+ * declines (a streak of one or two between productive drafts) keep the base
+ * pause, while persistently declining regimes (low-yield content) back off
+ * exponentially so the machinery cost of doomed propose attempts fades.  A
+ * cap at or below the base pause disables the escalation. */
+static uint32_t ds4_dspark_scheduler_no_draft_streak_cap(void) {
+    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_NO_DRAFT_STREAK_CAP", 32);
+}
+
 static uint32_t ds4_dspark_scheduler_short_accept_no_draft_skip_cycles(void) {
     return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_SHORT_ACCEPT_NO_DRAFT_SKIP", 4);
 }
@@ -50093,6 +50324,12 @@ static void ds4_session_dspark_scheduler_note(
         s->dspark_sched_skipped_cycle = false;
         return;
     }
+    /* A live draft (accepted or missed) decays the no-draft streak without
+     * collapsing it: persistent low-yield regimes stay clamped while
+     * transitional declines between productive drafts still reset it. */
+    if (!no_draft && s->dspark_sched_no_draft_streak > 0u) {
+        s->dspark_sched_no_draft_streak--;
+    }
 
     s->dspark_sched_cycles++;
     s->dspark_sched_accepted += accepted_drafts;
@@ -50138,6 +50375,20 @@ static void ds4_session_dspark_scheduler_note(
             const uint32_t cold_low_conf_skip =
                 ds4_dspark_scheduler_cold_low_confidence_skip_cycles();
             if (skip < cold_low_conf_skip) skip = cold_low_conf_skip;
+        }
+        s->dspark_sched_no_draft_streak++;
+        const uint32_t streak_cap =
+            ds4_dspark_scheduler_no_draft_streak_cap();
+        if (s->dspark_sched_no_draft_streak >= 2u &&
+            streak_cap > skip) {
+            uint32_t esc = skip;
+            for (uint32_t i = 1u;
+                 i < s->dspark_sched_no_draft_streak && esc < streak_cap;
+                 i++) {
+                esc <<= 1;
+            }
+            if (esc > streak_cap) esc = streak_cap;
+            if (skip < esc) skip = esc;
         }
         if (s->dspark_sched_skip < skip) {
             s->dspark_sched_skip = skip;
@@ -61710,6 +61961,10 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
             confidence_threshold > 0.0f &&
             dspark_confidence_probe_ready(dw);
         if (stage_chain_ready) {
+            /* The support chain's Q8 projections share the verify's nrow
+             * small-N matvec (mul_mv-exact per token; draft proposals may
+             * shift at ties, the verifier stays authoritative). */
+            ds4_gpu_set_dspark_nrow_active(1);
             stage_chain_ok =
                 metal_graph_eval_dspark_stage_chain(&s->graph,
                                                 &s->engine->mtp_model,
@@ -61719,6 +61974,7 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                                                 &stage_chain_done,
                                                 &stage_cache_start,
                                                 &stage_cache_rows);
+            ds4_gpu_set_dspark_nrow_active(0);
         }
         DS4_DSPARK_PROP_ADD(propose_chain_ms, chain_t0);
         const bool stage_block_ok = stage_chain_done >= 1u;
@@ -61770,12 +62026,17 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                 if (sigmoid_stable(confidence0) >= confidence_threshold) {
                     confidence_prefix_len = 1;
                     const double logits_t0 = DS4_DSPARK_PROP_T0();
+                    /* The block_size-row base head runs at mv_ext speed; the
+                     * nrow matvec shares the 562 MB weight read across the
+                     * draft rows (mul_mv-exact per row). */
+                    ds4_gpu_set_dspark_nrow_active(1);
                     base_logits_ok =
                         metal_graph_eval_dspark_base_logits_from_hidden(
                                 &s->graph,
                                 &s->engine->model,
                                 &s->engine->weights,
                                 dw);
+                    ds4_gpu_set_dspark_nrow_active(0);
                     DS4_DSPARK_PROP_ADD(propose_logits_ms, logits_t0);
                     reuse_confidence0_markov =
                         base_logits_ok &&

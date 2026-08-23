@@ -525,12 +525,65 @@ int ds4_gpu_dspark_markov_argmax_tensor(ds4_gpu_tensor *out_idx,
                                         uint32_t prev_token,
                                         uint32_t vocab,
                                         uint32_t rank);
+#ifdef __APPLE__
+/* Metal chained variant: one command buffer scores all n_rows draft rows.
+ * out_ring needs n_rows+1 u64 slots; slot 0 must hold ~prev_token in its low
+ * 32 bits on entry (the seed token), slots 1..n_rows receive the same
+ * monotonic keys the per-row API produces.  logits holds n_rows contiguous
+ * vocab rows.  Dispatch boundaries order each row's read of the previous
+ * row's key. */
+int ds4_gpu_dspark_markov_argmax_chain_tensor(ds4_gpu_tensor *out_ring,
+                                        const ds4_gpu_tensor *logits,
+                                        const void *model_map,
+                                        uint64_t model_size,
+                                        uint64_t w1_offset,
+                                        uint64_t w2_offset,
+                                        uint32_t n_rows,
+                                        uint32_t vocab,
+                                        uint32_t rank);
+#endif
+#ifdef __APPLE__
+/* Grouped (expert-major) routed MoE for the DSpark verify path at N<=8 rows;
+ * MXFP4 only, single device.  Same contract as the batch routed MoE but with
+ * one threadgroup per distinct expert. */
+int ds4_gpu_routed_moe_batch_grouped_tensor(
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *experts,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        float clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t n_tokens);
+#endif
 int ds4_gpu_indexer_topk_tensor(
         ds4_gpu_tensor       *selected,
         const ds4_gpu_tensor *scores,
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                top_k);
+#ifdef __APPLE__
+/* Set around the DSpark verify layer loop: routes the small-N Q8 matmuls
+ * through the nrow matvec and (opt-in) the grouped routed MoE. */
+void ds4_gpu_set_dspark_nrow_active(int active);
+int ds4_gpu_dspark_nrow_active(void);
+#endif
 
 int ds4_gpu_indexer_top1_value_tensor(
         ds4_gpu_tensor       *selected,
@@ -936,6 +989,36 @@ int ds4_gpu_dsv4_comp_row_finalize_tensor(
         float                 beta_fast,
         float                 beta_slow,
         float                 rms_eps);
+
+/* Same fusion with a compressor selector: mode 1 finalizes only the
+ * attention row/shift, mode 2 only the indexer row/shift.  Used by the
+ * DSpark verify loops, where the two compressors emit from separate
+ * per-token loops.  Unused buffers must still be valid for binding. */
+int ds4_gpu_dsv4_comp_row_finalize_mode_tensor(
+        ds4_gpu_tensor       *attn_stage,
+        ds4_gpu_tensor       *attn_cache,
+        uint32_t              attn_comp_row,
+        uint64_t              attn_norm_offset,
+        ds4_gpu_tensor       *index_cache,
+        uint32_t              index_comp_row,
+        uint64_t              index_norm_offset,
+        ds4_gpu_tensor       *attn_state_kv,
+        ds4_gpu_tensor       *attn_state_score,
+        ds4_gpu_tensor       *index_state_kv,
+        ds4_gpu_tensor       *index_state_score,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint32_t              pos,
+        uint32_t              n_rot,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        float                 rms_eps,
+        uint32_t              mode);
 
 /* Decode-only M5 fusion: q_a/kv Q8 pair projection + F16 quad compressor
  * projection/store in one dispatch.  Bit-exact vs the separate dispatches.

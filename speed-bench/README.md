@@ -89,6 +89,333 @@ routing; the microbatch build must write genuine small-N batched kernels.  Stric
 measures 43.07 t/s, i.e. no gain, as accepted blocks are re-run through
 one-token decode to stay byte-identical.
 
+Round-5 addendum (Aug 22, branch perf/decode-50tps, MXFP4): propose-path
+work, validated by the dspark fixture + verify-depth invariant
+(worst_argmax_gap 0.000) + scheduler stats.
+
+- **Logits re-verified OK before touching anything**: 128 speculative
+  tokens teacher-forced through plain decode show zero argmax gap; all five
+  fixture prompts produce byte-identical greedy output.  The verifier is
+  not the problem; the cost structure is.
+- **LANDED: chained Metal markov+argmax fusion.**  The propose loop used to
+  read back every draft row's 517 KiB logits row and run the full-vocab
+  markov bias + argmax on CPU (~175 MB of w2 traffic + 165 M MACs per
+  round, prop_markov ~1.33 ms).  Now a fused two-dispatch kernel pair
+  (q8_0 dot vs the dequantized w1 row + lexicographic top-1, CUDA-numerics
+  precedent, ties keep the lowest index) scores all five draft rows in ONE
+  command buffer, each row's kernel reading the previous row's token from a
+  GPU-resident key ring (`g->dspark_markov_ring`), ordered by dispatch
+  boundaries.  prop_markov 1.33 -> 0.59-0.69 ms/round (python_reverse
+  fixture 6.65 -> 3.23 ms over 5 rounds).  A per-row variant (one
+  commit+wait per draft row) measured WORSE than CPU (1.55 ms/round) — five
+  drained round trips eat the kernel win; the chained form is the one that
+  lands.  CPU fallback intact, rollback `DS4_DSPARK_NO_GPU_MARKOV=1`.
+  Outputs identical on all fixture cases; verify-depth invariant holds.
+- **MEASURED NEGATIVE, reverted**: routing the block_size-row base-head
+  matmul through `ds4_gpu_matmul_q8_0_decode_rows_exact_tensor` (the
+  multi-session mul_mv batch path) re-reads the 562 MB Q8_0 head per row —
+  prop_logits 2.0 -> 4.1 ms/round.  The generic small-N matmul (mv_ext)
+  stays; the head's ~280 GB/s vs the single-row decode head's ~730 GB/s is
+  the same small-N kernel-efficiency disease as verify, not a dispatch
+  routing problem.
+- Updated per-round cost structure (python_reverse, default confidence):
+  propose ~10 ms = chain 5.0 (support-model 3-stage forward over 6 rows,
+  batch-kernel small-N disease in metal_graph_encode_layer_ffn_batch) +
+  logits 2.0 (562 MB head at ~280 GB/s) + cache ~1.6 (one-time per
+  generation stage-0 seed, amortizes) + markov 0.65 (was 1.33) + setup 0.4.
+  Verify ~52-74 ms for <=6 rows (unchanged).  All three remaining propose
+  costs and the entire verify excess are the same root cause: no
+  decode-grade small-N (N<=8) kernels.  That is the only remaining lever
+  and it is the P4-scoped grouped-kernel program (bit-exact conditions in
+  the round-4 handoff), which the three failed verify increments above did
+  not try (they were dispatch routing, not new kernels).
+- One-time cost to know about: the first propose round of a process pays
+  ~45 ms of markov-head first-GPU-touch (PSO create + 70 MB of w1/w2 page
+  faults).  Amortizes over any real session; visible in 32-token fixtures.
+
+Round-6 addendum (Aug 22, branch perf/decode-50tps, MXFP4): the small-N
+kernel program.  Verify pass measured truthfully first (commit-only stage
+counters inside the verify loop — the decode eval used to wipe them with
+its per-token reset; a reset/report bracket in the verify driver fixes
+that):  verify wall ~74 ms/pass for <=6 rows, GPU-bound with a UNIFORM
+~2.9x per-stage excess over the ~30 ms bandwidth floor (routed_moe 22.8,
+hc_pre 11.5, output_proj 10.1, indexer+compressor 13.7, q_path 7.1,
+shared 10.8, router 4.3 ms/verify).  Expert footprint: ~12.8 distinct
+experts/layer (2.1x decode's 6) — the per-pair dispatch already dedups
+through L2.
+
+- **MEASURED NEGATIVE, gated OFF: expert-major grouped routed MoE.**
+  New grouped kernels (one threadgroup per distinct expert, sharing the
+  weight block read and LUT gathers across its (token,slot) pairs,
+  bit-exact per pair vs the reference matvec) went SLOWER: verify
+  74.0 -> 91.9 ms/pass.  At ~2.3 pairs/expert average overlap the issue
+  sharing (~2.9x at npair>=4) is eaten by the pair-loop/setup/register
+  overheads and the sentinel-padded grid — L2 was already doing the
+  dedup.  Opt-in kept as DS4_DSPARK_ENABLE_VERIFY_GROUPED_MOE for
+  re-measurement at other overlaps.  This closes the MoE angle at this
+  overlap factor: the recoverable time is NOT in the routed MoE.
+- **LANDED: nrow small-N Q8 matvec for the verify path** (verify
+  74.3 -> 68.9 ms/pass, -7.3%, interleaved A/B x3).  The batch small-N
+  matmuls (shared gate/up/down, q_a/q_b, kv, router, attention out-B)
+  ran through mv_ext at 27-280 GB/s where the single-row decode matvec
+  gets ~730 GB/s.  New kernel_mul_mv_q8_0_nrow_f32_n{2..6} keeps the
+  single-row kernel's exact per-element math (lane map, ascending block
+  stride, sequential per-lane sumq*scale, same two-stage simd_sum
+  epilogue tree per row) with one accumulator per token — bit-exact with
+  mul_mv per token, one weight read for all rows.  Routed in
+  ds4_gpu_matmul_q8_0_legacy_tensor when g_dspark_nrow_active is set
+  (verify layer loop only), n_tok 2..6; rollback
+  DS4_METAL_DISABLE_Q8_NROW_MATMUL.  Stage deltas per verify:
+  shared_down 6.4 -> 1.2, q_path 7.1 -> 4.3, shared_gate_up 4.4 -> 2.6,
+  attention out-B included.  Validation: fixture output_match=1 on all
+  five cases, verify-depth worst_argmax_gap 0.000, md5 oracle db0c504c…
+  holds (prefill untouched by construction), make test 44/44.
+- **LANDED: attention out-A grouped nrow** (output_proj 9.0 -> 6.2
+  ms/verify): kernel_dsv4_attn_out_low_q8_0_nrow_f32_n{2..6} runs all
+  eight head-group projections in one dispatch with the same nrow
+  structure.  Combined V2a+V2b: verify 74.8 -> 67.0 ms/pass (-10.4%,
+  interleaved A/B x3).
+- **LANDED: nrow for the propose side** (propose 9.4 -> 8.2 ms/round):
+  the block_size-row base head (562 MB, 280 -> ~730 GB/s) and the
+  support chain's Q8 projections set g_dspark_nrow_active around their
+  calls.  prop_logits 2.0 -> 1.2, prop_chain 5.0 -> 4.3 ms/round.
+  Guard: nrow only routes out_dim >= 512 — tiny extents (hc projections
+  out=24, router out=256) starve the no-k-split grid and stay on mv_ext
+  (an unguarded nrow made the chain 3x slower; measured, fixed).
+- End-to-end so far (python_reverse fixture, code): dspark 48.9 -> 52.9
+  t/s vs 47.0 baseline (+12%).  Fixture hello/math/python net-positive;
+  redis/medium-yield and story still scheduler-limited.  c_add fixture
+  guard still trips at 32 tokens (pre-existing scheduler conservatism;
+  net_saved improved -3.8 -> +10.2).
+- End-to-end at 128 tokens (temp 0): medium-yield code 40.85 -> 42.34
+  t/s vs 45.74 baseline (-7.4%, was -10.4%); story 39.23 -> 40.59 vs
+  45.38 (-10.5%, was -13.8%).  The remaining negatives are yield-side
+  (0.95-0.27 accepted/cycle), not cost-side: 24 verifies at ~48.7 ms
+  (n~4 rows) confirm the nrow verify scales with rows as expected.
+- Remaining verify map after nrow (target in order): routed_moe 22.5
+  (floor ~13, no lever found), hc_pre 11.3, output_proj 9.0 (the
+  attention out-A grouped projection is next), indexer_setup+compressor
+  13.7, router 4.3 (out=256 grid too small — needs k-split nrow),
+  attention 2.9.  The grouped-MoE negative + this map say the rest of
+  the floor is won stage-by-stage with nrow-family kernels, not by
+  restructuring dispatch.
+- Next candidates: k-split nrow for out_dim < 512 (router 4.3 -> ~0.5);
+  hc_pre 11.3 (F16 HC projections + sinkhorn at n=6); indexer/compressor
+  13.7; attention 2.9; then the support-model MoE per-pair MXFP4 (same
+  blocked angle as the target's routed_moe).
+- **ds4-eval wiring fix (Aug 23)**: eval never speculated at all — the
+  decode loop used only sample+eval, and loading the support model
+  disabled chain bursts (chain_greedy_supported rejects support_kind !=
+  NONE), so --dspark eval was the slowest decode configuration.  Added
+  --dspark/--dspark-confidence/--dspark-strict to ds4_eval.c and a
+  speculative-burst branch in the decode loop (same gating as the CLI:
+  temp <= 0, ds4_engine_mtp_draft_tokens > 1; think-close window guard
+  identical to chain bursts; accepted tokens go through
+  eval_chain_on_token so the emitted stream is byte-identical).
+  Measured on GPQA Diamond case 1, nothink, 1024-token budget, M3 Ultra:
+  plain 6.1s/278 tok, dspark 6.0s/277 tok, identical text, PASS both
+  ways.  DS4_DSPARK_STATS: cycles=114 avg_accept=1.44 accept_rate=85%
+  no_draft=55 scheduler_skips=45 net_saved=+192 ms — break-even is
+  ~1.4 accepted/cycle here (propose 4.2 + verify 26.1 vs 21.9 ms/token
+  baseline), so science/LaTeX content sits at parity; the 52.9 t/s
+  fixture number needs high-yield code.  Confidence sweep on the same
+  case: 0.4 -> net_saved -266 ms (cycles 141, avg 0.97), 0.8 -> -163 ms
+  (cycles 169, avg 0.65); the 0.6 default is already optimal for this
+  content.
+
+Round-7 addendum (Aug 23, branch perf/decode-50tps, MXFP4): the small-out
+end of the nrow program plus the first scheduler change.  Validation per
+item: fixture output_match=1 on all five cases (the c_add accepted_draft
+guard trip at 32 tokens is pre-existing and byte-identical before/after),
+verify-depth worst_argmax_gap 0.000, md5 oracle db0c504c…, make test 44/44,
+interleaved A/B x3 for wall time, commit-only counters for stage maps.
+
+- **LANDED: small-out nrow matvecs (Q8 + F16).**  The verify router is F16
+  (4096->256), not Q8 as the round-6 guard comment implied — the Q8
+  small-out variant only fires for the support model's Q8 router.  New
+  kernel_mul_mv_f16_nrow_f32_n{2..6} (and the Q8 _so_ sibling) widen the
+  nrow structure to NSG=8 with one output row per threadgroup: the router
+  dispatches 256 threadgroups of 256 threads where mv_ext had (32,2).
+  Routed when g_dspark_nrow_active && 64<=out<512 && in>=2048 (round-6
+  nrow keeps out>=512).  NOT bit-exact with mul_mv/mv_ext (different
+  per-lane block subsets and reduction tree); the verify tolerates the
+  order difference by design, as it already did for mv_ext.  Interleaved
+  A/B x3 (32-token fixture prompt): verify 329.3 -> 318.8 ms per 5 passes
+  (-2.1 ms/verify), e2e 53.7 -> 54.7 t/s.  Rollbacks
+  DS4_METAL_DISABLE_F16_NROW_SMALLOUT / DS4_METAL_DISABLE_Q8_NROW_SMALLOUT.
+  Measurement note: the router stage's cost was half select, not all
+  matmul — a temporary router_mm boundary showed 2.6 ms matmul / 1.7 ms
+  select per verify (counter mode).
+- **LANDED: fused batch router select** (kernel_dsv4_router_select_batch_
+  fused): one 256-thread threadgroup per token fuses the sqrt(softplus)
+  transform (device store + volatile reload, same rounding boundary as the
+  standalone dispatches), the bias add, and the 256-wide bitonic top-6 from
+  kernel_dsv4_router_finalize_one_simd — replacing softplus + sqrt +
+  bias-add + two argsort merge dispatches per bias layer.  The weight
+  finalization stays in kernel_dsv4_router_weights_batch (its simd_sum /
+  p/denom/scale rounding sequence is deliberately not reproduced in the
+  fused kernel — the comment there about 43-layer amplification applies).
+  Engages only under g_dspark_nrow_active, 2..6 tokens, non-hash layers.
+  Tie order inside the bitonic network can differ from the argsort merge
+  it replaces; router scores are distinct in practice, and the fixture +
+  verify-depth gates held.  A/B x3: verify 318.8 -> 315.3 per 5 passes
+  (-0.7 ms/verify), e2e 54.7 -> 55.0 t/s.  Rollback
+  DS4_METAL_DISABLE_ROUTER_SELECT_BATCH_FUSION.
+- **LANDED: nrow for the HC projections** (gate widened to out>=24): the
+  verify HC projections (F16 16384->24, hc_attn_fn/hc_ffn_fn, twice per
+  layer) ran mv_ext on a (3,2) grid of 64-thread threadgroups — 120 us per
+  call.  The nrow kernel gives each of the 24 output rows a 256-thread
+  threadgroup: hc_proj 10.3 -> 2.4 ms/verify (counter mode), production
+  verify -8.6 ms/verify (324.1 -> 281.3 per 5 passes, interleaved A/B x3),
+  prop_chain -3 ms/round (the support chain's HC projections ride too).
+  e2e fixture 54.1 -> 58.6 t/s.  Same rollback env as the router nrow.
+- **LANDED: scheduler no-draft streak escalation.**  Low-yield content
+  (story: avg_accept 0.31) loses ~12% to doomed propose+verify cycles.
+  Static longer skip knobs recover most of it (story 40.6 -> 43.7-43.9)
+  but collapse the code yield (avg_accept 1.93 -> 0.65, 47.1 -> 44.9 t/s):
+  the no_draft pause length must depend on regime persistence, not be
+  global.  Now consecutive no-draft cycles escalate the pause 3 -> 6 ->
+  12 -> 24 -> 32 (cap DS4_DSPARK_SCHEDULER_NO_DRAFT_STREAK_CAP, default 32;
+  a cap at/below the base pause disables), and a live draft (accepted or
+  missed) decays the streak by one instead of resetting it — transitional
+  declines between productive drafts stay cheap, persistent loser regimes
+  clamp.  Interleaved A/B x2 at 128 tokens: story 39.9 -> 42.1 t/s (code
+  neutral at 47.0, avg_accept and skips byte-identical), GPQA Diamond
+  case 1 identical text/stats PASS both ways.  Residual story gap vs plain
+  decode (~46.2) is structural: with drafting fully disabled
+  (--dspark-confidence 1.0) the session still pays ~1.8 ms/token of
+  propose-attempt + bookkeeping, i.e. the story ceiling is ~43.5-44.
+- **Scoped, not built: compressor/indexer small-N fusion** (compressor 7.9
+  + indexer_setup 5.6 ms/verify counter mode).  The n=6 verify runs the
+  per-token compressor loop: ~30 tiny dispatches per ratio-4 layer (6 APE
+  stores, 2 emit chains of pool+norm+rope+shift, 5x2 prefix-capture state
+  copies), dispatch-latency-bound.  Fusing them into one kernel per layer
+  is semantically possible only whole: the per-token prefix snapshots must
+  include the interleaved emit/shift effects, so the fused kernel would
+  have to reproduce the softmax pool, the rms_norm reduction tree, and the
+  YaRN rope tail inside one new kernel context — the A3 fast-math
+  contraction trap applies to the last two, with only the empirical gates
+  to catch it.  Deferred; the safe sub-fusions (stores, captures) are
+  blocked by the same interleaving.
+- End-to-end state (fixture-scale, temp 0): python_reverse dspark 57.9-58.6
+  t/s vs plain 46.7-47.6; all five fixture prompts net-positive, three of
+  them with dspark above plain decode outright (hello 53.7/40.8, math
+  49.1/40.3, python_reverse 57.9/46.7; redis 52.1/46.5).  128-token:
+  medium code 47.8-47.9 vs 46.4 plain (+3%, was -7.4% in round 6); story
+  42.1 vs 46.2 (-9%, was -10.5%; the residual is the machinery floor tax
+  plus yield reality, not verify cost).  GPQA parity with net_saved +479
+  ms (was +192 at the eval-wiring note).  Verify pass 66.6 -> 56.3 ms
+  production (-15.5%).
+- Updated verify map (counter mode, after this round): routed_moe 22.8
+  (floor-bound, no lever), compressor 7.9 + indexer_setup 5.6 (per-token
+  loops, see above), output_proj 6.1, attention 3.3, q_b 3.1 (at the wall),
+  router 2.9 -> fused split, hc_proj 2.4 + hc_pre 1.2 (was 11.5), kv_path
+  2.7.  shared_down misreads ~13 under counters since the fused select
+  landed (a commit/scheduling artifact — production wall disagrees);
+  treat that line as ~1.2.
+
+Round-8 addendum (Aug 23, branch perf/decode-50tps, MXFP4): the
+compressor/indexer emit-chain fusion — item 3 landed as dispatch routing,
+reusing the decode-proven bit-exact kernels.  Validation: fixture
+output_match=1 on all five cases (c_add guard trip pre-existing),
+verify-depth worst_argmax_gap 0.000, md5 oracle db0c504c…, make test
+44/44, interleaved A/B x3 for wall time.
+
+- **LANDED: verify emit chain routed to the decode fused kernels.**  The
+  round-7 scoping read this fusion as a new-kernel build with A3-class
+  numerics risk; the full map showed the bit-exact kernels already exist
+  on the decode path:
+  kernel_dsv4_compressor_exact_pool_ratio4_decode_ggml (one dispatch,
+  reproduces the GGML pool's soft_max/mul/sum_rows topologies reading
+  the state rows directly — the same logical content the verify path's
+  concat pack builds) and kernel_dsv4_comp_row_finalize_f32 (norm + rope
+  + fp8 round-trip + F16 commit, indexer norm + rope + QAT, and both
+  ratio-4 state shifts in one 22-threadgroup dispatch).  Verify never
+  routed to them: decode_one_token=false forced the 7-dispatch GGML
+  pool plus separate norm/rope/shift/quantize/commit per emit.  The
+  finalize kernel grew a mode field (0 = both compressors, decode
+  default; 1 = attention only; 2 = indexer only — the verify loops emit
+  the two compressors from separate per-token loops, so the combined
+  kernel would touch indexer state mid-window).  The verify loops engage
+  the routing per emit under g_dspark_nrow_active with decode's safety
+  gates (F16 cache, F32 norms, kv_rope_fp8 availability, pre-M5/M5
+  feature gate); each emit goes from 12 dispatches per compressor to 2
+  (exact pool + mode finalize), and the separate quantize/commit/QAT
+  calls are skipped.  Rollback
+  DS4_METAL_DISABLE_DSPARK_COMP_FINALIZE_FUSE.
+- A/B x3 (python_reverse, 32 tokens, interleaved, 20 s pauses): verify
+  283.4 -> 271.7 ms per 5 passes (-2.4 ms/verify, -4.2%); e2e fixture
+  58.6 -> 58.9 t/s.  Counter-mode stage map: compressor 7.9 -> 5.0,
+  indexer_setup 5.6 -> 2.7 ms/verify.
+- What remains in those stages (~7.7 ms/verify counter-mode) is the 12
+  per-token stores, the ~16-20 prefix-capture blits, and the residual
+  pool/finalize dispatches.  Stores cannot hoist past captures (each
+  capture must observe the canonical per-token-boundary state) and a
+  capture cannot share a dispatch with the store it depends on (Metal
+  has no cross-threadgroup ordering within a dispatch), so the residual
+  is structural short of the whole-loop fusion that reproduces the
+  intermediate states inside one kernel — still deferred, now worth at
+  most ~2-3 ms/verify.
+- Updated verify map (counter mode): routed_moe 22.8 (floor-bound),
+  output_proj 6.1, compressor 5.0, q_path 4.2, hc_pre 3.4, attention
+  2.9, indexer_setup 2.7, router 2.7 (fused split), hc_proj 2.4,
+  kv_path 1.2.  Production verify pass 56.3 -> ~54.3 ms.
+
+Round-9 addendum (Aug 23, branch perf/decode-50tps, MXFP4): handoff item 1
+(session bookkeeping trim) executed profiling-first; the premise measured
+false, so no code landed — the working tree is net-unchanged and the full
+ritual re-ran green at close.  Item 3 (ds4-eval re-measurement) landed
+positive.  All wall numbers interleaved x3, 128-token lighthouse prompt,
+20 s thermal pauses, one ds4 process at a time.
+
+- **Corrected story machinery map (the handoff's ~1.8 ms/token tax is really
+  ~1.15, and it is not bookkeeping).**  Plain chain 45.92 t/s; classic
+  (DS4_DISABLE_GREEDY_CHAIN=1) 44.62; --dspark-confidence 1.0 (drafting
+  dead, streak escalation active: 112 skips / 7 proposes / 119 cycles)
+  43.59; the same probe with the per-token capture dispatch skipped via a
+  temporary profiling env 43.86.  Decomposition per token: **0.62 chain
+  loss** (support_kind != NONE rejects ds4_session_chain_greedy_supported,
+  so every DSpark token runs the classic wait/readback/argmax loop) +
+  **0.24 propose machinery** (dominated by the ~20 ms first-propose
+  markov-head first-touch amortized over 119 cycles; 6 further explores)
+  + **~0.05 capture+ring** + **<=0.29 bounded residual**.  The capture is
+  ~free: target-layer count is 3 (layers 40,41,42), one weighted-sum
+  dispatch each, target_ms unchanged 24.4 vs 24.5 ms/token and GPU
+  stage-busy identical (2798 vs 2796 ms over 127 positions, commit-only
+  counters).  The residual sits outside every DS4_DSPARK_STATS timer with
+  identical GPU streams — submission-side or thermal, not attributed, not
+  actionable at this size.
+- **Why nothing was cut:** the capture feeds metal_graph_dspark_ring_maintain,
+  which appends one support-KV row per skipped token so the first real
+  propose after a streak finds the cache ending at pos — gating either
+  deadlocks the streak-recovery propose (capture_ok / cache_ends_at fail,
+  no-draft escalates again), and the 7 explores are the scheduler's regime
+  probes (load-bearing conservatism).  The one real lever, restoring chain
+  execution between bursts, is scoped with measured ROI: story-only
+  ~+0.58 ms/token on ~93% of tokens (42.1 -> ~43.2, still -6.5% vs plain
+  46.2); code gains ~0 (every cycle bursts, the chain never gets ahead);
+  GPQA +~0.06.  Not built: emit-path surgery plus ahead-encode/verify KV
+  interaction risk for a story-only partial recovery.
+- **GPQA Diamond case 1 re-measured (handoff item 3): now a wall-clock
+  win.**  Identical grading both ways (PASS, answer B): dspark 5.5 s /
+  277 tok vs plain 6.1 s / 278 tok — 0.6 s faster end to end (round 7 was
+  parity 6.0 vs 6.1 with net_saved +479 ms).  With stats:
+  cycles=99 avg_accept=1.798 accept_rate 87.7% scheduler_skips=30
+  net_saved=+809.7 ms; propose 446.9 ms total (prop_chain 256.7,
+  prop_logits 71.8, prop_cache 51.9, prop_markov 36.0); verify_layer
+  2743.6 ms over 58 fused-head verifies ~ 47.3 ms average (row-count
+  weighted; the 54.3 fixture number is for ~5-row blocks).
+- **Re-ranked open work for round 10:** (1) the propose chain — 4.2-4.5
+  ms/round is ~8% of the code cycle and it is dispatch-bound small-model
+  work, the same disease the verify's nrow program treated once
+  (prop_chain 5.0 -> 4.3); a dispatch/stage map of
+  metal_graph_eval_dspark_stage_chain is the entry point.  (2) Chain
+  restore between bursts (story-only, ROI above).  (3) Whole-loop
+  compressor fusion (~2-3 ms/verify ceiling, A3-class risk, unchanged).
+- Ritual at round-9 close: md5 oracle db0c504c…, verify-depth
+  worst_argmax_gap 0.000, acceptance output_match=1 on all five (c_add
+  guard trip pre-existing, accepted_draft 6 class), make test 44/44.
+
 ### Metal decode stage GPU counters
 
 The end-and-wait stage profiler (`DS4_METAL_DECODE_STAGE_PROFILE=1`) adds a

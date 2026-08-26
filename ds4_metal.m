@@ -20235,8 +20235,12 @@ int ds4_gpu_matmul_f16_tensor(
          * (out/8) x (n/3) threadgroups, so route to the nrow F16 matvec (one
          * 256-thread threadgroup per output row).  Not bit-exact with mv_ext
          * (different chunk-to-lane assignment and reduction tree); the verify
-         * tolerates the order difference by design.  in_dim >= 2048 keeps at
-         * least two half4 chunks per lane. */
+         * tolerates the order difference by design, but the support chain's
+         * 16384->4 head does NOT (round 10: rerouting it shifted the
+         * confidence gate and draft logits enough to drop python_reverse
+         * accept 95.65%->57.69% and trip the c_add class 6->3), so the gate
+         * stays at out_dim >= 24.  in_dim >= 2048 keeps at least two half4
+         * chunks per lane. */
         if (g_dspark_nrow_active && n_tok >= 2u && n_tok <= 6u &&
             (in_dim % 4u) == 0 && in_dim >= 2048u &&
             out_dim >= 24u && out_dim < 512u &&

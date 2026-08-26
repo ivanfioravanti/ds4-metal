@@ -1,11 +1,14 @@
-# DSpark campaign — handoff (rounds 1–9, sessions of Aug 22–23, M3 Ultra)
+# DSpark campaign — handoff (rounds 1–10, sessions of Aug 22–23 + 26, M3 Ultra)
 
 Repo `/Users/ifioravanti/github/ds4`, branch `perf/decode-50tps`, M3 Ultra.
-Rounds 5–9 are committed on this branch (code + docs); the working tree is
-clean apart from stale `speed-bench/bench_run*.log` debris.
+Rounds 5–9 are committed on this branch (code + docs); round 10 (Aug 26)
+left two tooling landings uncommitted in the working tree (the propose-chain
+stage-counter map in ds4.c and the ds4-eval `--source` filter) plus the
+round-10 records in README/handoff and a documenting comment at the f16
+small-out nrow gate in ds4_metal.m.
 
 **Record of truth:** `speed-bench/README.md`, section "DSpark speculation on
-M3 Ultra" (rounds 1–9, every measurement, every negative result). Read it
+M3 Ultra" (rounds 1–10, every measurement, every negative result). Read it
 first. This file is the quick-start; the README is the evidence.
 
 ## Where the campaign stands
@@ -22,13 +25,24 @@ speculation. Current state (all validated, all measured interleaved):
   before/after all changes; tolerated).
 - 128 tokens: medium code 47.8 vs 46.4 plain (**+3.2%**); story 42.1 vs
   46.2 (**−9%, structural** — corrected map below).
-- GPQA Diamond case 1 (ds4-eval): identical grading both ways, PASS,
-  **dspark 5.5 s vs plain 6.1 s — a 0.6 s wall win** (round 7 was parity).
-  net_saved **+810 ms**, avg_accept 1.80, accept_rate 87.7%.
+- GPQA Diamond (round 10 correction): **case 1's 0.6 s wall win does NOT
+  generalize.**  25-case sweep ×3 medians: aggregate **−3.2% (dspark
+  slower)**, 10W/13L/2T; 17/25 token streams diverge from plain (non-strict
+  verify numerics; 3 answer flips); losses concentrate in low-yield cases.
+  DSpark's reliable win band is high-yield code-class content.
 - Economics: break-even ≈ 3 accepted/cycle (propose ~9 ms + verify ~54 ms
-  vs 21.5 ms/token). Code yields 4.4 → wins; GPQA 1.80 → clear win;
-  story 0.31 → loses. M3 Ultra decode already runs at ~730 of 800 GB/s,
-  and the 6-row verify reads ~12.8 distinct experts/layer vs decode's 6.
+  vs 21.5 ms/token). Code yields 4.4 → wins; GPQA mixed (case 1 1.80,
+  25-case aggregate 0.47); story 0.31 → loses. M3 Ultra decode already runs
+  at ~730 of 800 GB/s, and the 6-row verify reads ~12.8 distinct
+  experts/layer vs decode's 6.
+- **Round 10 closed the round-9 item 1 (propose chain) NEGATIVE**: the
+  chain is kernel-bound (FFN 48% of 3.57 ms GPU-busy/round), not
+  dispatch-bound; a rope-merge + copy-fold dispatch bundle measured
+  perf-neutral and was reverted. Also caught: the DSpark scheduler is
+  wall-clock-driven — any propose-timing perturbation flips the schedule
+  basin (avg_accept 4.4↔1.5) with byte-identical outputs, so single-run
+  fixture t/s is not a build comparator. Details in the README round-10
+  addendum.
 
 ## Round 9 (Aug 23): item 1 closed by measurement, item 3 landed
 
@@ -129,40 +143,66 @@ make test                               # MUST: 44/44
   host bookkeeping does not exist (map above); capture/ring gating on skip
   cycles deadlocks streak recovery; the propose explores are load-bearing.
 
-## Open work, ranked (round-9 ranking)
+## Open work, ranked (round-10 ranking)
 
-1. **Propose chain cost** — 4.2–4.5 ms/round ≈ 8% of the code cycle
-   (GPQA: prop_chain 256.7 of propose 446.9 ms over 61 rounds). Dispatch-
-   bound small-model work (3 stages × 6 rows through per-row/batch
-   dispatches); the same disease the verify's nrow program treated once
-   (prop_chain 5.0 → 4.3). Entry point: a dispatch/stage map of
-   `metal_graph_eval_dspark_stage_chain` in ds4.c. Halving it is ~+2% e2e
-   on code-class content.
-2. **Chain restore between DSpark bursts** — recovers the 0.62 ms/token
+1. **Chain restore between DSpark bursts** — recovers the 0.62 ms/token
    classic-loop loss, but measured ROI is story-only (see round-9 section);
    code/GPQA gain ≈ 0. Only if story matters enough for a partial recovery.
-3. **Whole-loop compressor/indexer fusion** — ceiling ~2–3 ms/verify;
+   The transition design must truncate the KV to the confirmed pos when a
+   propose cycle follows chained skips (chain ahead-encodes 2 tokens with
+   decode-kernel numerics; verify re-encodes with batch-kernel numerics).
+2. **Whole-loop compressor/indexer fusion** — ceiling ~2–3 ms/verify;
    A3-class fast-math risk with only empirical gates; round-8 fusion
    already took the cheap 60%.
-4. ds4-eval broader sweep: GPQA case 1 is now a wall win; a multi-case
-   GPQA/SuperGPQA pass with verify at 54 ms would firm up the parity→win
-   band for science content.
+3. **Scheduler-freeze env** (new, tooling) — a DS4_DSPARK_SCHEDULER_FREEZE
+   style knob pinning the schedule decisions would make fixture A/Bs
+   deterministic; round 10 showed the wall-clock-driven scheduler flips
+   basins on any timing perturbation (README round-10 addendum).
+4. Support-model FFN kernel slivers — shared gate+up dual-output nrow
+   (~30–50 µs/stage, the only untried dispatch-level item; low ceiling).
+   The propose chain is otherwise closed (kernel-bound; round 10).
 5. Kernel track otherwise closed: verify map (counter mode) routed_moe
    22.8 (floor), output_proj 6.1, compressor 5.0, q_path 4.2, hc_pre 3.4,
    attention 2.9, indexer_setup 2.7, router 2.7, hc_proj 2.4, kv_path 1.2.
 
-## If you take item 1 (propose chain)
+Round-10 closures: propose chain (was item 1 — kernel-bound, fusion
+perf-neutral, reverted); GPQA multi-case sweep (was item 4 — 25-case band
+is parity-to-negative, recorded in README).
 
-Start at `metal_graph_eval_dspark_stage_chain` (ds4.c ~33300) and the
-per-stage builders it calls (`metal_graph_eval_dspark_stage_block`,
-`metal_graph_eval_dspark_final_hidden`). Measure a dispatch inventory
-first (DS4_METAL_STAGE_COUNTERS labels only the shared encoders — a
-dispatch count per stage may need a temporary counter). Precedent rules:
-the nrow family keeps single-row math bit-exact per token and only widens
-the weight read (round 6); fused forms must reuse decode-proven kernels or
-carry the A3 fast-math caveat. Draft-side numerics may shift at ties by
-design (the verifier stays authoritative), but scheduler stats
-(no_draft/skips/avg_accept) are load-bearing: any change must keep the
-fixture's c_add/net_saved behavior byte-identical class and pass the full
-ritual above plus interleaved A/B ×3 on python_reverse (32 tok) and the
-128-token story/code pair.
+## If you take item 1 (chain restore)
+
+Entry points: `ds4_session_chain_greedy_supported` (the
+`support_kind != NONE` rejection that forces every DSpark token through
+the classic wait/readback/argmax loop) and the speculative burst driver in
+`ds4_session_prepare_dspark_draft_impl` / the eval decode loop's
+`spec_burst_ok` branch. Design constraints from round 9's scoping:
+
+- Capture (layers 40/41/42) and `metal_graph_dspark_ring_maintain` must
+  keep running during chained skips — gating them deadlocks the streak
+  recovery propose.
+- When a propose cycle follows chained tokens, the chain is up to 2
+  encodes ahead: those KV rows carry decode-kernel numerics while verify
+  re-encodes with batch-kernel numerics. Truncate the KV to the confirmed
+  pos and let verify re-encode (matches today's semantics); do NOT let
+  the two numerics families mix in one cache window.
+- Validate the transition cost first: story content has ~8 propose
+  transitions per 128 tokens; the +0.58 ms/token recovery only nets if a
+  transition (drain + KV rewind + cache_ends_at rebuild) costs ≲ a few ms.
+- Full ritual plus interleaved A/B ×2 on the 128-token story pair; abort
+  criteria: any c_add/net_saved class change, stream divergence, or a
+  code/GPQA regression. And per the round-10 scheduler finding: compare
+  builds by output + counter maps + x3 medians, never single fixture runs.
+
+## Round-10 tooling landed (uncommitted — commit with the records)
+
+- ds4.c: propose-chain stage-counter map (driver bracket +
+  `ds%u:%s`-labeled boundaries). Run with
+  `DS4_METAL_STAGE_COUNTERS=1 DS4_DSPARK_STAGE_PROFILE=1`; normalize per
+  round by counting `ds0:attn_hc_pre` samples (rounds that reach the
+  chain) — totals mix full and early-failed attempts.
+- ds4_eval.c/ds4_help.c: `--source SUBSTR` (case-insensitive substring
+  over the embedded case sources; mutually exclusive with
+  `--case-sequence`). `--source "GPQA Diamond"` = 25 cases,
+  "SuperGPQA" = 25, "AIME2025" = 25, "COMPSEC" = 17 of 92.
+- ds4_metal.m: comment at the f16 small-out nrow gate documenting the
+  round-10 negative (do not lower `out_dim >= 24`).

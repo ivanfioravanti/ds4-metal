@@ -32896,6 +32896,15 @@ static bool metal_graph_dspark_stage_profile_boundary(
         uint32_t    pos,
         uint32_t    rows,
         double     *stage_t0) {
+    if (ds4_gpu_stage_counters_enabled()) {
+        /* Commit-only counter sample, mirroring the decode/verify
+         * boundaries: the surrounding decode loop resets the counter buffer
+         * at every token, so the propose driver brackets each chain round
+         * with its own reset/report. */
+        char label[40];
+        snprintf(label, sizeof(label), "ds%u:%s", stage, part);
+        return ds4_gpu_stage_counter_sample(label) != 0;
+    }
     if (ds4_gpu_end_commands() == 0) return false;
     const double now = now_sec();
     fprintf(stderr,
@@ -33341,7 +33350,17 @@ static bool metal_graph_eval_dspark_stage_chain(
     /* Final hidden rows consume only the last stage's GPU output. Keep them in
      * this command buffer when the CPU confidence precheck will need them. */
     if (ok && encode_final_hidden) {
+        const bool hidden_profile =
+            metal_graph_dspark_stage_profile_enabled(dw->n_stages);
+        double hidden_t0 = hidden_profile ? now_sec() : 0.0;
         ok = metal_graph_eval_dspark_final_hidden(g, dspark_model, dw, true);
+        if (ok && hidden_profile) {
+            ok = metal_graph_dspark_stage_profile_boundary("hidden",
+                                                           dw->n_stages,
+                                                           pos,
+                                                           dw->block_size,
+                                                           &hidden_t0);
+        }
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     if (suspended_expert_sharding) {
@@ -62241,6 +62260,11 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
              * small-N matvec (mul_mv-exact per token; draft proposals may
              * shift at ties, the verifier stays authoritative). */
             ds4_gpu_set_dspark_nrow_active(1);
+            /* The decode eval resets the commit-only counter buffer at every
+             * token start, so a propose round would never survive to a
+             * report.  Bracket the chain like the verify pass to make its
+             * dispatch/stage map visible under DS4_METAL_STAGE_COUNTERS. */
+            if (ds4_gpu_stage_counters_enabled()) ds4_gpu_stage_counter_reset();
             stage_chain_ok =
                 metal_graph_eval_dspark_stage_chain(&s->graph,
                                                 &s->engine->mtp_model,
@@ -62250,6 +62274,7 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                                                 &stage_chain_done,
                                                 &stage_cache_start,
                                                 &stage_cache_rows);
+            if (ds4_gpu_stage_counters_enabled()) ds4_gpu_stage_counter_report(pos);
             ds4_gpu_set_dspark_nrow_active(0);
         }
         DS4_DSPARK_PROP_ADD(propose_chain_ms, chain_t0);

@@ -416,6 +416,88 @@ positive.  All wall numbers interleaved x3, 128-token lighthouse prompt,
   worst_argmax_gap 0.000, acceptance output_match=1 on all five (c_add
   guard trip pre-existing, accepted_draft 6 class), make test 44/44.
 
+Round-10 addendum (Aug 26, branch perf/decode-50tps, M3 Ultra): items 1
+and 4 of the round-9 ranking executed; item 1 closed NEGATIVE by
+measurement, item 4 produced the corrected GPQA band.  Two tooling
+landings (uncommitted at write time): the propose-chain stage-counter map
+(bracket at the propose driver + `ds%u:%s` labels in
+metal_graph_dspark_stage_profile_boundary; env pair
+DS4_METAL_STAGE_COUNTERS=1 DS4_DSPARK_STAGE_PROFILE=1) and a ds4-eval
+`--source SUBSTR` case filter (the 92 embedded cases are interleaved by
+source; `--questions N` cannot isolate one).
+
+- **Propose chain map (the round-9 entry point, now measured):** per
+  round, counter mode, python_reverse 32 tok — ffn **1.72 ms (48%)**,
+  attn_output_hc 0.48, kv_path 0.48, q_path 0.42, attention 0.18,
+  hidden 0.15, attn_hc_pre 0.09, attn_norm 0.04 (total 3.57 GPU-busy vs
+  3.75 wall).  The chain is **kernel-bound, not dispatch-bound**: the
+  round-9 "dispatch-bound small-model work" premise is false.  The FFN's
+  ~12 dispatches average ~130 µs of real kernel time (support routed MoE
+  IQ2_XXS/Q2_K over 5x6 pairs, shared expert, router); the removable
+  dispatches (blits, ropes, small norms) are µs-scale.
+- **MEASURED NEGATIVE, reverted: propose dispatch-fusion bundle.**  (a)
+  kv target+draft rope merge (2 dispatches -> 1, bit-identical per-row
+  math); (b) q head_rms_norm+rope_tail -> the decode-production fused
+  kernel; (c) stage-input copy fold — the FFN epilogue (grown a
+  next_hc_override param) writes draft rows straight into
+  stage_input_hc rows 1..block, eliminating the 2 inter-stage blit
+  encoder churns.  Outputs md5-identical to the rollback path and plain
+  decode on every gate, but per-round GPU busy and prop_chain were
+  UNCHANGED (3.62 vs 3.65 ms/round, counter mode, n normalized by chain
+  rounds).  The removed dispatches were too small to matter; reverted
+  per the no-noise-landings rule.
+- **MEASURED NEGATIVE, reverted: f16-nrow at out_dim<24** (the support
+  head 16384->4 missed the small-out gate).  Lowering the gate to >=4
+  reroutes hc_head_fn off mv_ext; the reduction-tree difference shifts
+  conf0 enough that the fixture's scheduler-stats class broke
+  (python_reverse accept 95.65% -> 57.69%, c_add 6 -> 3).  Gate restored
+  to out_dim >= 24; the comment in ds4_gpu_matmul_f16_tensor documents
+  it.  Draft-side "may shift at ties" has a practical limit: the
+  confidence gate sits near the threshold, so ulp shifts flip gate
+  decisions, not just tie-breaks.
+- **Scheduler time-basin hazard (new measurement rule).**  The DSpark
+  scheduler accumulates wall-clock extra-ms and decides on
+  slow_accept/measured_unprofitable ratios (ds4_session_dspark_scheduler
+  accounting, ~ds4.c:50490).  Any propose-timing perturbation — even an
+  output-identical fusion, counter envs, or thermal state — flips the
+  whole run into a different schedule basin (observed same binary+env:
+  avg_accept 4.400/95.65% vs 1.500/57.69%, fixture 58.9 vs 45.9 t/s,
+  outputs byte-identical both ways).  Consequences: (1) single-run
+  fixture t/s is not a build comparator — use the stats-class +
+  counter-map arbiters, or interleave x3 and take medians; (2) the
+  "scheduler stats byte-identical class" ritual requirement is only
+  achievable by timing-identical builds; (3) a scheduler-freeze env would
+  make fixture A/Bs deterministic (candidate tooling item).
+- **GPQA Diamond 25-case sweep (round-9 item 4): the wall win does NOT
+  generalize.**  `--source "GPQA Diamond"`, nothink, 1024-token budget,
+  temp 0, plain vs --dspark, interleaved x3, medians: aggregate **220.5 s
+  plain vs 227.6 s dspark = -3.2% (dspark slower)**, 10 wins / 13 losses
+  / 2 ties (>20 ms thresholds).  Case 1 (+0.63 s) was the favorable end:
+  the biggest win +4.7 s is a budget-hit case whose diverged stream
+  finished 237 tokens early; losses concentrate in low-yield cases
+  (machinery tax) and diverged-longer streams.  **17/25 dspark token
+  streams differ from plain** (non-strict verify-kernel numerics; 3
+  answer flips, here all F->P, passes 16->19 — treat as divergence, not
+  quality gain).  Aggregate stats: cycles=6976 avg_accept 0.468
+  accept_rate 82.2%, no_draft 5601, verify_layer 55.4 s, propose 11.0 s
+  (prop_chain 7.0 over 3972 attempts ~= 1.76 ms/attempt — the fixture's
+  4.3 counts full chains only; failed/short attempts average in).
+  Verdict: science content sits at parity-to-negative wall at verify 54
+  ms; DSpark's real win band is high-yield code-class only.  The
+  ds4-eval `--source` flag landed to make this sweep repeatable.
+- Ritual at round-10 close: md5 oracle db0c504c…, acceptance
+  output_match=1 all five (python_reverse 59.07 t/s / 95.65% / c_add
+  accepted_draft 6 class — canonical), make test 44/44.
+- **Re-ranked open work after round 10:** (1) story chain restore
+  (unchanged ROI, ~+1.1 t/s story-class, emit-path + KV-rewind risk);
+  (2) whole-loop compressor fusion (~2-3 ms/verify, A3-class risk);
+  (3) scheduler-freeze env for deterministic fixture A/Bs (tooling,
+  small); (4) support-model FFN kernel slivers (shared gate+up dual
+  nrow, ~30-50 µs/stage — the only untried dispatch-level item, low
+  ceiling).  The propose chain and the GPQA band are closed.  Without
+  the requant track, the bit-exact DSpark program is at its local
+  optimum.
+
 ### Metal decode stage GPU counters
 
 The end-and-wait stage profiler (`DS4_METAL_DECODE_STAGE_PROFILE=1`) adds a

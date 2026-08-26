@@ -1196,6 +1196,7 @@ typedef struct {
     const char *trace_path;
     const char *regrade_trace_path;
     const char *case_sequence;
+    const char *source_filter;
     ds4_backend backend;
     int threads;
     int ctx_size;
@@ -1576,6 +1577,8 @@ static eval_config parse_options(int argc, char **argv) {
             c.question_limit = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--case-sequence")) {
             c.case_sequence = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--source")) {
+            c.source_filter = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--temp")) {
             c.temperature = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
         } else if (!strcmp(arg, "--top-p")) {
@@ -4340,6 +4343,41 @@ int main(int argc, char **argv) {
     }
     int *case_sequence = NULL;
     int case_sequence_len = 0;
+    if (cfg.source_filter) {
+        /* Select every embedded case whose source matches the substring
+         * (case-insensitive), in embedded order.  The embedded array is
+         * interleaved by source, so --questions cannot isolate one source.
+         * Indices can exceed a --questions limit: restore the full count. */
+        if (cfg.case_sequence) {
+            fprintf(stderr,
+                    "ds4-eval: --source and --case-sequence are mutually exclusive\n");
+            return 2;
+        }
+        const int total = (int)(sizeof(eval_cases) / sizeof(eval_cases[0]));
+        int len = 0;
+        case_sequence = malloc((size_t)total * sizeof(*case_sequence));
+        if (!case_sequence) {
+            fprintf(stderr, "ds4-eval: out of memory while applying --source\n");
+            return 2;
+        }
+        for (int i = 0; i < total; i++) {
+            if (strcasestr(eval_cases[i].source, cfg.source_filter)) {
+                case_sequence[len++] = i;
+            }
+        }
+        if (len == 0) {
+            fprintf(stderr,
+                    "ds4-eval: no embedded cases match --source '%s'\n",
+                    cfg.source_filter);
+            free(case_sequence);
+            return 2;
+        }
+        case_sequence_len = len;
+        ncases = total;
+        fprintf(stderr,
+                "ds4-eval: --source '%s' selected %d of %d embedded cases\n",
+                cfg.source_filter, len, total);
+    }
     if (cfg.case_sequence &&
         parse_case_sequence(cfg.case_sequence, ncases, &case_sequence, &case_sequence_len) != 0) {
         return 2;

@@ -498,6 +498,54 @@ source; `--questions N` cannot isolate one).
   the requant track, the bit-exact DSpark program is at its local
   optimum.
 
+### Q4_K attention+head requant — the parked track, executed (Aug 26)
+
+The roadmap's Part-1 decision point ("further decode gains require the
+requant track, quality-gated by ds4-eval parity, not md5"), taken without
+the HF safetensors on disk.  Two landed pieces:
+
+- **`gguf-tools/gguf-requantize-dense`** (new tool, the name .gitignore
+  expected): GGUF→GGUF re-encoder for dense families.  Dequantizes only the
+  requested tensors (sources f32/f16/bf16/q8_0), re-encodes via
+  ds4q_quantize_chunk, copies every other tensor and the whole KV blob
+  verbatim (--verify checksums the copied tensors).  The reference is the
+  input GGUF's values (double quantization: q8_0→q4_K adds only q8_0's
+  near-lossless stage on top of q4_K's own error — acceptable for
+  quality-gated experiments).  Gotchas encoded: GGUF v3 value-type enum
+  must match the quantizer's (UINT32=4/FLOAT32=6/BOOL=7), ds4q_type_name
+  returns NULL at enum holes, the type string is `q4_K`.
+- **Variant GGUF**: `gguf/DeepSeek-V4-Flash-MXFP4Experts-F16HC-
+  F16Compressor-F16Indexer-Q4KAttn-Q8Shared-Q4KOut-chat-v2-mxfp4-0731.gguf`
+  (153.4 GB): 216 tensors changed = 43 layers × 5 attention projections
+  (attn_q_a/q_b/kv/output_a/output_b) + output.weight; indexer/compressor/
+  HC/norm/shared/embd untouched (the indexer's own attn_q_b suffix-matches
+  the projection pattern and is explicitly excluded).
+
+**Speed** (interleaved ×3, lighthouse 128 tok): generation 45.72 →
+**51.47 t/s median (+12.6%)**, ≈ −2.4 ms/token of the estimated −3.5–4
+(q4_K dense dequant is not free); prefill −3%.
+
+**Quality gate (the agreed "intelligence" check, full ds4-eval):**
+- Screen (92 cases, --nothink --tokens 1024): Q4_K 61/92 vs baseline 58/92;
+  31 answer flips splitting 7 F→P / 4 P→F — noise.
+- Canonical (92 cases, thinking mode, 16k budget): Q4_K **85/92 vs baseline
+  82/92**.  AIME2025 22/25 → 24/25, GPQA Diamond 20/24 → 24/24, SuperGPQA
+  22→21, COMPSEC 17/17 → 15/17 (the one soft spot: two CVE-localization
+  regressions, precision-sensitive line recall).  12 answer flips, 6 F→P vs
+  3 P→F.  Wall 6549 s → 5770 s (−12%) at 272k → 265k generated tokens
+  (24.1 → 21.8 ms/token including prefill).
+- Verdict: **no degradation detectable at this suite's resolution; the +3
+  is within noise.  The variant is a keeper** — quality-gated, not md5:
+  transcripts differ from the Q8 baseline by design (this is the
+  non-bit-exact track).
+
+Follow-ups left open: DSpark-on-Q4K (verify floor and prop_logits both
+shrink; re-run the 25-case GPQA dspark sweep on this model), the MXFP4
+version of the same track (needs the dense encoder in quants.c; ~−4.9 ms
+estimate), imatrix calibration if COMPSEC-class precision ever matters,
+and the dense Q4_K kernel's dequant overhead (the gap between −2.4
+realized and −3.5–4 byte-scaled).
+
 ### Metal decode stage GPU counters
 
 The end-and-wait stage profiler (`DS4_METAL_DECODE_STAGE_PROFILE=1`) adds a

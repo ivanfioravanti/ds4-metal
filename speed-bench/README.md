@@ -546,6 +546,156 @@ estimate), imatrix calibration if COMPSEC-class precision ever matters,
 and the dense Q4_K kernel's dequant overhead (the gap between −2.4
 realized and −3.5–4 byte-scaled).
 
+**Follow-up results (Aug 27):**
+
+- **DSpark-on-Q4K measured NEGATIVE — do not compose them yet.**  GPQA
+  25-case plain-vs-dspark ×3 on the Q4_K model: aggregate **−16.1%**
+  (dspark slower; 5W/20L), vs the Q8 model's −3.2%.  Plain decode got the
+  full +15% (188.0 s vs 220.5 s over the sweep) but dspark barely moved
+  (218.2 vs 227.6 s): the verify/propose small-N nrow kernels
+  (kernel_mul_mv_q8_0_nrow_*, round 6) are Q8-specific, so every
+  re-quantized tensor falls back to the generic dense batch path in the
+  verify — verify_layer improved only ~11% (55.4 → 49.2 s) against
+  plain's ~15%, and avg_accept dropped to 0.348.  Acceptance fixture on
+  the Q4K target stays output_match=1 ×5 (correctness fine; it is pure
+  cost).  Practical guidance: Q4_K for plain decode, Q8 if you want
+  DSpark; composing them needs a q4_K nrow small-N kernel family (the
+  round-6 precedent, applied to the q4_K dense matvec).
+- **Imatrix calibration for the dense families: built, screens NEUTRAL.**
+  The existing collector covered routed MoE only, so it grew dense-family
+  hooks (ds4.c ds4_imatrix_collector): sum(x²) over the materialized
+  prefill buffers — attn_norm (→ attn_q_a + attn_kv entries), qr_norm
+  (→ attn_q_b), heads viewed as n_out_group group_dim slices
+  group-averaged (→ attn_output_a, count ×n_out_group), attn_low
+  (→ attn_output_b); 256 rows/chunk subsample to bound readback;
+  output.weight stays uncalibrated (head input not materialized in
+  prefill).  gguf-requantize-dense grew --imatrix/--imatrix-strict
+  (exact-name match, nval must equal ne[0], feeds
+  ds4q_quantize_chunk — the q4_K path consumes it).  Collector bug
+  caught by the tool's miss report: the save header said N_LAYER×7 but
+  writes 8 entries/layer (3 MoE + 5 dense), truncating the last 43
+  entries at load — fixed (header patched in place on the collected
+  .dat; no recollection needed).  Calibration: 231 prompts / 262,144
+  tokens on the Q8 baseline (433 MB .dat, 344 entries).  Variant
+  …-Q4KAttn-…-Q4KOut-imatrix-…: 215/216 re-quantized tensors calibrated
+  (only output.weight misses).  Screen (92 nothink): **61/92 — identical
+  to no-imatrix**, flips perfectly symmetric (5 P→F / 5 F→P); per-source
+  GPQA 16→17, SuperGPQA 20→21, AIME 8→7, COMPSEC 16→15.  **Canonical
+  (thinking, 16k): 81/92 vs no-imatrix's 85/92 — MEASURED NEGATIVE, do
+  not use for this variant** (11 answer flips, 6 P→F vs 2 F→P, GPQA
+  Diamond 24/24 → 19/24; wall/token unchanged).  The screen's neutrality
+  did not survive canonical resolution.  Suspects, unranked: the
+  group-averaged heads vector for attn_output_a, the shared attn_norm
+  vector for q_a+kv, the 256-row subsample, or the absolute-scale
+  interplay with the q4_K weighted search.  The no-imatrix Q4_K variant
+  stays the keeper (85/92).  The infrastructure (dense-family collector
+  hooks + tool --imatrix) is landable as-is for future lower-bpw tracks
+  (q2_k/iq2 head, denser MXFP4), where calibration is expected to matter.
+
+**Q4_K prefill cost attribution + dequant-diet negative (Aug 27).**  The
+variant's prefill penalty localizes cleanly by commit-only stage counters
+(2.2k-token prompt): q_path **+22.5 ms (+5.0%)** and output_proj
+**+26.2 ms (+3.7%)** — exactly the re-quantized projection families;
+routed_moe/shared/router/hc all flat, whole-model counter delta +1.4%
+(wall −1.1% at 2.2k tokens, −3% at the ~10-token lighthouse prompt,
+**−1.66% at 37.6k tokens** interleaved ×3: base 564.63-564.77 vs
+q4k 555.20-555.63 t/s — the long-context regime prices the trade at
+~1.1 s on a 67 s prefill).
+An instruction-diet twin of dequantize_dense_q4_K (sixteen byte loads →
+four aligned uint4 loads + float4 lanes, identical element values and
+arithmetic) was built bit-exact — the prefill variant harness confirmed
+1,034,240 floats identical across 8 runs at 8192 tokens — and measured
+**PERF-NEUTRAL in both regimes** (8k-token mul_mm: −0.006%; ~10-token
+mv_ext: within noise).  Reverted per the no-noise rule.  Conclusion: the
+q4_K dense prefill cost is structural in the mul_mm staging for 256-wide
+blocks (thread→block mapping / sa write pattern), not dequant ALU;
+recovering it means staging-mapping surgery on the shared template, or
+accepting ~1–3% prefill as the price of +12.6% decode.  Also examined
+and passed on: antirez/ds4 PR #864 (IQ2 half-LUT + mpp 2×16 tile split)
+helps IQ2/Q2_K on M5+ only — its kernel family is Metal-4-gated
+(ds4_metal.m pre-M5 disable) and not instantiated for MXFP4; the MXFP4
+analog of its LUT trick was already landed here in earlier rounds
+(dequantize_mxfp4_half_scale/_half_lut).
+
+**Q4_K_M: data-driven mixed variant (Aug 27 night).**  Leave-one-out
+ablation ranked the dense families by NLL sensitivity (each variant
+restores one family to q8_0, scored on the 100-case official-continuation
+fixture; total delta to recover = 0.0357 NLL, baseline 0.1467 vs keeper
+0.1824):
+
+| family restored to Q8 | NLL | share of delta | bytes share |
+|---|---|---|---|
+| attn_kv | 0.1739 | **23.8%** | 2% |
+| attn_q_a | 0.1783 | 11.5% | 4% |
+| attn_output_b | 0.1788 | 10.1% | 31% |
+| attn_q_b | 0.1797 | 7.6% | 31% |
+| output (head) | 0.1801 | 6.4% | 10% |
+| attn_output_a | engine refuses | — | 31% |
+
+The MLA input bottlenecks (kv: 4096→512, q_a: 4096→1024 lora) carry the
+drift; the head is NOT a major driver (the prior was wrong — measured).
+**Engine constraint discovered: attn_output_a/out_b are a fused pair in
+the grouped attention-output kernel and cannot mix quant types** —
+out_a-at-Q8 with out_b-at-Q4_K fails at load ("logits failed at target
+token 1"); promote together or not at all.
+
+**Variant built: `…-Q4KM-Attn-Q8Shared-Q4KOut-chat-v2-mxfp4-0731.gguf`**
+(attn_kv + attn_q_a back at q8_0; q_b/out_a/out_b/head at q4_K; 130
+tensors changed, copied tensors checksum-verified).  Metrics vs baseline
+(keeper in parens): continuation NLL **0.1726** (+17.7% rel. vs
+baseline's +24.4%) — 27.4% of the delta recovered; KL(base||var) mean
+**0.0312** (0.0364), median 0.00034 (0.00053); top-1 agreement **94.58%**
+(94.19%); base-top-1 in top-5 still 100%.  Decode is a wash — 51.44 vs
+50.72 median interleaved ×3 (the +124 MB of promotions is below noise;
+keeper read 51.47 in its own session).  Screen 61/92 (same as keeper —
+the screen's resolution).  **Canonical (thinking, 16k): 81/92 vs the
+keeper's 85/92 — MEASURED NEGATIVE ON THE GATE; the uniform Q4_K stays
+the keeper** (AIME 24→22, GPQA Diamond 24→21, COMPSEC 15→16; 11 flips,
+6 P→F vs 2 F→P; wall 6014 s, 21.5 ms/tok).
+
+**Methodological finding — the surrogate metrics do not rank variants at
+this quality level.**  Across three canonicals: uniform Q4_K has the
+WORST continuation NLL of the variants (0.1824) and the BEST eval
+(85/92); Q4_K_M improves every distribution metric (NLL 0.1726, KL
+0.0312, top-1 94.58%) and scores 81; imatrix likewise 81.  NLL/KL on
+100 official nothink continuations and canonical thinking-mode eval
+disagree in both directions at these deltas — the canonical eval is the
+only arbiter for accept/reject, and per-case flip counts (6:2, 11 total)
+sit at the edge of binomial noise for a 92-case suite.  Do not use the
+distribution metrics as a acceptance proxy for future variants; use them
+only to characterize shape (tail structure, containment) after the gate.
+
+Tool fixes this round: `--tensor-suffix SUF=TYPE` (indexer-excluded
+suffix match, after prefix overrides, before family defaults) and a
+precedence bug where an override setting a tensor BACK to its source
+type was silently undone by the family default (the `target == t->type`
+guard needed an explicit `overridden` flag).  Measurement gotcha: the
+scorer prints an avg_nll per case — grep `'summary cases'`, not the
+first `avg_nll=` match.  Tool determinism re-verified: a fresh full-Q4_K
+build is byte-identical to the keeper.
+
+**Distribution metrics, baseline vs the keeper variant (Aug 27).**
+score_official grew `--dump-logits FILE`/`--dump-max N` (per-position
+full-vocab F32 rows over the same teacher-forced official-continuation
+stream; "LGD1" header).  2048 paired positions over the 100-case flash
+fixture:
+
+- top-1 argmax agreement **94.19%** (1929/2048); baseline's top-1 is in
+  the variant's top-5 and top-20 at **100%** — every disagreement is a
+  near-tie reordering, never a missing candidate.
+- KL(base||q4k) mean 0.0364 / median 0.00053 / p90 0.104; KL(q4k||base)
+  mean 0.0387 (symmetric — no directional mass loss); JSD (base 2) mean
+  0.0087 / median 0.00014 / max 0.265.
+- Shape: ~90% of positions are virtually identical (median top-1 prob
+  gap 1e-6); the means are carried by a ~10% tail of genuine near-ties —
+  exactly the positions that flip greedy streams (17/25 GPQA streams
+  diverge) while leaving sampled/graded behavior intact.
+- Companion NLL (official continuation tokens): 0.1467 → 0.1824 (+24%
+  relative, both very low in absolute nats).
+- Analysis script pattern + dump format documented here; the imatrix
+  variant GGUF was deleted after its canonical loss (reproducible via
+  the tool + the collected .dat).
+
 ### Metal decode stage GPU counters
 
 The end-and-wait stage profiler (`DS4_METAL_DECODE_STAGE_PROFILE=1`) adds a

@@ -19,6 +19,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -295,6 +296,75 @@ static bool is_output_head(const char *name) {
     return strcmp(name, "output.weight") == 0;
 }
 
+/* ---- imatrix (llama.cpp legacy .dat, ds4 collector format) -------------- */
+
+typedef struct {
+    char *name;
+    float *values;
+    int64_t n_values;
+} imatrix_entry;
+
+typedef struct {
+    imatrix_entry *entries;
+    int n_entries;
+    bool strict;
+} imatrix_store;
+
+static int32_t rq_read_i32(FILE *fp, const char *what) {
+    uint8_t b[4];
+    if (fread(b, 1, 4, fp) != 4) die("short read (%s)", what);
+    return (int32_t)((uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+                     ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24));
+}
+
+static void imatrix_load(imatrix_store *im, const char *path, bool strict) {
+    memset(im, 0, sizeof(*im));
+    im->strict = strict;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) die_errno("open imatrix", path);
+    int32_t n = rq_read_i32(fp, "imatrix entry count");
+    if (n < 1) die("imatrix has no entries");
+    im->entries = xcalloc((size_t)n, sizeof(im->entries[0]));
+    im->n_entries = n;
+    for (int i = 0; i < n; i++) {
+        int32_t len = rq_read_i32(fp, "imatrix name length");
+        if (len <= 0 || len > 4096) die("bad imatrix name length");
+        char *name = xmalloc((size_t)len + 1);
+        if (fread(name, 1, (size_t)len, fp) != (size_t)len) die("short imatrix name read");
+        name[len] = '\0';
+        int32_t ncall = rq_read_i32(fp, "imatrix calls");
+        int32_t nval = rq_read_i32(fp, "imatrix values");
+        if (nval < 1) die("bad imatrix value count for %s", name);
+        float *values = xmalloc((size_t)nval * sizeof(float));
+        if (fread(values, sizeof(float), (size_t)nval, fp) != (size_t)nval) {
+            die("short imatrix value read for %s", name);
+        }
+        if (ncall > 0) {
+            for (int j = 0; j < nval; j++) values[j] /= (float)ncall;
+        }
+        for (int j = 0; j < nval; j++) {
+            if (!isfinite(values[j])) die("non-finite imatrix value in %s", name);
+        }
+        im->entries[i] = (imatrix_entry){ .name = name, .values = values, .n_values = nval };
+    }
+    fclose(fp);
+    fprintf(stderr, "loaded imatrix %s: %d entries\n", path, n);
+}
+
+static const float *imatrix_find(const imatrix_store *im, const tensor_meta *t) {
+    for (int i = 0; i < im->n_entries; i++) {
+        if (strcmp(im->entries[i].name, t->name) == 0) {
+            if (im->entries[i].n_values != t->ne[0]) {
+                die("imatrix size mismatch for %s: got %" PRId64 " expected %" PRId64,
+                    t->name, im->entries[i].n_values, t->ne[0]);
+            }
+            return im->entries[i].values;
+        }
+    }
+    if (im->strict) die("missing imatrix entry for %s", t->name);
+    return NULL;
+}
+
 /* ---- CLI ---------------------------------------------------------------- */
 
 static void usage(const char *argv0) {
@@ -307,9 +377,12 @@ static void usage(const char *argv0) {
     printf("  --attention-proj T   re-encode attn_q_a/q_b/kv/output_a/b projections\n");
     printf("  --output T           re-encode the output head (output.weight)\n");
     printf("  --tensor-type PFX=T  re-encode tensors whose name starts with PFX; repeatable\n");
+    printf("  --tensor-suffix SUF=T re-encode tensors whose name ends with SUF (indexer excluded); repeatable\n");
     printf("  --dry-run            print the plan and exit\n");
     printf("  --overwrite          replace --out if it exists\n");
     printf("  --verify             after writing, checksum every copied tensor against --in\n");
+    printf("  --imatrix FILE       importance matrix (ds4 --imatrix-out legacy .dat) for re-encoded tensors\n");
+    printf("  --imatrix-strict    fail if a re-encoded tensor has no matching imatrix vector\n");
     printf("\nT: f16, f32, bf16, q8_0, q4_k, q2_k, iq2_xxs (sources: f32/f16/bf16/q8_0)\n");
 }
 
@@ -317,6 +390,17 @@ typedef struct {
     const char *prefix;
     ds4q_type type;
 } type_override;
+
+/* Suffix overrides run after prefix overrides and before the family
+ * defaults, so a family can be re-promoted (e.g. .attn_q_b.weight=q8_0
+ * inside --attention-proj q4_K) for Q4_K_M-style mixed builds.
+ * Indexer tensors are excluded: blk.N.indexer.attn_q_b.weight also
+ * suffix-matches and must keep its recipe type. */
+static bool name_has_suffix(const char *name, const char *suffix) {
+    if (strstr(name, "indexer")) return false;
+    const size_t nlen = strlen(name), slen = strlen(suffix);
+    return nlen >= slen && strcmp(name + nlen - slen, suffix) == 0;
+}
 
 static ds4q_type parse_type(const char *s) {
     for (int t = 0; t < DS4Q_TYPE_COUNT; t++) {
@@ -366,9 +450,13 @@ int main(int argc, char **argv) {
     ds4q_type out_type = DS4Q_TYPE_COUNT;
     type_override overrides[64];
     int n_overrides = 0;
+    type_override suffix_overrides[64];
+    int n_suffix_overrides = 0;
     bool dry_run = false;
     bool overwrite = false;
     bool verify = false;
+    const char *imatrix_path = NULL;
+    bool imatrix_strict = false;
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
@@ -388,9 +476,23 @@ int main(int argc, char **argv) {
             overrides[n_overrides].type = parse_type(eq + 1);
             n_overrides++;
         }
+        else if (!strcmp(arg, "--tensor-suffix") && i + 2 < argc) {
+            char *spec = argv[++i];
+            char *eq = strchr(spec, '=');
+            if (!eq) die("--tensor-suffix expects SUF=TYPE");
+            *eq = '\0';
+            if (n_suffix_overrides >= (int)(sizeof(suffix_overrides) / sizeof(suffix_overrides[0]))) {
+                die("too many --tensor-suffix overrides");
+            }
+            suffix_overrides[n_suffix_overrides].prefix = spec;
+            suffix_overrides[n_suffix_overrides].type = parse_type(eq + 1);
+            n_suffix_overrides++;
+        }
         else if (!strcmp(arg, "--dry-run")) dry_run = true;
         else if (!strcmp(arg, "--overwrite")) overwrite = true;
         else if (!strcmp(arg, "--verify")) verify = true;
+        else if (!strcmp(arg, "--imatrix") && i + 1 < argc) imatrix_path = argv[++i];
+        else if (!strcmp(arg, "--imatrix-strict")) imatrix_strict = true;
         else { usage(argv[0]); die("unknown or incomplete argument '%s'", arg); }
     }
     if (!in_path || (!out_path && !dry_run)) {
@@ -398,6 +500,8 @@ int main(int argc, char **argv) {
         die("--in and --out are required");
     }
 
+    imatrix_store im = {0};
+    if (imatrix_path) imatrix_load(&im, imatrix_path, imatrix_strict);
     gguf_file g = open_gguf(in_path);
     printf("input: %s\n  version=%u n_kv=%" PRIu64 " n_tensors=%" PRIu64
            " alignment=%zu data_offset=%zu\n",
@@ -409,18 +513,32 @@ int main(int argc, char **argv) {
     for (uint64_t i = 0; i < g.n_tensors; i++) {
         tensor_meta *t = &g.tensors[i];
         ds4q_type target = t->type;
+        bool overridden = false;
         if (n_overrides > 0) {
             for (int k = 0; k < n_overrides; k++) {
                 if (strncmp(t->name, overrides[k].prefix, strlen(overrides[k].prefix)) == 0) {
                     target = overrides[k].type;
+                    overridden = true;
                     break;
                 }
             }
         }
-        if (target == t->type && is_attention_projection(t->name) && attn_type != DS4Q_TYPE_COUNT) {
+        if (!overridden && n_suffix_overrides > 0) {
+            for (int k = 0; k < n_suffix_overrides; k++) {
+                if (name_has_suffix(t->name, suffix_overrides[k].prefix)) {
+                    target = suffix_overrides[k].type;
+                    overridden = true;
+                    break;
+                }
+            }
+        }
+        /* Family defaults must not re-apply after an explicit override
+         * (a Q4_K_M promotion sets the target back to the q8_0 source
+         * type, which the old target == t->type guard silently undid). */
+        if (!overridden && is_attention_projection(t->name) && attn_type != DS4Q_TYPE_COUNT) {
             target = attn_type;
         }
-        if (target == t->type && is_output_head(t->name) && out_type != DS4Q_TYPE_COUNT) {
+        if (!overridden && is_output_head(t->name) && out_type != DS4Q_TYPE_COUNT) {
             target = out_type;
         }
         if (target != t->type) {
@@ -439,9 +557,13 @@ int main(int argc, char **argv) {
         t->new_size = target == t->type ? t->size : tensor_nbytes(target, t->ne, t->n_dims);
         if (target != t->type) {
             changed++;
-            printf("type_change: %s %s -> %s (%.2f MiB -> %.2f MiB)\n",
+            const char *im_state = !imatrix_path ? "" :
+                (imatrix_find(&im, t) ? " [imatrix]" :
+                 (printf("imatrix-miss: %s\n", t->name), " [no-imatrix]"));
+            printf("type_change: %s %s -> %s (%.2f MiB -> %.2f MiB)%s\n",
                    t->name, ds4q_type_name(t->type), ds4q_type_name(target),
-                   (double)t->size / 1048576.0, (double)t->new_size / 1048576.0);
+                   (double)t->size / 1048576.0, (double)t->new_size / 1048576.0,
+                   im_state);
         }
         old_bytes += t->size;
         new_bytes += t->new_size;
@@ -522,8 +644,9 @@ int main(int argc, char **argv) {
             uint8_t *enc = xmalloc(t->new_size);
             const int64_t n_row = t->n_dims > 1 ? t->ne[1] : 1;
             ds4q_quantize_init(t->new_type);
+            const float *imat = imatrix_path ? imatrix_find(&im, t) : NULL;
             size_t written = ds4q_quantize_chunk(t->new_type, f32, enc, 0,
-                                                 n_row, t->ne[0], NULL);
+                                                 n_row, t->ne[0], imat);
             if (written != t->new_size) {
                 die("%s: encoded %zu bytes, expected %zu", t->name, written, t->new_size);
             }

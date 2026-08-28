@@ -34627,6 +34627,23 @@ typedef struct {
     float *down_sum2;      /* [active layer][active expert][expert FFN] */
     uint32_t gate_up_count[DS4_MAX_LAYER][DS4_MAX_EXPERT];
     uint32_t down_count[DS4_MAX_LAYER][DS4_MAX_EXPERT];
+    /* Dense attention-projection importance: sum of squared matmul inputs,
+     * accumulated from the same materialized prefill buffers the release
+     * graph writes.  attn_norm feeds attn_q_a and attn_kv; qr_norm feeds
+     * attn_q_b; the heads rows viewed as n_out_group group_dim slices
+     * (group-averaged into one vector) feed attn_output_a; attn_low feeds
+     * attn_output_b.  The output head's input is not materialized in the
+     * prefill graph, so output.weight stays uncalibrated.  Rows are
+     * subsampled per chunk to bound the readback volume. */
+    float *attn_norm_sum2;   /* [layer][n_embd] */
+    float *qr_norm_sum2;     /* [layer][n_lora_q] */
+    float *heads_sum2;       /* [layer][n_embd] (n_out_group * head_dim) */
+    float *attn_low_sum2;    /* [layer][n_out_group * n_lora_o] */
+    uint32_t attn_dense_count[DS4_MAX_LAYER];
+    float *attn_norm_buf;
+    float *qr_norm_buf;
+    float *heads_buf;
+    float *attn_low_buf;
     float *ffn_norm_buf;
     float *routed_mid_buf;
     uint16_t *routed_mid_f16_buf;
@@ -34639,6 +34656,11 @@ typedef struct {
     const char *dataset_path;
 } ds4_imatrix_collector;
 
+/* Dense-family readback subsample: importance statistics converge within a
+ * few thousand rows; this bounds the per-chunk readback to keep calibration
+ * tractable (the heads buffer alone is 128 KiB per row). */
+#define DS4_IMATRIX_DENSE_ROWS 256u
+
 static bool imatrix_collector_init(ds4_imatrix_collector *c, uint32_t cap_tokens, const char *dataset_path) {
     memset(c, 0, sizeof(*c));
     c->cap_tokens = cap_tokens ? cap_tokens : 1u;
@@ -34647,24 +34669,42 @@ static bool imatrix_collector_init(ds4_imatrix_collector *c, uint32_t cap_tokens
     const size_t down_n = (size_t)DS4_N_LAYER * DS4_N_EXPERT * DS4_N_FF_EXP;
     c->gate_up_sum2 = xcalloc(gate_n, sizeof(c->gate_up_sum2[0]));
     c->down_sum2 = xcalloc(down_n, sizeof(c->down_sum2[0]));
+    c->attn_norm_sum2 = xcalloc((size_t)DS4_N_LAYER * DS4_N_EMBD, sizeof(float));
+    c->qr_norm_sum2 = xcalloc((size_t)DS4_N_LAYER * DS4_N_LORA_Q, sizeof(float));
+    c->heads_sum2 = xcalloc((size_t)DS4_N_LAYER * DS4_N_EMBD, sizeof(float));
+    c->attn_low_sum2 = xcalloc((size_t)DS4_N_LAYER * DS4_N_OUT_GROUP * DS4_N_LORA_O, sizeof(float));
     c->ffn_norm_buf = xmalloc((size_t)c->cap_tokens * DS4_N_EMBD * sizeof(c->ffn_norm_buf[0]));
     c->routed_mid_buf = xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(c->routed_mid_buf[0]));
     c->routed_mid_f16_buf = xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(c->routed_mid_f16_buf[0]));
     c->selected_buf = xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * sizeof(c->selected_buf[0]));
     c->sq_tmp = xmalloc((size_t)DS4_N_EMBD * sizeof(c->sq_tmp[0]));
+    c->attn_norm_buf = xmalloc((size_t)DS4_IMATRIX_DENSE_ROWS * DS4_N_EMBD * sizeof(float));
+    c->qr_norm_buf = xmalloc((size_t)DS4_IMATRIX_DENSE_ROWS * DS4_N_LORA_Q * sizeof(float));
+    c->heads_buf = xmalloc((size_t)DS4_IMATRIX_DENSE_ROWS * DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float));
+    c->attn_low_buf = xmalloc((size_t)DS4_IMATRIX_DENSE_ROWS * DS4_N_OUT_GROUP * DS4_N_LORA_O * sizeof(float));
     return c->gate_up_sum2 && c->down_sum2 && c->ffn_norm_buf &&
-           c->routed_mid_buf && c->routed_mid_f16_buf && c->selected_buf && c->sq_tmp;
+           c->routed_mid_buf && c->routed_mid_f16_buf && c->selected_buf && c->sq_tmp &&
+           c->attn_norm_sum2 && c->qr_norm_sum2 && c->heads_sum2 && c->attn_low_sum2 &&
+           c->attn_norm_buf && c->qr_norm_buf && c->heads_buf && c->attn_low_buf;
 }
 
 static void imatrix_collector_free(ds4_imatrix_collector *c) {
     if (!c) return;
     free(c->gate_up_sum2);
     free(c->down_sum2);
+    free(c->attn_norm_sum2);
+    free(c->qr_norm_sum2);
+    free(c->heads_sum2);
+    free(c->attn_low_sum2);
     free(c->ffn_norm_buf);
     free(c->routed_mid_buf);
     free(c->routed_mid_f16_buf);
     free(c->selected_buf);
     free(c->sq_tmp);
+    free(c->attn_norm_buf);
+    free(c->qr_norm_buf);
+    free(c->heads_buf);
+    free(c->attn_low_buf);
     memset(c, 0, sizeof(*c));
 }
 
@@ -34726,6 +34766,49 @@ static bool imatrix_collect_layer_batch(
             c->observed_routes++;
         }
     }
+
+    /* Dense attention projections: same style of observation over the
+     * layer's attention-half buffers, still resident when the layer's FFN
+     * has finished (the same invariant the ffn_norm read above relies on).
+     * The heads rows are accumulated per n_out_group slice into one
+     * group-averaged vector for attn_output_a. */
+    {
+        const uint32_t dense_rows = n_tokens < DS4_IMATRIX_DENSE_ROWS
+            ? n_tokens : DS4_IMATRIX_DENSE_ROWS;
+        const uint32_t group_cnt = DS4_N_OUT_GROUP;
+        const uint32_t group_dim = DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP);
+        const uint64_t an_bytes = (uint64_t)dense_rows * DS4_N_EMBD * sizeof(float);
+        const uint64_t qr_bytes = (uint64_t)dense_rows * DS4_N_LORA_Q * sizeof(float);
+        const uint64_t heads_bytes = (uint64_t)dense_rows * DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
+        const uint64_t low_bytes = (uint64_t)dense_rows * DS4_N_OUT_GROUP * DS4_N_LORA_O * sizeof(float);
+        if (ds4_gpu_tensor_read(metal_graph_batch_attn_norm(g), 0, c->attn_norm_buf, an_bytes) == 0 ||
+            ds4_gpu_tensor_read(metal_graph_batch_qr_norm(g), 0, c->qr_norm_buf, qr_bytes) == 0 ||
+            ds4_gpu_tensor_read(metal_graph_batch_heads(g), 0, c->heads_buf, heads_bytes) == 0 ||
+            ds4_gpu_tensor_read(metal_graph_batch_attn_low(g), 0, c->attn_low_buf, low_bytes) == 0) {
+            return false;
+        }
+
+        float *an = c->attn_norm_sum2 + (size_t)il * DS4_N_EMBD;
+        float *qr = c->qr_norm_sum2 + (size_t)il * DS4_N_LORA_Q;
+        float *hs = c->heads_sum2 + (size_t)il * DS4_N_EMBD;
+        float *lo = c->attn_low_sum2 + (size_t)il * (DS4_N_OUT_GROUP * DS4_N_LORA_O);
+        for (uint32_t t = 0; t < dense_rows; t++) {
+            const float *xn = c->attn_norm_buf + (size_t)t * DS4_N_EMBD;
+            for (uint32_t i = 0; i < DS4_N_EMBD; i++) an[i] += xn[i] * xn[i];
+            const float *xq = c->qr_norm_buf + (size_t)t * DS4_N_LORA_Q;
+            for (uint32_t i = 0; i < DS4_N_LORA_Q; i++) qr[i] += xq[i] * xq[i];
+            const float *xh = c->heads_buf + (size_t)t * (DS4_N_HEAD * DS4_N_HEAD_DIM);
+            for (uint32_t grp = 0; grp < group_cnt; grp++) {
+                const float *slice = xh + (size_t)grp * group_dim;
+                for (uint32_t i = 0; i < group_dim && i < DS4_N_EMBD; i++) {
+                    hs[i] += slice[i] * slice[i];
+                }
+            }
+            const float *xl = c->attn_low_buf + (size_t)t * (DS4_N_OUT_GROUP * DS4_N_LORA_O);
+            for (uint32_t i = 0; i < DS4_N_OUT_GROUP * DS4_N_LORA_O; i++) lo[i] += xl[i] * xl[i];
+        }
+        c->attn_dense_count[il] += dense_rows;
+    }
     c->observed_tokens += n_tokens;
     c->chunks++;
     return true;
@@ -34775,7 +34858,7 @@ static bool imatrix_collector_save(
         return false;
     }
 
-    const int32_t entries = (int32_t)(DS4_N_LAYER * 3);
+    const int32_t entries = (int32_t)(DS4_N_LAYER * 8);
     imatrix_write_i32(fp, entries);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *layer = &weights->layer[il];
@@ -34798,6 +34881,45 @@ static bool imatrix_collector_save(
                             c->down_count[il],
                             DS4_N_EXPERT,
                             DS4_N_FF_EXP);
+
+        /* Dense attention projections: one vector per tensor (n_expert=1).
+         * attn_q_a and attn_kv share the attn_norm statistics; the heads
+         * vector is the n_out_group-group-averaged sum, so its observation
+         * count scales by the group count to keep the baked mean honest. */
+        if (layer->attn_q_a && layer->attn_q_b && layer->attn_kv &&
+            layer->attn_output_a && layer->attn_output_b) {
+            snprintf(name, sizeof(name), "%.*s", (int)layer->attn_q_a->name.len, layer->attn_q_a->name.ptr);
+            imatrix_write_entry(fp, name,
+                                c->attn_norm_sum2 + (size_t)il * DS4_N_EMBD,
+                                &c->attn_dense_count[il],
+                                1,
+                                DS4_N_EMBD);
+            snprintf(name, sizeof(name), "%.*s", (int)layer->attn_kv->name.len, layer->attn_kv->name.ptr);
+            imatrix_write_entry(fp, name,
+                                c->attn_norm_sum2 + (size_t)il * DS4_N_EMBD,
+                                &c->attn_dense_count[il],
+                                1,
+                                DS4_N_EMBD);
+            snprintf(name, sizeof(name), "%.*s", (int)layer->attn_q_b->name.len, layer->attn_q_b->name.ptr);
+            imatrix_write_entry(fp, name,
+                                c->qr_norm_sum2 + (size_t)il * DS4_N_LORA_Q,
+                                &c->attn_dense_count[il],
+                                1,
+                                DS4_N_LORA_Q);
+            snprintf(name, sizeof(name), "%.*s", (int)layer->attn_output_a->name.len, layer->attn_output_a->name.ptr);
+            const uint32_t heads_count = c->attn_dense_count[il] * DS4_N_OUT_GROUP;
+            imatrix_write_entry(fp, name,
+                                c->heads_sum2 + (size_t)il * DS4_N_EMBD,
+                                &heads_count,
+                                1,
+                                DS4_N_EMBD);
+            snprintf(name, sizeof(name), "%.*s", (int)layer->attn_output_b->name.len, layer->attn_output_b->name.ptr);
+            imatrix_write_entry(fp, name,
+                                c->attn_low_sum2 + (size_t)il * (DS4_N_OUT_GROUP * DS4_N_LORA_O),
+                                &c->attn_dense_count[il],
+                                1,
+                                DS4_N_OUT_GROUP * DS4_N_LORA_O);
+        }
     }
 
     const int32_t chunks = (int32_t)c->chunks;

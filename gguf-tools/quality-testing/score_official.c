@@ -530,6 +530,8 @@ int main(int argc, char **argv) {
     uint32_t ssd_streaming_cache_experts = 0;
     uint64_t ssd_streaming_cache_bytes = 0;
     uint32_t ssd_streaming_preload_experts = 0;
+    const char *dump_logits_path = NULL;
+    long dump_max = 2048;
 
     for (int i = 4; i < argc; i++) {
         const char *arg = argv[i];
@@ -558,6 +560,10 @@ int main(int argc, char **argv) {
         } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
             ssd_streaming_preload_experts =
                 (uint32_t)parse_positive_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dump-logits")) {
+            dump_logits_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dump-max")) {
+            dump_max = parse_positive_int(need_arg(&i, argc, argv, arg), arg);
         } else if (arg[0] != '-' && !ctx_set) {
             ctx_size = parse_positive_int(arg, "ctx");
             ctx_set = true;
@@ -622,6 +628,25 @@ int main(int argc, char **argv) {
     const int n_vocab = ds4_engine_vocab_size(engine);
     float *logits = malloc((size_t)n_vocab * sizeof(logits[0]));
     if (!logits) die("out of memory");
+
+    /* Optional per-position full-vocab logits dump over the same
+     * teacher-forced continuation stream, for cross-model distribution
+     * metrics (top-1 agreement, KL).  Rows pair 1:1 across two runs over
+     * the same manifest: magic 'LGD1', u32 n_vocab, then F32 rows. */
+    FILE *dump = NULL;
+    long dumped = 0;
+    if (dump_logits_path) {
+        dump = fopen(dump_logits_path, "wb");
+        if (!dump) {
+            fprintf(stderr, "open %s: %s\n", dump_logits_path, strerror(errno));
+            return 1;
+        }
+        const uint32_t magic = 0x3144474Cu; /* "LGD1" little-endian */
+        if (fwrite(&magic, sizeof(magic), 1, dump) != 1 ||
+            fwrite(&(uint32_t){(uint32_t)n_vocab}, sizeof(uint32_t), 1, dump) != 1) {
+            die("failed to write logits dump header");
+        }
+    }
 
     FILE *mf = fopen(manifest_path, "rb");
     if (!mf) {
@@ -708,6 +733,13 @@ int main(int argc, char **argv) {
             if (!local_logits(session, logits, n_vocab, &logsum, &greedy)) {
                 fprintf(stderr, "%s logits failed at target token %d\n", id, i);
                 return 1;
+            }
+            if (dump && dumped < dump_max) {
+                if (fwrite(logits, sizeof(logits[0]), (size_t)n_vocab, dump) !=
+                    (size_t)n_vocab) {
+                    die("failed to write logits dump row");
+                }
+                dumped++;
             }
 
             if (i == 0) first_match = (greedy == target.v[i]);
@@ -877,6 +909,11 @@ int main(int argc, char **argv) {
 
     fclose(out);
     fclose(mf);
+    if (dump) {
+        fclose(dump);
+        fprintf(stderr, "logits_dump %ld rows x %d vocab -> %s\n",
+                dumped, n_vocab, dump_logits_path);
+    }
     free(logits);
     ds4_session_free(session);
     ds4_engine_close(engine);

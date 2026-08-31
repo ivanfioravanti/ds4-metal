@@ -17,6 +17,7 @@ from qwen4_benchmark import (
     parse_qwen_mtp_timing,
     prepare_cold_phase_order,
     require_cold_ple_binding,
+    require_ds4_mtp_timing,
     rusage_v2_evidence,
     ssd_backing_evidence,
 )
@@ -56,9 +57,11 @@ class Qwen4BenchmarkTests(unittest.TestCase):
     def test_qwen_mtp_parser_aggregates_request_local_cycles(self):
         evidence = parse_qwen_mtp_timing("\n".join((
             "ds4: Qwen MTP timing drafted=4 accepted=3 "
-            "target_tokens=4 cycle=12.500 ms verifier=sequential",
+            "target_tokens=4 cycle=12.500 ms verifier=block",
             "ds4: Qwen MTP timing drafted=4 accepted=1 "
-            "target_tokens=2 cycle=9.250 ms verifier=sequential",
+            "target_tokens=2 cycle=9.250 ms verifier=block",
+            "ds4: Qwen MTP stages snapshot=1.000 ms draft=2.000 ms "
+            "verify=3.000 ms commit=4.000 ms path=restore-replay",
             "ds4: Qwen MTP timing drafted=0 accepted=0 "
             "target_tokens=1 cycle=1.000 ms",
         )))
@@ -67,16 +70,42 @@ class Qwen4BenchmarkTests(unittest.TestCase):
             "version": 1,
             "cycles": 3,
             "drafted": 8,
+            "max_drafted": 4,
             "accepted": 4,
             "target_tokens": 7,
             "cycle_ms": 22.75,
-            "verifier": {"sequential": 2, "unlabeled": 1},
+            "verifier": {"block": 2, "unlabeled": 1},
         })
+
+    def test_qwen_mtp_requirement_accepts_block_verifier(self):
+        evidence = parse_qwen_mtp_timing(
+            "ds4: Qwen MTP timing drafted=4 accepted=3 "
+            "target_tokens=4 cycle=12.500 ms verifier=block"
+        )
+        require_ds4_mtp_timing(evidence, 4)
+
+    def test_qwen_mtp_requirement_rejects_sequential_verifier(self):
+        evidence = parse_qwen_mtp_timing(
+            "ds4: Qwen MTP timing drafted=4 accepted=3 "
+            "target_tokens=4 cycle=12.500 ms verifier=sequential"
+        )
+        with self.assertRaisesRegex(RuntimeError, "block verifier"):
+            require_ds4_mtp_timing(evidence, 4)
 
     def test_qwen_mtp_parser_rejects_malformed_evidence(self):
         with self.assertRaisesRegex(ValueError, "malformed"):
             parse_qwen_mtp_timing(
                 "ds4: Qwen MTP timing drafted=4 accepted=? target_tokens=5"
+            )
+        with self.assertRaisesRegex(ValueError, "accepted exceeds drafted"):
+            parse_qwen_mtp_timing(
+                "ds4: Qwen MTP timing drafted=1 accepted=2 "
+                "target_tokens=3 cycle=1.000 ms verifier=block"
+            )
+        with self.assertRaisesRegex(ValueError, "1 \+ accepted"):
+            parse_qwen_mtp_timing(
+                "ds4: Qwen MTP timing drafted=4 accepted=2 "
+                "target_tokens=4 cycle=1.000 ms verifier=block"
             )
 
     def test_mtp_command_enables_draft_four_and_timing_only_for_mtp(self):

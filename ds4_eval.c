@@ -1202,6 +1202,8 @@ typedef struct {
     int ctx_size;
     int max_tokens;
     int question_limit;
+    int mtp_draft_tokens;
+    float mtp_margin;
     float temperature;
     float top_p;
     float min_p;
@@ -1222,6 +1224,7 @@ typedef struct {
     ds4_think_mode think_mode;
     ds4_dist_options dist;
     bool plain;
+    bool mtp_timing;
     bool warm_weights;
     bool quality;
     bool ssd_streaming;
@@ -1519,6 +1522,8 @@ static eval_config parse_options(int argc, char **argv) {
         .model_path = "ds4flash.gguf",
         .backend = default_backend(),
         .max_tokens = 16000,
+        .mtp_draft_tokens = 1,
+        .mtp_margin = 3.0f,
         .top_p = DS4_DEFAULT_TOP_P,
         .min_p = DS4_DEFAULT_MIN_P,
         .pause_ms = 350,
@@ -1559,6 +1564,19 @@ static eval_config parse_options(int argc, char **argv) {
             c.ple_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-model")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp-draft")) {
+            c.mtp_draft_tokens = parse_int_arg(
+                need_arg(&i, argc, argv, arg), arg);
+            if (c.mtp_draft_tokens < 1 || c.mtp_draft_tokens > 16) {
+                fprintf(stderr,
+                        "ds4-eval: --mtp-draft must be between 1 and 16\n");
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--mtp-margin")) {
+            c.mtp_margin = parse_float_arg(
+                need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
+        } else if (!strcmp(arg, "--mtp-timing")) {
+            c.mtp_timing = true;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
@@ -4173,8 +4191,9 @@ int main(int argc, char **argv) {
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_size > 0 ? cfg.ctx_size : 0,
-        .mtp_draft_tokens = 1,
-        .mtp_margin = 3.0f,
+        .mtp_draft_tokens = cfg.mtp_draft_tokens,
+        .mtp_margin = cfg.mtp_margin,
+        .glm_mtp_timing = cfg.mtp_timing,
         .power_percent = cfg.power_percent,
         .prefill_chunk = cfg.prefill_chunk,
         .qwen4_prefill_mode = cfg.qwen4_prefill_mode,

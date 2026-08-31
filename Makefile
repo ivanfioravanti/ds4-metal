@@ -10,6 +10,7 @@ SAMPLING_TEST := tests/test_sampling
 GLM53_KDA_TEST := tests/test_glm53_kda
 GLM53_KDA_ROCM_TEST := tests/test_glm53_kda_rocm
 QWEN4_HOST_TEST := tests/test_qwen4_host
+QWEN4_SPEC_TEST := tests/test_qwen4_spec
 QWEN4_METAL_TEST := tests/test_qwen4_metal
 
 DEBUG_FLAGS ?= -g
@@ -202,7 +203,8 @@ rocm: strix-halo
 # CUDA hosts.  Everything else mirrors `make test`.
 test-rocm:
 	$(MAKE) -B ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
-		tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args $(QWEN4_HOST_TEST) \
+		tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
+		$(QWEN4_HOST_TEST) $(QWEN4_SPEC_TEST) \
 		ds4 ds4-server ds4-bench ds4-agent \
 		CORE_OBJS="ds4.o ds4_qwen4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o $(ROCM_MMQ_OBJS)" \
 		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
@@ -216,6 +218,7 @@ test-rocm:
 	./tests/test_gpu_args
 	./tests/test_gpu_args_cli.sh
 	./$(QWEN4_HOST_TEST)
+	./$(QWEN4_SPEC_TEST)
 
 ds4: ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
@@ -464,6 +467,12 @@ tests/test_qwen4_host.o: tests/test_qwen4_host.c ds4_qwen4.h ds4_image.h
 $(QWEN4_HOST_TEST): tests/test_qwen4_host.o ds4_qwen4.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+tests/test_qwen4_spec.o: tests/test_qwen4_spec.c ds4_qwen4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+$(QWEN4_SPEC_TEST): tests/test_qwen4_spec.o ds4_qwen4.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 ifeq ($(UNAME_S),Darwin)
 tests/test_qwen4_metal.o: tests/test_qwen4_metal.c ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
@@ -477,8 +486,9 @@ test-qwen4-metal: $(QWEN4_METAL_TEST)
 endif
 
 .PHONY: test-qwen4-host test-qwen4-pack test-qwen4-acceptance test-qwen4
-test-qwen4-host: $(QWEN4_HOST_TEST)
+test-qwen4-host: $(QWEN4_HOST_TEST) $(QWEN4_SPEC_TEST)
 	./$(QWEN4_HOST_TEST)
+	./$(QWEN4_SPEC_TEST)
 
 test-qwen4-pack:
 	$(MAKE) -C gguf-tools quants-shared
@@ -620,7 +630,8 @@ endif
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
-	$(SAMPLING_TEST) $(QWEN4_HOST_TEST) ds4 ds4-server ds4-bench ds4-agent
+	$(SAMPLING_TEST) $(QWEN4_HOST_TEST) $(QWEN4_SPEC_TEST) \
+	ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test
@@ -630,6 +641,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
 	./tests/test_gpu_args_cli.sh
 	./tests/test_sampling
 	./$(QWEN4_HOST_TEST)
+	./$(QWEN4_SPEC_TEST)
 
 dspark-acceptance: ds4
 	DS4_DSPARK_MODEL="$(DS4_DSPARK_MODEL)" \

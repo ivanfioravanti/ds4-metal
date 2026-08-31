@@ -129,6 +129,7 @@ static void test_buffer_align(test_buffer *buffer, size_t alignment) {
 
 static size_t build_ple_gguf(uint8_t *file,
                              size_t capacity,
+                             uint32_t pack_version,
                              uint64_t *weight_offset_out) {
     enum {
         ALIGNMENT = 32,
@@ -150,12 +151,15 @@ static size_t build_ple_gguf(uint8_t *file,
     test_buffer_bytes(&buffer, "GGUF", 4u);
     test_buffer_u32(&buffer, 3u);
     test_buffer_u64(&buffer, 4u);
-    test_buffer_u64(&buffer, 5u);
+    test_buffer_u64(&buffer, 7u);
     test_buffer_kv_string(&buffer, "general.architecture",
                           DS4_QWEN4_PLE_ARCHITECTURE);
     test_buffer_kv_u32(&buffer, "general.alignment", ALIGNMENT);
     test_buffer_kv_u32(&buffer, "ds4.pack.version",
-                       DS4_QWEN4_PACK_MANIFEST_VERSION);
+                       pack_version);
+    test_buffer_kv_string(
+        &buffer, "ds4.pack.id", "0123456789abcdef0123456789abcdef");
+    test_buffer_kv_string(&buffer, "general.source.revision", "deadbeef");
     test_buffer_kv_string(&buffer, "ds4.pack.artifact", "ple");
     test_buffer_kv_string(&buffer, "ds4.pack.quant.ple", "Q4_1");
     const uint64_t weight_shape[] = {DIM, ROWS};
@@ -253,6 +257,21 @@ static void test_prefill_policy(void) {
               &admission, error, sizeof(error)));
     CHECK(strstr(error, "missing exact Q8") != NULL);
 
+    const uint64_t mtp_per_token =
+        (uint64_t)DS4_QWEN4_HC_COUNT * DS4_QWEN4_HIDDEN * sizeof(float);
+    const uint64_t mtp_scratch2k = scratch2k + 2048u * mtp_per_token;
+    const uint64_t mtp_scratch8k = scratch8k + 8192u * mtp_per_token;
+    CHECK(ds4_qwen4_admit_prefill_with_extra(
+              DS4_QWEN4_PREFILL_AUTO, true, NULL, mtp_scratch8k - 1u,
+              mtp_per_token, &admission, error, sizeof(error)));
+    CHECK(admission.admitted_cap == 2048u);
+    CHECK(admission.scratch_required == mtp_scratch2k);
+    CHECK(ds4_qwen4_admit_prefill_with_extra(
+              DS4_QWEN4_PREFILL_AUTO, true, NULL, mtp_scratch8k,
+              mtp_per_token, &admission, error, sizeof(error)));
+    CHECK(admission.admitted_cap == 8192u);
+    CHECK(admission.scratch_required == mtp_scratch8k);
+
     const char *reason = NULL;
     CHECK(ds4_qwen4_select_prefill_chunk(DS4_QWEN4_PREFILL_AUTO, true,
                                          8192, 8192, 0, &reason) == 8192);
@@ -271,6 +290,68 @@ static void test_prefill_policy(void) {
     CHECK(!strcmp(reason, "pre-admitted scratch cap"));
     CHECK(ds4_qwen4_select_prefill_chunk(DS4_QWEN4_PREFILL_4096, false,
                                          4096, 1, 1, &reason) == 4096);
+}
+
+static void test_pack_profiles(void) {
+    char error[256] = {0};
+    ds4_qwen4_pack_profile profile = DS4_QWEN4_PACK_PROFILE_INVALID;
+
+    CHECK(ds4_qwen4_pack_profile_from_version(
+        DS4_QWEN4_PACK_VERSION_Q4, &profile));
+    CHECK(profile == DS4_QWEN4_PACK_PROFILE_Q4_K);
+    CHECK(!strcmp(ds4_qwen4_pack_profile_name(profile), "q4_k"));
+    CHECK(!strcmp(ds4_qwen4_pack_manifest_file(profile),
+                  DS4_QWEN4_PACK_MANIFEST_FILE));
+    CHECK(!strcmp(ds4_qwen4_pack_routed_name(profile), "Q4_K"));
+    CHECK(ds4_qwen4_pack_routed_metadata_valid(
+        profile, "Q4_K", NULL, NULL, error, sizeof(error)));
+    CHECK(!ds4_qwen4_pack_routed_metadata_valid(
+        profile, "mixed-q2", NULL, NULL, error, sizeof(error)));
+    CHECK(strstr(error, "expected Q4_K") != NULL);
+    CHECK(ds4_qwen4_pack_routed_qtypes_valid(
+        profile, DS4_QWEN4_QTYPE_Q4_K, DS4_QWEN4_QTYPE_Q4_K,
+        DS4_QWEN4_QTYPE_Q4_K, error, sizeof(error)));
+    CHECK(!ds4_qwen4_pack_routed_qtypes_valid(
+        profile, DS4_QWEN4_QTYPE_IQ2_XXS, DS4_QWEN4_QTYPE_IQ2_XXS,
+        DS4_QWEN4_QTYPE_Q2_K, error, sizeof(error)));
+    CHECK(strstr(error, "expected 12/12/12") != NULL);
+    CHECK(ds4_qwen4_pack_fast_required_mask(profile) ==
+          (DS4_QWEN4_FAST_Q4_METAL_REQUIRED_MASK |
+           DS4_QWEN4_FAST_PLE_STAGER));
+
+    CHECK(ds4_qwen4_pack_profile_from_version(
+        DS4_QWEN4_PACK_VERSION_Q2, &profile));
+    CHECK(profile == DS4_QWEN4_PACK_PROFILE_IQ2_XXS_Q2_K);
+    CHECK(!strcmp(ds4_qwen4_pack_profile_name(profile),
+                  "iq2_xxs_gate_up_q2_k_down"));
+    CHECK(!strcmp(ds4_qwen4_pack_manifest_file(profile),
+                  DS4_QWEN4_PACK_Q2_MANIFEST_FILE));
+    CHECK(!strcmp(ds4_qwen4_pack_routed_name(profile), "mixed-q2"));
+    CHECK(!strcmp(ds4_qwen4_pack_routed_gate_up_name(profile), "IQ2_XXS"));
+    CHECK(!strcmp(ds4_qwen4_pack_routed_down_name(profile), "Q2_K"));
+    CHECK(ds4_qwen4_pack_routed_metadata_valid(
+        profile, "mixed-q2", "IQ2_XXS", "Q2_K",
+        error, sizeof(error)));
+    CHECK(!ds4_qwen4_pack_routed_metadata_valid(
+        profile, "mixed-q2", "IQ2_XXS", "Q4_K",
+        error, sizeof(error)));
+    CHECK(strstr(error, "expected IQ2_XXS/Q2_K") != NULL);
+    CHECK(!ds4_qwen4_pack_routed_metadata_valid(
+        profile, "mixed-q2", NULL, "Q2_K", error, sizeof(error)));
+    CHECK(ds4_qwen4_pack_routed_qtypes_valid(
+        profile, DS4_QWEN4_QTYPE_IQ2_XXS, DS4_QWEN4_QTYPE_IQ2_XXS,
+        DS4_QWEN4_QTYPE_Q2_K, error, sizeof(error)));
+    CHECK(!ds4_qwen4_pack_routed_qtypes_valid(
+        profile, DS4_QWEN4_QTYPE_IQ2_XXS, DS4_QWEN4_QTYPE_IQ2_XXS,
+        DS4_QWEN4_QTYPE_Q4_K, error, sizeof(error)));
+    CHECK(strstr(error, "expected 16/16/10") != NULL);
+    CHECK(ds4_qwen4_pack_fast_required_mask(profile) ==
+          (DS4_QWEN4_FAST_Q2_METAL_REQUIRED_MASK |
+           DS4_QWEN4_FAST_PLE_STAGER));
+
+    CHECK(!ds4_qwen4_pack_profile_from_version(2u, &profile));
+    CHECK(profile == DS4_QWEN4_PACK_PROFILE_INVALID);
+    CHECK(ds4_qwen4_pack_fast_required_mask(profile) == 0u);
 }
 
 static void test_mrope_positions(void) {
@@ -392,7 +473,8 @@ static void test_ple_table(void) {
     memset(file, 0, sizeof(file));
     uint64_t weight_offset = 0;
     const size_t file_size =
-        build_ple_gguf(file, sizeof(file), &weight_offset);
+        build_ple_gguf(file, sizeof(file), DS4_QWEN4_PACK_VERSION_Q4,
+                       &weight_offset);
     CHECK(file_size != 0u);
     if (file_size == 0u) return;
 
@@ -423,6 +505,9 @@ static void test_ple_table(void) {
     CHECK(table.block_size == 32u);
     CHECK(table.blocks_per_row == 5u);
     CHECK(table.row_bytes == 100u);
+    CHECK(table.pack_version == DS4_QWEN4_PACK_VERSION_Q4);
+    CHECK(!strcmp(table.pack_id, "0123456789abcdef0123456789abcdef"));
+    CHECK(!strcmp(table.source_revision, "deadbeef"));
     CHECK(table.data_offset == weight_offset);
     CHECK(table.identity_device != 0 || table.identity_inode != 0);
     CHECK(!strcmp(table.sha256, digest));
@@ -532,6 +617,38 @@ static void test_ple_table(void) {
     CHECK(ds4_qwen4_ple_table_open(
               &table, path, error, sizeof(error)) != 0);
     CHECK(table.fd == -1 && table.map == NULL);
+    ds4_qwen4_ple_table_close(&table);
+    CHECK(unlink(path) == 0);
+}
+
+static void test_ple_v4_header(void) {
+    uint8_t file[4096] = {0};
+    const size_t file_size = build_ple_gguf(
+        file, sizeof(file), DS4_QWEN4_PACK_VERSION_Q2, NULL);
+    CHECK(file_size != 0u);
+    if (file_size == 0u) return;
+
+    char path[128];
+    snprintf(path, sizeof(path), "/tmp/ds4-qwen4-ple-v4-%ld.bin",
+             (long)getpid());
+    int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+    CHECK(fd >= 0 && write_all(fd, file, file_size));
+    if (fd >= 0) CHECK(close(fd) == 0);
+
+    char error[256], digest[65];
+    uint64_t bytes = 0u;
+    CHECK(ds4_qwen4_sha256_file(path, digest, &bytes,
+                                error, sizeof(error)) == 0);
+    ds4_qwen4_pack_artifact artifact = {
+        .kind = DS4_QWEN4_ARTIFACT_PLE,
+        .bytes = bytes,
+    };
+    memcpy(artifact.sha256, digest, sizeof(artifact.sha256));
+    ds4_qwen4_ple_table table = {.fd = -1};
+    CHECK(ds4_qwen4_pack_validate_ple_open(
+              &artifact, path, &table, error, sizeof(error)) == 0);
+    CHECK(table.rows == 2u && table.row_bytes == 100u);
+    CHECK(table.pack_version == DS4_QWEN4_PACK_VERSION_Q2);
     ds4_qwen4_ple_table_close(&table);
     CHECK(unlink(path) == 0);
 }
@@ -734,7 +851,7 @@ static bool write_pack_manifest_with_tensors(
         const char *tensors_json,
         const char *tensor_digest) {
     const bool legacy = version == 1u;
-    if (version < 1u || version > DS4_QWEN4_PACK_MANIFEST_VERSION ||
+    if (version < 1u || version > DS4_QWEN4_PACK_LATEST_VERSION ||
         !tensors_json || !tensor_digest) return false;
     const uint32_t base_count = legacy ? QWEN4_TEST_LEGACY_BASE_COUNT : 1u;
     FILE *fp = fopen(manifest_path, "wb");
@@ -781,6 +898,7 @@ static bool write_pack_manifest_with_tensors(
         "],\"geometry\":{\"tensors\":{\"decoy\":{"
         "\"text\":\"escaped \\\" brace }\"}}},"
         "\"pack_id\":\"0123456789abcdef0123456789abcdef\","
+        "\"quantization\":{\"control\":{\"qtype\":\"source\"}},"
         "\"schema\":\"ds4.qwen4.fast-pack\","
         "\"source\":{\"repository\":\"Qwen/Qwen3.8-Flash-Next\",\"revision\":\"deadbeef\"},"
         "\"tensor_manifest_sha256\":\"%s\",\"tensors\":%s,"
@@ -867,17 +985,29 @@ static void test_pack_manifest(void) {
 
     /* Canonical v3 packs contain one base GGUF and may omit shard_index. */
     CHECK(write_pack_manifest(manifest_path, names, digests, sizes,
-                              DS4_QWEN4_PACK_MANIFEST_VERSION, true));
+                              DS4_QWEN4_PACK_VERSION_Q4, true));
     ds4_qwen4_pack_manifest canonical;
     CHECK(ds4_qwen4_pack_manifest_load(&canonical, manifest_path,
                                         error, sizeof(error)) == 0);
-    CHECK(canonical.version == DS4_QWEN4_PACK_MANIFEST_VERSION);
+    CHECK(canonical.version == DS4_QWEN4_PACK_VERSION_Q4);
     CHECK(canonical.base_shard_count == DS4_QWEN4_PACK_BASE_SHARDS);
     CHECK(canonical.base_shard_count == 1u);
     CHECK(canonical.artifact_count == 4u);
     CHECK(!strcmp(canonical.source_revision, "deadbeef"));
     CHECK(!strcmp(canonical.tensor_manifest_sha256,
                   QWEN4_TEST_TENSORS_SHA256));
+    CHECK(canonical.profile == DS4_QWEN4_PACK_PROFILE_Q4_K);
+
+    /* v4 keeps the authenticated artifact topology but selects the fixed
+     * IQ2_XXS gate/up + Q2_K down profile. */
+    CHECK(write_pack_manifest(manifest_path, names, digests, sizes,
+                              DS4_QWEN4_PACK_VERSION_Q2, true));
+    ds4_qwen4_pack_manifest q2;
+    CHECK(ds4_qwen4_pack_manifest_load(&q2, manifest_path,
+                                        error, sizeof(error)) == 0);
+    CHECK(q2.version == DS4_QWEN4_PACK_VERSION_Q2);
+    CHECK(q2.profile == DS4_QWEN4_PACK_PROFILE_IQ2_XXS_Q2_K);
+    CHECK(q2.base_shard_count == 1u && q2.artifact_count == 4u);
 
     char changed_tensors[sizeof(QWEN4_TEST_TENSORS_JSON)];
     memcpy(changed_tensors, QWEN4_TEST_TENSORS_JSON,
@@ -887,7 +1017,7 @@ static void test_pack_manifest(void) {
     if (changed_qtype) changed_qtype[9] = 'X';
     CHECK(write_pack_manifest_with_tensors(
         manifest_path, names, digests, sizes,
-        DS4_QWEN4_PACK_MANIFEST_VERSION, true,
+        DS4_QWEN4_PACK_VERSION_Q4, true,
         changed_tensors, QWEN4_TEST_TENSORS_SHA256));
     ds4_qwen4_pack_manifest invalid_tensor_manifest;
     CHECK(ds4_qwen4_pack_manifest_load(
@@ -903,7 +1033,7 @@ static void test_pack_manifest(void) {
     truncated_tensors[sizeof(truncated_tensors) - 2u] = '\0';
     CHECK(write_pack_manifest_with_tensors(
         manifest_path, names, digests, sizes,
-        DS4_QWEN4_PACK_MANIFEST_VERSION, true,
+        DS4_QWEN4_PACK_VERSION_Q4, true,
         truncated_tensors, QWEN4_TEST_TENSORS_SHA256));
     CHECK(ds4_qwen4_pack_manifest_load(
               &invalid_tensor_manifest, manifest_path,
@@ -913,7 +1043,7 @@ static void test_pack_manifest(void) {
           invalid_tensor_manifest.artifact_count == 0u);
 
     CHECK(write_pack_manifest(manifest_path, names, digests, sizes,
-                              DS4_QWEN4_PACK_MANIFEST_VERSION, true));
+                              DS4_QWEN4_PACK_VERSION_Q4, true));
     uint32_t validation_mask = 0u;
     CHECK(ds4_qwen4_pack_validation_mask(
               &canonical, false, false, &validation_mask,
@@ -998,7 +1128,7 @@ static void test_pack_manifest(void) {
     /* v3 may omit optional artifacts entirely; requesting a corresponding
      * CLI sidecar must still fail selection. */
     CHECK(write_pack_manifest(manifest_path, names, digests, sizes,
-                              DS4_QWEN4_PACK_MANIFEST_VERSION, false));
+                              DS4_QWEN4_PACK_VERSION_Q4, false));
     ds4_qwen4_pack_manifest canonical_text;
     CHECK(ds4_qwen4_pack_manifest_load(&canonical_text, manifest_path,
                                         error, sizeof(error)) == 0);
@@ -1028,11 +1158,13 @@ static void test_pack_manifest(void) {
 }
 
 int main(void) {
+    test_pack_profiles();
     test_prefill_policy();
     test_mrope_positions();
     test_qwen4_image_preprocess();
     test_ngram_hash();
     test_ple_table();
+    test_ple_v4_header();
     test_ple_mmap_stager();
     test_artifact_tensor_counts();
     test_pack_manifest();

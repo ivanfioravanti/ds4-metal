@@ -137,6 +137,9 @@ def validate_mtp_timing(sample: dict, index: int) -> dict:
     drafted = exact_nonnegative_int(
         evidence.get("drafted"), f"{label} drafted tokens"
     )
+    max_drafted = exact_nonnegative_int(
+        evidence.get("max_drafted"), f"{label} maximum drafts per cycle"
+    )
     accepted = exact_nonnegative_int(
         evidence.get("accepted"), f"{label} accepted tokens"
     )
@@ -156,6 +159,10 @@ def validate_mtp_timing(sample: dict, index: int) -> dict:
         fail(f"{label} must show cycles, drafts, and accepted draft tokens")
     if accepted > drafted:
         fail(f"{label} accepted more tokens than it drafted")
+    if max_drafted <= 0 or max_drafted > 4 or max_drafted > drafted:
+        fail(f"{label} exceeds the configured draft depth")
+    if target_tokens != cycles + accepted:
+        fail(f"{label} has inconsistent cycle/token accounting")
     verifier = evidence.get("verifier")
     if not isinstance(verifier, dict) or not verifier:
         fail(f"{label} has no verifier evidence")
@@ -169,9 +176,9 @@ def validate_mtp_timing(sample: dict, index: int) -> dict:
     if verifier_cycles != cycles:
         fail(f"{label} verifier cycle count differs from MTP cycles")
     if exact_nonnegative_int(
-            verifier.get("sequential", 0),
-            f"{label} sequential verifier cycles") <= 0:
-        fail(f"{label} did not observe the sequential verifier")
+            verifier.get("block", 0),
+            f"{label} block verifier cycles") <= 0:
+        fail(f"{label} did not observe the block verifier")
     if target_tokens != completion_tokens:
         fail(f"{label} target-token sum differs from successful completion tokens")
     return {
@@ -652,7 +659,7 @@ def render_markdown(results: list[dict], notes: list[str]) -> str:
             f"{mtp['ds4_mtp_cycles_median']:.0f} cycles, "
             f"{mtp['ds4_mtp_drafted_median']:.0f} drafted tokens, and "
             f"{mtp['ds4_mtp_accepted_median']:.0f} accepted draft tokens; "
-            "the sequential verifier covered the successful completion.",
+            "the block verifier covered the successful completion.",
         ])
     return "\n".join(lines) + "\n"
 

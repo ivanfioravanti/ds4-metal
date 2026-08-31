@@ -3377,6 +3377,28 @@ int ds4_gpu_qwen4_moe_q4_k_model(
         uint32_t              top_k,
         uint32_t              n_rows);
 
+/* Mixed low-bit routed experts. Gate/up are ordinary IQ2_XXS GGML blocks
+ * with logical shape [expert, 640, 2560]. Down is ordinary Q2_K with shape
+ * [expert, 2560, 768]; the logical activation width remains 640 and the
+ * 128-value physical alignment tail is supplied as zero. */
+int ds4_gpu_qwen4_moe_iq2_xxs_q2_k_model(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *selected_experts,
+        const ds4_gpu_tensor *selected_weights,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_weight_offset,
+        uint64_t              up_weight_offset,
+        uint64_t              down_weight_offset,
+        uint32_t              in_dim,
+        uint32_t              expert_dim,
+        uint32_t              out_dim,
+        uint32_t              n_experts,
+        uint32_t              top_k,
+        uint32_t              n_rows);
+
 int ds4_gpu_qwen4_shared_expert_add(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *routed,

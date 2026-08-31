@@ -32,6 +32,7 @@
 /tests/test_sampling
 /tests/test_glm53_kda
 /tests/test_qwen4_host
+/tests/test_qwen4_spec
 /tests/test_qwen4_metal
 *.o
 *.dSYM/

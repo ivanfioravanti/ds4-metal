@@ -7,9 +7,13 @@
 
 #define DS4_QWEN4_ARCHITECTURE "qwen4-exp"
 #define DS4_QWEN4_PLE_ARCHITECTURE "qwen4-exp-ple"
-#define DS4_QWEN4_PACK_MANIFEST_VERSION UINT32_C(3)
+#define DS4_QWEN4_PACK_VERSION_Q4 UINT32_C(3)
+#define DS4_QWEN4_PACK_VERSION_Q2 UINT32_C(4)
+#define DS4_QWEN4_PACK_MANIFEST_VERSION DS4_QWEN4_PACK_VERSION_Q2
+#define DS4_QWEN4_PACK_LATEST_VERSION DS4_QWEN4_PACK_MANIFEST_VERSION
 #define DS4_QWEN4_PACK_SCHEMA "ds4.qwen4.fast-pack"
 #define DS4_QWEN4_PACK_MANIFEST_FILE "qwen3.8-flash-next-q4.manifest.json"
+#define DS4_QWEN4_PACK_Q2_MANIFEST_FILE "qwen3.8-flash-next-q2.manifest.json"
 #define DS4_QWEN4_PACK_BASE_SHARDS 1u
 #define DS4_QWEN4_PACK_MAX_BASE_SHARDS DS4_QWEN4_PACK_BASE_SHARDS
 #define DS4_QWEN4_PACK_MAX_ARTIFACTS 4u
@@ -52,6 +56,10 @@ enum {
     DS4_QWEN4_NGRAM_HEADS = 16,
     DS4_QWEN4_NGRAM_MAX_SIZE = 8,
     DS4_QWEN4_NGRAM_MAX_HEADS = 32,
+    /* The CLI already caps speculative depth at 16.  Keep the Qwen graph's
+     * fixed verifier buffers on the same explicit ABI boundary instead of
+     * sizing them from the much larger prefill workspace. */
+    DS4_QWEN4_MTP_MAX_DRAFTS = 16,
     /* PLE resets n-gram history at the model-config EOS (<|endoftext|>),
      * while generation stops at the tokenizer EOS (<|im_end|>). */
     DS4_QWEN4_NGRAM_EOS = 248044,
@@ -75,7 +83,7 @@ enum {
     DS4_QWEN4_MROPE_T = 11,
     DS4_QWEN4_MROPE_H = 11,
     DS4_QWEN4_MROPE_W = 10,
-    /* Exact v3 GGUF tensor-directory cardinalities.  Tokenizer vocabulary
+    /* Exact v3/v4 GGUF tensor-directory cardinalities.  Tokenizer vocabulary
      * and merge tables are GGUF metadata and do not add tensor entries. */
     DS4_QWEN4_BASE_TENSOR_COUNT =
         1 + 25 * DS4_QWEN4_LAYERS + 6 + 3 + 1,
@@ -92,12 +100,71 @@ enum {
 #define DS4_QWEN4_NGRAM_VOCAB_DIVISOR UINT64_C(128)
 #define DS4_QWEN4_NGRAM_SEED UINT64_C(1234)
 
+/* v3 and v4 deliberately identify complete quantization contracts rather
+ * than accepting arbitrary per-tensor GGUF mixtures. */
+typedef enum {
+    DS4_QWEN4_PACK_PROFILE_INVALID = 0,
+    DS4_QWEN4_PACK_PROFILE_Q4_K = 1,
+    DS4_QWEN4_PACK_PROFILE_IQ2_XXS_Q2_K = 2,
+} ds4_qwen4_pack_profile;
+
+enum {
+    DS4_QWEN4_QTYPE_Q2_K = 10,
+    DS4_QWEN4_QTYPE_Q4_K = 12,
+    DS4_QWEN4_QTYPE_IQ2_XXS = 16,
+};
+
+bool ds4_qwen4_pack_profile_from_version(uint32_t version,
+                                         ds4_qwen4_pack_profile *out);
+const char *ds4_qwen4_pack_profile_name(ds4_qwen4_pack_profile profile);
+const char *ds4_qwen4_pack_manifest_file(ds4_qwen4_pack_profile profile);
+const char *ds4_qwen4_pack_routed_name(ds4_qwen4_pack_profile profile);
+const char *ds4_qwen4_pack_routed_gate_up_name(
+        ds4_qwen4_pack_profile profile);
+const char *ds4_qwen4_pack_routed_down_name(
+        ds4_qwen4_pack_profile profile);
+bool ds4_qwen4_pack_routed_metadata_valid(
+        ds4_qwen4_pack_profile profile,
+        const char *routed,
+        const char *routed_gate_up,
+        const char *routed_down,
+        char *error,
+        size_t error_cap);
+bool ds4_qwen4_pack_routed_qtypes_valid(
+        ds4_qwen4_pack_profile profile,
+        uint32_t gate_qtype,
+        uint32_t up_qtype,
+        uint32_t down_qtype,
+        char *error,
+        size_t error_cap);
+
 typedef enum {
     DS4_QWEN4_PREFILL_AUTO = 0,
     DS4_QWEN4_PREFILL_2048 = 2048,
     DS4_QWEN4_PREFILL_4096 = 4096,
     DS4_QWEN4_PREFILL_8192 = 8192,
 } ds4_qwen4_prefill_mode;
+
+typedef struct {
+    uint32_t proposed;
+    uint32_t accepted;
+    uint32_t rejected_at;
+    bool first_draft_matches;
+    bool full_accept;
+} ds4_qwen4_mtp_accept_plan;
+
+/* Build the greedy commit plan for one Qwen MTP block.  target_after_first
+ * verifies drafts[0] from the logits that already existed before the batched
+ * verifier.  verifier_tops[i] is the target token after drafts[i], so only
+ * entries [0, proposed-2] participate in accepting later drafts; the final
+ * row remains useful as the continuation logits on a full accept. */
+bool ds4_qwen4_mtp_plan_greedy(
+        const int32_t *drafts,
+        uint32_t proposed,
+        int32_t target_after_first,
+        const int32_t *verifier_tops,
+        uint32_t verifier_rows,
+        ds4_qwen4_mtp_accept_plan *plan);
 
 #define DS4_QWEN4_FAST_PATH_CAPS_VERSION UINT32_C(1)
 #define DS4_QWEN4_FAST_PATH_REASON_CAP 192u
@@ -109,13 +176,28 @@ typedef enum {
 #define DS4_QWEN4_FAST_DECODE_Q4        (UINT64_C(1) << 5)
 #define DS4_QWEN4_FAST_DECODE_Q8        (UINT64_C(1) << 6)
 #define DS4_QWEN4_FAST_PLE_STAGER       (UINT64_C(1) << 7)
-#define DS4_QWEN4_FAST_METAL_REQUIRED_MASK \
+#define DS4_QWEN4_FAST_EXACT_Q2_MOE     (UINT64_C(1) << 8)
+#define DS4_QWEN4_FAST_DECODE_Q2        (UINT64_C(1) << 9)
+#define DS4_QWEN4_FAST_METAL_COMMON_MASK \
+    (DS4_QWEN4_FAST_EXACT_Q8_PREFILL | DS4_QWEN4_FAST_GDN_R4 | \
+     DS4_QWEN4_FAST_QSA_STREAM_TOPK | DS4_QWEN4_FAST_QSA_M1 | \
+     DS4_QWEN4_FAST_DECODE_Q8)
+#define DS4_QWEN4_FAST_Q4_METAL_REQUIRED_MASK \
     (DS4_QWEN4_FAST_EXACT_Q8_PREFILL | DS4_QWEN4_FAST_EXACT_Q4_MOE | \
      DS4_QWEN4_FAST_GDN_R4 | DS4_QWEN4_FAST_QSA_STREAM_TOPK | \
      DS4_QWEN4_FAST_QSA_M1 | DS4_QWEN4_FAST_DECODE_Q4 | \
      DS4_QWEN4_FAST_DECODE_Q8)
+#define DS4_QWEN4_FAST_Q2_METAL_REQUIRED_MASK \
+    (DS4_QWEN4_FAST_METAL_COMMON_MASK | DS4_QWEN4_FAST_EXACT_Q2_MOE | \
+     DS4_QWEN4_FAST_DECODE_Q2)
+/* Compatibility aliases retain the v3/Q4 meaning. */
+#define DS4_QWEN4_FAST_METAL_REQUIRED_MASK \
+    DS4_QWEN4_FAST_Q4_METAL_REQUIRED_MASK
 #define DS4_QWEN4_FAST_REQUIRED_MASK \
-    (DS4_QWEN4_FAST_METAL_REQUIRED_MASK | DS4_QWEN4_FAST_PLE_STAGER)
+    (DS4_QWEN4_FAST_Q4_METAL_REQUIRED_MASK | DS4_QWEN4_FAST_PLE_STAGER)
+
+uint64_t ds4_qwen4_pack_fast_required_mask(
+        ds4_qwen4_pack_profile profile);
 
 typedef struct {
     uint32_t version;
@@ -153,6 +235,7 @@ typedef struct {
 
 typedef struct {
     uint32_t version;
+    ds4_qwen4_pack_profile profile;
     uint32_t base_shard_count;
     uint32_t artifact_count;
     char pack_id[DS4_QWEN4_PACK_ID_CAP];
@@ -211,6 +294,19 @@ bool ds4_qwen4_admit_prefill(ds4_qwen4_prefill_mode mode,
                              bool fast_path_complete,
                              const char *missing_fast_path,
                              uint64_t scratch_available,
+                             ds4_qwen4_prefill_admission *out,
+                             char *error,
+                             size_t error_cap);
+
+/* Variant used when an optional sidecar adds a row-scaled workspace, such as
+ * the Qwen MTP target-hidden capture.  Its bytes are part of the same startup
+ * admission decision and are reported in scratch_required. */
+bool ds4_qwen4_admit_prefill_with_extra(
+                             ds4_qwen4_prefill_mode mode,
+                             bool fast_path_complete,
+                             const char *missing_fast_path,
+                             uint64_t scratch_available,
+                             uint64_t extra_bytes_per_token,
                              ds4_qwen4_prefill_admission *out,
                              char *error,
                              size_t error_cap);
@@ -277,6 +373,7 @@ typedef struct {
     uint32_t block_size;
     uint32_t blocks_per_row;
     uint32_t row_bytes;
+    uint32_t pack_version;
     uint64_t data_offset;
     uint64_t identity_device;
     uint64_t identity_inode;
@@ -284,6 +381,8 @@ typedef struct {
     int64_t identity_mtime_nsec;
     int64_t identity_ctime_sec;
     int64_t identity_ctime_nsec;
+    char pack_id[DS4_QWEN4_PACK_ID_CAP];
+    char source_revision[DS4_QWEN4_PACK_ID_CAP];
     char sha256[65];
     bool validation_nocache_requested;
     bool validation_nocache_enabled;

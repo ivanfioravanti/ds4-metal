@@ -184,13 +184,14 @@ class Qwen4AcceptanceTests(unittest.TestCase):
                     row["mtp_timing"] = {
                         "schema": "ds4.qwen4.mtp-timing",
                         "version": 1,
-                        "cycles": 126 + sample,
+                        "cycles": 300 - sample,
                         "drafted": 300 + sample,
+                        "max_drafted": 4,
                         "accepted": 200 + sample,
                         "target_tokens": 500,
                         "cycle_ms": 900.0 + sample,
                         "verifier": {
-                            "sequential": 125 + sample,
+                            "block": 299 - sample,
                             "unlabeled": 1,
                         },
                     }
@@ -291,20 +292,39 @@ class Qwen4AcceptanceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "more tokens than it drafted"):
             validate(document)
 
-    def test_mtp_requires_sequential_verifier_evidence(self):
+    def test_mtp_maximum_draft_depth_is_enforced(self):
         document = copy.deepcopy(self.document())
         sample = next(row for row in document["cases"]
                       if row["name"] == "mtp-10k+500")["ds4"][0]
-        sample["mtp_timing"]["verifier"] = {"unlabeled": 126}
-        with self.assertRaisesRegex(ValueError, "sequential verifier"):
+        sample["mtp_timing"]["max_drafted"] = 5
+        with self.assertRaisesRegex(ValueError, "configured draft depth"):
+            validate(document)
+
+    def test_mtp_requires_block_verifier_evidence(self):
+        document = copy.deepcopy(self.document())
+        sample = next(row for row in document["cases"]
+                      if row["name"] == "mtp-10k+500")["ds4"][0]
+        sample["mtp_timing"]["verifier"] = {
+            "unlabeled": sample["mtp_timing"]["cycles"]
+        }
+        with self.assertRaisesRegex(ValueError, "block verifier"):
             validate(document)
 
     def test_mtp_target_sum_must_cover_successful_completion(self):
         document = copy.deepcopy(self.document())
         sample = next(row for row in document["cases"]
                       if row["name"] == "mtp-10k+500")["ds4"][0]
-        sample["mtp_timing"]["target_tokens"] = 499
+        sample["completion_tokens"] = 499
         with self.assertRaisesRegex(ValueError, "successful completion tokens"):
+            validate(document)
+
+    def test_mtp_cycle_token_accounting_must_be_consistent(self):
+        document = copy.deepcopy(self.document())
+        sample = next(row for row in document["cases"]
+                      if row["name"] == "mtp-10k+500")["ds4"][0]
+        sample["mtp_timing"]["cycles"] -= 1
+        sample["mtp_timing"]["verifier"]["block"] -= 1
+        with self.assertRaisesRegex(ValueError, "cycle/token accounting"):
             validate(document)
 
     def test_mtp_configuration_requires_draft_four_and_timing(self):

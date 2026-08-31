@@ -1,6 +1,7 @@
 // Qwen3.8-Flash-Next native kernels. Quantized matrices use the ordinary
-// GGML block payloads emitted by GGUF: Q8_0 for dense projections and Q4_K
-// for routed experts. Inputs, outputs, and recurrent state remain FP32.
+// GGML block payloads emitted by GGUF: Q8_0 for dense projections and either
+// Q4_K or mixed IQ2_XXS gate/up plus Q2_K down for routed experts. Inputs,
+// outputs, and recurrent state remain FP32.
 
 static inline float qwen4_bf16_to_f32(ushort value) {
     return as_type<float>((uint)value << 16);
@@ -924,6 +925,315 @@ kernel void kernel_qwen4_moe_map_rows8(
         work_items[work_base + tile] = uint2(expert, tile * 8u);
     if (expert + 1u == args.n_experts)
         work_count[0] = work_base + (uint)tile_counts[expert];
+}
+
+/* IQ2_XXS gate/up and Q2_K down rows use the ordinary GGML block payloads.
+ * Keep the IQ2 reduction order aligned with the established generic kernel:
+ * one lane owns a 32-value group, applies its block delta after the 32-value
+ * dot, then the SIMD group performs the final reduction and 1/4 scale. */
+static inline float2 qwen4_iq2_xxs_pair_dot(
+        device const block_iq2_xxs *gate_row,
+        device const block_iq2_xxs *up_row,
+        device const float *x,
+        uint logical_dim,
+        ushort lane) {
+    const uint groups32 = logical_dim / 32u;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    for (uint group32 = (uint)lane; group32 < groups32; group32 += 32u) {
+        const uint block = group32 / 8u;
+        const uint group = group32 & 7u;
+        device const block_iq2_xxs *gb = gate_row + block;
+        device const block_iq2_xxs *ub = up_row + block;
+        device const ushort *gq = gb->qs + 4u * group;
+        device const ushort *uq = ub->qs + 4u * group;
+        device const uchar *gaux = (device const uchar *)gq;
+        device const uchar *uaux = (device const uchar *)uq;
+        const uint gs = (uint)gq[2] | ((uint)gq[3] << 16u);
+        const uint us = (uint)uq[2] | ((uint)uq[3] << 16u);
+        const float gd = (float)gb->d * (0.5f + (float)(gs >> 28u));
+        const float ud = (float)ub->d * (0.5f + (float)(us >> 28u));
+        float gate_group = 0.0f;
+        float up_group = 0.0f;
+        const uint xbase = group32 * 32u;
+        for (uint sub = 0u; sub < 4u; sub++) {
+            constant const uchar *ggrid =
+                (constant const uchar *)(ds4_metal_iq2xxs_grid + gaux[sub]);
+            constant const uchar *ugrid =
+                (constant const uchar *)(ds4_metal_iq2xxs_grid + uaux[sub]);
+            const uchar gsign = ds4_metal_ksigns_iq2xs[
+                (gs >> (7u * sub)) & 127u];
+            const uchar usign = ds4_metal_ksigns_iq2xs[
+                (us >> (7u * sub)) & 127u];
+            for (uint j = 0u; j < 8u; j++) {
+                const float xv = x[xbase + sub * 8u + j];
+                const float gv = (float)ggrid[j] *
+                    ((gsign & ds4_metal_kmask_iq2xs[j]) ? -1.0f : 1.0f);
+                const float uv = (float)ugrid[j] *
+                    ((usign & ds4_metal_kmask_iq2xs[j]) ? -1.0f : 1.0f);
+                gate_group = fma(gv, xv, gate_group);
+                up_group = fma(uv, xv, up_group);
+            }
+        }
+        gate_sum = fma(gd, gate_group, gate_sum);
+        up_sum = fma(ud, up_group, up_sum);
+    }
+    return float2(simd_sum(gate_sum) * 0.25f,
+                  simd_sum(up_sum) * 0.25f);
+}
+
+static inline float qwen4_q2_k_dot(
+        device const block_q2_K *row,
+        device const float *x,
+        uint logical_dim,
+        ushort lane) {
+    float sum = 0.0f;
+    for (uint k = (uint)lane; k < logical_dim; k += 32u)
+        sum = fma(ds4_glm_q2_K_value(row, k), x[k], sum);
+    return simd_sum(sum);
+}
+
+kernel void kernel_qwen4_moe_iq2_xxs_gate_up_rows8(
+        constant qwen4_moe_args &args [[buffer(0)]],
+        device const block_iq2_xxs *gate_weight [[buffer(1)]],
+        device const block_iq2_xxs *up_weight [[buffer(2)]],
+        device const float *x [[buffer(3)]],
+        device const uint *counts [[buffer(4)]],
+        device const uint *hids [[buffer(5)]],
+        device const char *work [[buffer(6)]],
+        device float *mid [[buffer(7)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    device const uint *work_count = (device const uint *)work;
+    if (tgpig.x >= work_count[0]) return;
+    device const uint2 *work_items = (device const uint2 *)(work + 8);
+    const uint2 item = work_items[tgpig.x];
+    const uint expert = item.x;
+    const uint local0 = item.y;
+    const uint output = tgpig.y * (uint)nsg + (uint)sg;
+    if (expert >= args.n_experts || output >= args.expert_dim) return;
+
+    const uint valid = min(8u, counts[expert] - local0);
+    uint assignments[8];
+    uint tokens[8];
+    device const uint *expert_hids = hids + (ulong)expert * args.n_rows;
+    for (uint r = 0u; r < valid; r++) {
+        assignments[r] = expert_hids[local0 + r];
+        tokens[r] = assignments[r] / args.top_k;
+    }
+
+    const uint row_blocks = args.in_dim / 256u;
+    const ulong weight_row = (ulong)expert * args.expert_dim + output;
+    device const block_iq2_xxs *gwr = gate_weight + weight_row * row_blocks;
+    device const block_iq2_xxs *uwr = up_weight + weight_row * row_blocks;
+    float4 gate0 = 0.0f, gate1 = 0.0f;
+    float4 up0 = 0.0f, up1 = 0.0f;
+    const uint groups32 = args.in_dim / 32u;
+    for (uint group32 = (uint)lane; group32 < groups32; group32 += 32u) {
+        const uint block = group32 / 8u;
+        const uint group = group32 & 7u;
+        device const block_iq2_xxs *gb = gwr + block;
+        device const block_iq2_xxs *ub = uwr + block;
+        device const ushort *gq = gb->qs + 4u * group;
+        device const ushort *uq = ub->qs + 4u * group;
+        device const uchar *gaux = (device const uchar *)gq;
+        device const uchar *uaux = (device const uchar *)uq;
+        const uint gs = (uint)gq[2] | ((uint)gq[3] << 16u);
+        const uint us = (uint)uq[2] | ((uint)uq[3] << 16u);
+        const float gd = (float)gb->d * (0.5f + (float)(gs >> 28u));
+        const float ud = (float)ub->d * (0.5f + (float)(us >> 28u));
+        float4 gate_group0 = 0.0f, gate_group1 = 0.0f;
+        float4 up_group0 = 0.0f, up_group1 = 0.0f;
+        const uint xbase = group32 * 32u;
+        for (uint sub = 0u; sub < 4u; sub++) {
+            constant const uchar *ggrid =
+                (constant const uchar *)(ds4_metal_iq2xxs_grid + gaux[sub]);
+            constant const uchar *ugrid =
+                (constant const uchar *)(ds4_metal_iq2xxs_grid + uaux[sub]);
+            const uchar gsign = ds4_metal_ksigns_iq2xs[
+                (gs >> (7u * sub)) & 127u];
+            const uchar usign = ds4_metal_ksigns_iq2xs[
+                (us >> (7u * sub)) & 127u];
+            for (uint j = 0u; j < 8u; j++) {
+                const uint k = xbase + sub * 8u + j;
+                const float gv = (float)ggrid[j] *
+                    ((gsign & ds4_metal_kmask_iq2xs[j]) ? -1.0f : 1.0f);
+                const float uv = (float)ugrid[j] *
+                    ((usign & ds4_metal_kmask_iq2xs[j]) ? -1.0f : 1.0f);
+                for (uint r = 0u; r < valid; r++) {
+                    const float xv = x[(ulong)tokens[r] * args.in_dim + k];
+                    if (r < 4u) {
+                        gate_group0[r] = fma(gv, xv, gate_group0[r]);
+                        up_group0[r] = fma(uv, xv, up_group0[r]);
+                    } else {
+                        gate_group1[r - 4u] =
+                            fma(gv, xv, gate_group1[r - 4u]);
+                        up_group1[r - 4u] =
+                            fma(uv, xv, up_group1[r - 4u]);
+                    }
+                }
+            }
+        }
+        gate0 = fma(float4(gd), gate_group0, gate0);
+        gate1 = fma(float4(gd), gate_group1, gate1);
+        up0 = fma(float4(ud), up_group0, up0);
+        up1 = fma(float4(ud), up_group1, up1);
+    }
+    for (uint r = 0u; r < valid; r++) {
+        const float gate =
+            simd_sum(r < 4u ? gate0[r] : gate1[r - 4u]) * 0.25f;
+        const float up =
+            simd_sum(r < 4u ? up0[r] : up1[r - 4u]) * 0.25f;
+        if (lane == 0u)
+            mid[(ulong)assignments[r] * args.expert_dim + output] =
+                (gate / (1.0f + exp(-gate))) * up;
+    }
+}
+
+kernel void kernel_qwen4_moe_q2_k_down_rows8(
+        constant qwen4_moe_args &args [[buffer(0)]],
+        device const block_q2_K *down_weight [[buffer(1)]],
+        device const float *mid [[buffer(2)]],
+        device const uint *counts [[buffer(3)]],
+        device const uint *hids [[buffer(4)]],
+        device const char *work [[buffer(5)]],
+        device float *contributions [[buffer(6)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    device const uint *work_count = (device const uint *)work;
+    if (tgpig.x >= work_count[0]) return;
+    device const uint2 *work_items = (device const uint2 *)(work + 8);
+    const uint2 item = work_items[tgpig.x];
+    const uint expert = item.x;
+    const uint local0 = item.y;
+    const uint output = tgpig.y * (uint)nsg + (uint)sg;
+    if (expert >= args.n_experts || output >= args.out_dim) return;
+    const uint valid = min(8u, counts[expert] - local0);
+    uint assignments[8];
+    device const uint *expert_hids = hids + (ulong)expert * args.n_rows;
+    for (uint r = 0u; r < valid; r++) assignments[r] = expert_hids[local0 + r];
+
+    const uint row_blocks = args.down_dim / 256u;
+    const ulong weight_row = (ulong)expert * args.out_dim + output;
+    device const block_q2_K *wr = down_weight + weight_row * row_blocks;
+    float4 sum0 = 0.0f, sum1 = 0.0f;
+    /* k=[640,768) is the physical Q2_K alignment tail and is exactly zero. */
+    for (uint k = (uint)lane; k < args.expert_dim; k += 32u) {
+        const float w = ds4_glm_q2_K_value(wr, k);
+        for (uint r = 0u; r < valid; r++) {
+            const float xv = mid[(ulong)assignments[r] * args.expert_dim + k];
+            if (r < 4u) sum0[r] = fma(w, xv, sum0[r]);
+            else sum1[r - 4u] = fma(w, xv, sum1[r - 4u]);
+        }
+    }
+    for (uint r = 0u; r < valid; r++) {
+        const float sum = simd_sum(r < 4u ? sum0[r] : sum1[r - 4u]);
+        if (lane == 0u)
+            contributions[(ulong)assignments[r] * args.out_dim + output] = sum;
+    }
+}
+
+kernel void kernel_qwen4_moe_iq2_xxs_gate_up(
+        constant qwen4_moe_args &args [[buffer(0)]],
+        device const block_iq2_xxs *gate_weight [[buffer(1)]],
+        device const block_iq2_xxs *up_weight [[buffer(2)]],
+        device const float *x [[buffer(3)]],
+        device const int *selected [[buffer(4)]],
+        device float *mid [[buffer(5)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    const uint output = tgpig.x * (uint)nsg + (uint)sg;
+    const uint row = tgpig.y;
+    const uint slot = tgpig.z;
+    if (output >= args.expert_dim || row >= args.n_rows || slot >= args.top_k) return;
+    const ulong assignment = (ulong)row * args.top_k + slot;
+    const int expert = selected[assignment];
+    if (expert < 0 || (uint)expert >= args.n_experts) return;
+    const uint row_blocks = args.in_dim / 256u;
+    const ulong weight_row = (ulong)(uint)expert * args.expert_dim + output;
+    const float2 pair = qwen4_iq2_xxs_pair_dot(
+        gate_weight + weight_row * row_blocks,
+        up_weight + weight_row * row_blocks,
+        x + (ulong)row * args.in_dim, args.in_dim, lane);
+    if (lane == 0u)
+        mid[assignment * args.expert_dim + output] =
+            (pair.x / (1.0f + exp(-pair.x))) * pair.y;
+}
+
+kernel void kernel_qwen4_moe_q2_k_down(
+        constant qwen4_moe_args &args [[buffer(0)]],
+        device const block_q2_K *down_weight [[buffer(1)]],
+        device const float *mid [[buffer(2)]],
+        device const int *selected [[buffer(3)]],
+        device const float *selected_weights [[buffer(4)]],
+        device float *out [[buffer(5)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    const uint output = tgpig.x * (uint)nsg + (uint)sg;
+    const uint row = tgpig.y;
+    if (output >= args.out_dim || row >= args.n_rows) return;
+    const uint row_blocks = args.down_dim / 256u;
+    float total = 0.0f;
+    for (uint slot = 0u; slot < args.top_k; slot++) {
+        const ulong assignment = (ulong)row * args.top_k + slot;
+        const int expert = selected[assignment];
+        if (expert < 0 || (uint)expert >= args.n_experts) continue;
+        const ulong weight_row = (ulong)(uint)expert * args.out_dim + output;
+        const float sum = qwen4_q2_k_dot(
+            down_weight + weight_row * row_blocks,
+            mid + assignment * args.expert_dim,
+            args.expert_dim, lane);
+        total = fma(sum, selected_weights[assignment], total);
+    }
+    if (lane == 0u) out[(ulong)row * args.out_dim + output] = total;
+}
+
+kernel void kernel_qwen4_moe_q2_k_down_split(
+        constant qwen4_moe_args &args [[buffer(0)]],
+        device const block_q2_K *down_weight [[buffer(1)]],
+        device const float *mid [[buffer(2)]],
+        device const int *selected [[buffer(3)]],
+        device const float *selected_weights [[buffer(4)]],
+        device float *out [[buffer(5)]],
+        threadgroup float *partials [[threadgroup(0)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint output = tgpig.x;
+    const uint row = tgpig.y;
+    if (sg < args.top_k) {
+        const ulong assignment = (ulong)row * args.top_k + (uint)sg;
+        const int expert = selected[assignment];
+        float sum = 0.0f;
+        if (output < args.out_dim && row < args.n_rows &&
+            expert >= 0 && (uint)expert < args.n_experts) {
+            const uint row_blocks = args.down_dim / 256u;
+            const ulong weight_row = (ulong)(uint)expert * args.out_dim + output;
+            sum = qwen4_q2_k_dot(
+                down_weight + weight_row * row_blocks,
+                mid + assignment * args.expert_dim,
+                args.expert_dim, lane);
+        }
+        if (lane == 0u) partials[sg] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u && output < args.out_dim && row < args.n_rows) {
+        float total = 0.0f;
+        for (uint slot = 0u; slot < args.top_k; slot++) {
+            const ulong assignment = (ulong)row * args.top_k + slot;
+            total = fma(partials[slot], selected_weights[assignment], total);
+        }
+        out[(ulong)row * args.out_dim + output] = total;
+    }
 }
 
 /* Q4_K expert rows use the same GGML decoder as the established GLM path.

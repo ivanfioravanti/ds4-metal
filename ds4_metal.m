@@ -45702,6 +45702,43 @@ int ds4_gpu_qwen4_query_fast_path_caps(ds4_qwen4_fast_path_caps *caps) {
             caps, DS4_QWEN4_FAST_EXACT_Q4_MOE,
             "exact expert-major Q4 MoE", ready, missing);
 
+        static const char *const moe_exact_q2_pipelines[] = {
+            "kernel_qwen4_moe_map_rows8",
+            "kernel_qwen4_moe_iq2_xxs_gate_up_rows8",
+            "kernel_qwen4_moe_q2_k_down_rows8",
+            "kernel_qwen4_moe_weighted_sum10_f32",
+        };
+        ready = exact_moe_min != 0u && exact_moe_min <= 8192u &&
+            ds4_gpu_qwen4_cap_group(
+                moe_exact_q2_pipelines,
+                sizeof(moe_exact_q2_pipelines) /
+                    sizeof(moe_exact_q2_pipelines[0]),
+                &missing);
+        if (ready) {
+            id<MTLComputePipelineState> map =
+                ds4_gpu_qwen4_cap_pipeline(moe_exact_q2_pipelines[0]);
+            id<MTLComputePipelineState> gate_up =
+                ds4_gpu_qwen4_cap_pipeline(moe_exact_q2_pipelines[1]);
+            id<MTLComputePipelineState> down =
+                ds4_gpu_qwen4_cap_pipeline(moe_exact_q2_pipelines[2]);
+            id<MTLComputePipelineState> sum =
+                ds4_gpu_qwen4_cap_pipeline(moe_exact_q2_pipelines[3]);
+            ready = map.maxTotalThreadsPerThreadgroup >=
+                        DS4_QWEN4_EXPERTS &&
+                    gate_up.maxTotalThreadsPerThreadgroup >= 128u &&
+                    down.maxTotalThreadsPerThreadgroup >= 256u &&
+                    sum.maxTotalThreadsPerThreadgroup >= 256u &&
+                    g_device.maxThreadgroupMemoryLength >=
+                        (NSUInteger)DS4_QWEN4_EXPERTS *
+                        DS4_QWEN4_EXPERTS_USED * sizeof(int32_t);
+            if (!ready) missing = "insufficient Metal MoE limits";
+        } else if (!missing) {
+            missing = "DS4_QWEN4_MOE_EXACT_MIN_ROWS disables 8K rows8";
+        }
+        ds4_gpu_qwen4_cap_note(
+            caps, DS4_QWEN4_FAST_EXACT_Q2_MOE,
+            "exact expert-major IQ2_XXS/Q2_K MoE", ready, missing);
+
         static const char *const gdn_pipelines[] = {
             "kernel_qwen4_gdn_conv_split_f32",
             "kernel_qwen4_gdn_qk_l2norm_f32",
@@ -45777,6 +45814,22 @@ int ds4_gpu_qwen4_query_fast_path_caps(ds4_qwen4_fast_path_caps *caps) {
             caps, DS4_QWEN4_FAST_DECODE_Q4,
             "Q4 M=1 decode", ready, missing);
 
+        const char *decode_q2_down = moe_down_mode && !strcmp(moe_down_mode, "0")
+            ? "kernel_qwen4_moe_q2_k_down"
+            : "kernel_qwen4_moe_q2_k_down_split";
+        const char *decode_q2_pipelines[] = {
+            "kernel_qwen4_moe_topk_f32",
+            "kernel_qwen4_moe_iq2_xxs_gate_up",
+            decode_q2_down,
+        };
+        ready = ds4_gpu_qwen4_cap_group(
+            decode_q2_pipelines,
+            sizeof(decode_q2_pipelines) / sizeof(decode_q2_pipelines[0]),
+            &missing);
+        ds4_gpu_qwen4_cap_note(
+            caps, DS4_QWEN4_FAST_DECODE_Q2,
+            "IQ2_XXS/Q2_K M=1 decode", ready, missing);
+
         const char *decode_q8_pipelines[] = {
             "kernel_qwen4_q8_0_f32_m1",
             "kernel_qwen4_q8_0_f32_m1_silu",
@@ -45795,7 +45848,13 @@ int ds4_gpu_qwen4_query_fast_path_caps(ds4_qwen4_fast_path_caps *caps) {
             "Q8 M=1 decode", ready, missing);
     }
     caps->missing_mask = caps->required_mask & ~caps->available_mask;
-    if (!caps->missing_mask) caps->missing_reason[0] = '\0';
+    const uint64_t all_profile_metal =
+        DS4_QWEN4_FAST_Q4_METAL_REQUIRED_MASK |
+        DS4_QWEN4_FAST_Q2_METAL_REQUIRED_MASK;
+    if (!caps->missing_mask &&
+        (caps->available_mask & all_profile_metal) == all_profile_metal) {
+        caps->missing_reason[0] = '\0';
+    }
     return 1;
 }
 
@@ -46880,12 +46939,38 @@ static int ds4_gpu_qwen4_q4_k_tensor_bytes(
            glm53_gpu_mul_u64(rows, row_bytes, bytes);
 }
 
+static int ds4_gpu_qwen4_iq2_xxs_tensor_bytes(
+        uint32_t n_experts,
+        uint32_t out_dim,
+        uint32_t physical_in_dim,
+        uint64_t *bytes) {
+    if (!bytes || n_experts == 0u || out_dim == 0u ||
+        physical_in_dim == 0u || (physical_in_dim % 256u) != 0u) return 0;
+    const uint64_t row_bytes = (uint64_t)(physical_in_dim / 256u) * 66u;
+    uint64_t rows = 0;
+    return glm53_gpu_mul_u64(n_experts, out_dim, &rows) &&
+           glm53_gpu_mul_u64(rows, row_bytes, bytes);
+}
+
+static int ds4_gpu_qwen4_q2_k_tensor_bytes(
+        uint32_t n_experts,
+        uint32_t out_dim,
+        uint32_t physical_in_dim,
+        uint64_t *bytes) {
+    if (!bytes || n_experts == 0u || out_dim == 0u ||
+        physical_in_dim == 0u || (physical_in_dim % 256u) != 0u) return 0;
+    const uint64_t row_bytes = (uint64_t)(physical_in_dim / 256u) * 84u;
+    uint64_t rows = 0;
+    return glm53_gpu_mul_u64(n_experts, out_dim, &rows) &&
+           glm53_gpu_mul_u64(rows, row_bytes, bytes);
+}
+
 enum {
     DS4_QWEN4_MOE_EXACT_TILE_ROWS = 512u,
     DS4_QWEN4_MOE_EXACT_BLOCK_ROWS = 8u,
 };
 
-static int ds4_gpu_qwen4_use_exact_moe_q4_k(
+static int ds4_gpu_qwen4_use_exact_moe_rows8(
         uint32_t n_rows,
         uint32_t n_experts,
         uint32_t top_k) {
@@ -46895,7 +46980,7 @@ static int ds4_gpu_qwen4_use_exact_moe_q4_k(
            n_experts <= 512u && top_k == 10u;
 }
 
-static int ds4_gpu_qwen4_try_exact_moe_q4_k(
+static int ds4_gpu_qwen4_try_exact_moe_rows8(
         id<MTLBuffer> const weight_buffer[3],
         const uint64_t weight_inner[3],
         id<MTLBuffer> x_buffer,
@@ -46915,11 +47000,19 @@ static int ds4_gpu_qwen4_try_exact_moe_q4_k(
         uint32_t n_experts,
         uint32_t top_k,
         uint32_t n_rows,
+        const char *gate_up_kernel_name,
+        const char *down_kernel_name,
+        NSString *encoder_label,
+        NSString *gate_up_signpost,
+        NSString *down_signpost,
+        const char *finish_label,
         int *handled) {
     if (handled) *handled = 0;
     if (!weight_buffer || !weight_inner || !x_buffer || !selected_buffer ||
         !selected_weights_buffer || !mid_buffer || !out_buffer || !handled ||
-        n_rows == 0u || n_experts == 0u || top_k != 10u || out_dim == 0u)
+        n_rows == 0u || n_experts == 0u || top_k != 10u || out_dim == 0u ||
+        !gate_up_kernel_name || !down_kernel_name || !encoder_label ||
+        !gate_up_signpost || !down_signpost || !finish_label)
         return 0;
     for (uint32_t i = 0u; i < 3u; i++)
         if (!weight_buffer[i] || weight_inner[i] > NSUIntegerMax) return 0;
@@ -46927,9 +47020,9 @@ static int ds4_gpu_qwen4_try_exact_moe_q4_k(
     id<MTLComputePipelineState> map_pipeline = ds4_gpu_get_pipeline(
         "kernel_qwen4_moe_map_rows8");
     id<MTLComputePipelineState> gate_up_pipeline = ds4_gpu_get_pipeline(
-        "kernel_qwen4_moe_q4_k_gate_up_rows8");
+        gate_up_kernel_name);
     id<MTLComputePipelineState> down_pipeline = ds4_gpu_get_pipeline(
-        "kernel_qwen4_moe_q4_k_down_rows8");
+        down_kernel_name);
     id<MTLComputePipelineState> sum_pipeline = ds4_gpu_get_pipeline(
         "kernel_qwen4_moe_weighted_sum10_f32");
     if (!map_pipeline || !gate_up_pipeline || !down_pipeline || !sum_pipeline ||
@@ -46955,11 +47048,11 @@ static int ds4_gpu_qwen4_try_exact_moe_q4_k(
     if (map_bytes64 > NSUIntegerMax || contribution_bytes64 > NSUIntegerMax ||
         !ds4_gpu_ensure_scratch_buffer(
             &g_moe_id_map_buffer, &g_moe_id_map_bytes,
-            (NSUInteger)map_bytes64, "ds4_qwen4_moe_q4_k_map") ||
+            (NSUInteger)map_bytes64, "ds4_qwen4_moe_rows8_map") ||
         !ds4_gpu_ensure_scratch_buffer(
             &g_moe_down_scratch_buffer, &g_moe_down_scratch_bytes,
             (NSUInteger)contribution_bytes64,
-            "ds4_qwen4_moe_q4_k_contributions")) return 0;
+            "ds4_qwen4_moe_rows8_contributions")) return 0;
 
     int owned = 0;
     id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -46967,8 +47060,8 @@ static int ds4_gpu_qwen4_try_exact_moe_q4_k(
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
     if (!enc) return 0;
     *handled = 1;
-    enc.label = @"Qwen exact expert-major Q4_K MoE rows8";
-    [enc pushDebugGroup:@"Qwen exact expert-major Q4_K MoE rows8"];
+    enc.label = encoder_label;
+    [enc pushDebugGroup:encoder_label];
     ds4_gpu_qwen4_moe_args args = {
         .n_experts = n_experts,
         .top_k = top_k,
@@ -47010,7 +47103,7 @@ static int ds4_gpu_qwen4_try_exact_moe_q4_k(
         id<MTLResource> map_barrier[] = {g_moe_id_map_buffer};
         [enc memoryBarrierWithResources:map_barrier count:1u];
 
-        [enc insertDebugSignpost:@"Qwen MoE exact rows8 Q4_K gate/up"];
+        [enc insertDebugSignpost:gate_up_signpost];
         [enc setComputePipelineState:gate_up_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:weight_buffer[0] offset:(NSUInteger)weight_inner[0] atIndex:1];
@@ -47030,7 +47123,7 @@ static int ds4_gpu_qwen4_try_exact_moe_q4_k(
         id<MTLResource> mid_barrier[] = {mid_buffer};
         [enc memoryBarrierWithResources:mid_barrier count:1u];
 
-        [enc insertDebugSignpost:@"Qwen MoE exact rows8 Q4_K down"];
+        [enc insertDebugSignpost:down_signpost];
         [enc setComputePipelineState:down_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:weight_buffer[2] offset:(NSUInteger)weight_inner[2] atIndex:1];
@@ -47069,8 +47162,7 @@ static int ds4_gpu_qwen4_try_exact_moe_q4_k(
     }
     [enc popDebugGroup];
     ds4_gpu_end_compute_encoder(cb, enc);
-    return ds4_gpu_finish_command_buffer(
-        cb, owned, "Qwen exact expert-major Q4_K MoE rows8");
+    return ds4_gpu_finish_command_buffer(cb, owned, finish_label);
 }
 
 int ds4_gpu_qwen4_moe_q4_k_model(
@@ -47124,9 +47216,9 @@ int ds4_gpu_qwen4_moe_q4_k_model(
                 down_weight_offset, down_bytes, &inner[2]),
         };
         if (!buffer[0] || !buffer[1] || !buffer[2]) return 0;
-        if (ds4_gpu_qwen4_use_exact_moe_q4_k(n_rows, n_experts, top_k)) {
+        if (ds4_gpu_qwen4_use_exact_moe_rows8(n_rows, n_experts, top_k)) {
             int handled = 0;
-            const int fast_ok = ds4_gpu_qwen4_try_exact_moe_q4_k(
+            const int fast_ok = ds4_gpu_qwen4_try_exact_moe_rows8(
                 buffer, inner,
                 ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x),
                 ds4_gpu_tensor_buffer(selected_experts),
@@ -47136,7 +47228,14 @@ int ds4_gpu_qwen4_moe_q4_k_model(
                 ds4_gpu_tensor_buffer(mid), ds4_gpu_tensor_offset(mid),
                 ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out),
                 in_dim, expert_dim, down_dim, out_dim,
-                n_experts, top_k, n_rows, &handled);
+                n_experts, top_k, n_rows,
+                "kernel_qwen4_moe_q4_k_gate_up_rows8",
+                "kernel_qwen4_moe_q4_k_down_rows8",
+                @"Qwen exact expert-major Q4_K MoE rows8",
+                @"Qwen MoE exact rows8 Q4_K gate/up",
+                @"Qwen MoE exact rows8 Q4_K down",
+                "Qwen exact expert-major Q4_K MoE rows8",
+                &handled);
             if (handled) return fast_ok;
         }
 
@@ -47202,6 +47301,146 @@ int ds4_gpu_qwen4_moe_q4_k_model(
                  split_down ? top_k * 32u : 256u, 1u, 1u)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "Qwen routed Q4_K experts");
+    }
+}
+
+int ds4_gpu_qwen4_moe_iq2_xxs_q2_k_model(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *selected_experts,
+        const ds4_gpu_tensor *selected_weights,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_weight_offset,
+        uint64_t              up_weight_offset,
+        uint64_t              down_weight_offset,
+        uint32_t              in_dim,
+        uint32_t              expert_dim,
+        uint32_t              out_dim,
+        uint32_t              n_experts,
+        uint32_t              top_k,
+        uint32_t              n_rows) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint32_t down_dim = (expert_dim + 255u) & ~255u;
+    uint64_t gate_bytes = 0, down_bytes = 0;
+    const uint64_t mid_elements = (uint64_t)n_rows * top_k * expert_dim;
+    if (!out || !mid || !x || !selected_experts || !selected_weights ||
+        !model_map || n_rows == 0u || top_k == 0u || top_k > 16u ||
+        top_k > n_experts || (in_dim % 256u) != 0u ||
+        !ds4_gpu_qwen4_iq2_xxs_tensor_bytes(
+            n_experts, expert_dim, in_dim, &gate_bytes) ||
+        !ds4_gpu_qwen4_q2_k_tensor_bytes(
+            n_experts, out_dim, down_dim, &down_bytes) ||
+        !glm53_gpu_tensor_has(x, (uint64_t)n_rows * in_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(mid, mid_elements, sizeof(float)) ||
+        !glm53_gpu_tensor_has(out, (uint64_t)n_rows * out_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(selected_experts,
+                              (uint64_t)n_rows * top_k, sizeof(int32_t)) ||
+        !glm53_gpu_tensor_has(selected_weights,
+                              (uint64_t)n_rows * top_k, sizeof(float))) {
+        fprintf(stderr,
+                "ds4: Qwen IQ2_XXS/Q2_K MoE received invalid geometry or buffers\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        uint64_t inner[3] = {0};
+        id<MTLBuffer> buffer[3] = {
+            ds4_gpu_wrap_model_range(model_map, model_size,
+                gate_weight_offset, gate_bytes, &inner[0]),
+            ds4_gpu_wrap_model_range(model_map, model_size,
+                up_weight_offset, gate_bytes, &inner[1]),
+            ds4_gpu_wrap_model_range(model_map, model_size,
+                down_weight_offset, down_bytes, &inner[2]),
+        };
+        if (!buffer[0] || !buffer[1] || !buffer[2]) return 0;
+        if (ds4_gpu_qwen4_use_exact_moe_rows8(n_rows, n_experts, top_k)) {
+            int handled = 0;
+            const int fast_ok = ds4_gpu_qwen4_try_exact_moe_rows8(
+                buffer, inner,
+                ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x),
+                ds4_gpu_tensor_buffer(selected_experts),
+                ds4_gpu_tensor_offset(selected_experts),
+                ds4_gpu_tensor_buffer(selected_weights),
+                ds4_gpu_tensor_offset(selected_weights),
+                ds4_gpu_tensor_buffer(mid), ds4_gpu_tensor_offset(mid),
+                ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out),
+                in_dim, expert_dim, down_dim, out_dim,
+                n_experts, top_k, n_rows,
+                "kernel_qwen4_moe_iq2_xxs_gate_up_rows8",
+                "kernel_qwen4_moe_q2_k_down_rows8",
+                @"Qwen exact expert-major IQ2_XXS/Q2_K MoE rows8",
+                @"Qwen MoE exact rows8 IQ2_XXS gate/up",
+                @"Qwen MoE exact rows8 Q2_K down",
+                "Qwen exact expert-major IQ2_XXS/Q2_K MoE rows8",
+                &handled);
+            if (handled) return fast_ok;
+        }
+
+        id<MTLComputePipelineState> gate_up_pipeline = ds4_gpu_get_pipeline(
+            "kernel_qwen4_moe_iq2_xxs_gate_up");
+        const char *raw_split = getenv("DS4_QWEN4_MOE_DOWN_SPLIT");
+        const int split_down = n_rows == 1u &&
+            !(raw_split && strcmp(raw_split, "0") == 0);
+        id<MTLComputePipelineState> down_pipeline = ds4_gpu_get_pipeline(
+            split_down ? "kernel_qwen4_moe_q2_k_down_split"
+                       : "kernel_qwen4_moe_q2_k_down");
+        if (!gate_up_pipeline || !down_pipeline) return 0;
+        ds4_gpu_qwen4_moe_args args = {
+            .n_rows = n_rows,
+            .n_experts = n_experts,
+            .top_k = top_k,
+            .in_dim = in_dim,
+            .expert_dim = expert_dim,
+            .out_dim = out_dim,
+            .down_dim = down_dim,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        enc.label = @"Qwen routed IQ2_XXS experts gate/up";
+        [enc setComputePipelineState:gate_up_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:buffer[0] offset:(NSUInteger)inner[0] atIndex:1];
+        [enc setBuffer:buffer[1] offset:(NSUInteger)inner[1] atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x)
+                offset:ds4_gpu_tensor_offset(x) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(selected_experts)
+                offset:ds4_gpu_tensor_offset(selected_experts) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(mid)
+                offset:ds4_gpu_tensor_offset(mid) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((expert_dim + 3u) / 4u,
+                                              n_rows, top_k)
+             threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        enc.label = @"Qwen routed Q2_K experts down";
+        [enc setComputePipelineState:down_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:buffer[2] offset:(NSUInteger)inner[2] atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(mid)
+                offset:ds4_gpu_tensor_offset(mid) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(selected_experts)
+                offset:ds4_gpu_tensor_offset(selected_experts) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(selected_weights)
+                offset:ds4_gpu_tensor_offset(selected_weights) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:5];
+        if (split_down)
+            [enc setThreadgroupMemoryLength:top_k * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(
+                 split_down ? out_dim : (out_dim + 7u) / 8u,
+                 n_rows, 1u)
+             threadsPerThreadgroup:MTLSizeMake(
+                 split_down ? top_k * 32u : 256u, 1u, 1u)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(
+            cb, owned, "Qwen routed IQ2_XXS/Q2_K experts");
     }
 }
 

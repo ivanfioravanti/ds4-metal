@@ -14,12 +14,196 @@
 #include <time.h>
 #include <unistd.h>
 
+bool ds4_qwen4_mtp_plan_greedy(
+        const int32_t *drafts,
+        uint32_t proposed,
+        int32_t target_after_first,
+        const int32_t *verifier_tops,
+        uint32_t verifier_rows,
+        ds4_qwen4_mtp_accept_plan *plan) {
+    if (!plan) return false;
+    memset(plan, 0, sizeof(*plan));
+    if (!drafts || proposed == 0u ||
+        proposed > DS4_QWEN4_MTP_MAX_DRAFTS ||
+        verifier_rows != proposed ||
+        (proposed > 1u && !verifier_tops)) return false;
+
+    plan->proposed = proposed;
+    plan->rejected_at = 0u;
+    if (drafts[0] != target_after_first) return true;
+
+    plan->first_draft_matches = true;
+    plan->accepted = 1u;
+    while (plan->accepted < proposed) {
+        const uint32_t next = plan->accepted;
+        if (verifier_tops[next - 1u] != drafts[next]) {
+            plan->rejected_at = next;
+            return true;
+        }
+        plan->accepted++;
+    }
+    plan->rejected_at = proposed;
+    plan->full_accept = true;
+    return true;
+}
+
 static void qwen4_error(char *out, size_t cap, const char *fmt, ...) {
     if (!out || cap == 0) return;
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(out, cap, fmt, ap);
     va_end(ap);
+}
+
+bool ds4_qwen4_pack_profile_from_version(uint32_t version,
+                                         ds4_qwen4_pack_profile *out) {
+    ds4_qwen4_pack_profile profile = DS4_QWEN4_PACK_PROFILE_INVALID;
+    if (version == DS4_QWEN4_PACK_VERSION_Q4) {
+        profile = DS4_QWEN4_PACK_PROFILE_Q4_K;
+    } else if (version == DS4_QWEN4_PACK_VERSION_Q2) {
+        profile = DS4_QWEN4_PACK_PROFILE_IQ2_XXS_Q2_K;
+    }
+    if (out) *out = profile;
+    return profile != DS4_QWEN4_PACK_PROFILE_INVALID;
+}
+
+const char *ds4_qwen4_pack_profile_name(ds4_qwen4_pack_profile profile) {
+    switch (profile) {
+        case DS4_QWEN4_PACK_PROFILE_Q4_K: return "q4_k";
+        case DS4_QWEN4_PACK_PROFILE_IQ2_XXS_Q2_K:
+            return "iq2_xxs_gate_up_q2_k_down";
+        default: return "invalid";
+    }
+}
+
+const char *ds4_qwen4_pack_manifest_file(ds4_qwen4_pack_profile profile) {
+    switch (profile) {
+        case DS4_QWEN4_PACK_PROFILE_Q4_K:
+            return DS4_QWEN4_PACK_MANIFEST_FILE;
+        case DS4_QWEN4_PACK_PROFILE_IQ2_XXS_Q2_K:
+            return DS4_QWEN4_PACK_Q2_MANIFEST_FILE;
+        default: return NULL;
+    }
+}
+
+const char *ds4_qwen4_pack_routed_name(ds4_qwen4_pack_profile profile) {
+    switch (profile) {
+        case DS4_QWEN4_PACK_PROFILE_Q4_K: return "Q4_K";
+        case DS4_QWEN4_PACK_PROFILE_IQ2_XXS_Q2_K: return "mixed-q2";
+        default: return NULL;
+    }
+}
+
+const char *ds4_qwen4_pack_routed_gate_up_name(
+        ds4_qwen4_pack_profile profile) {
+    switch (profile) {
+        case DS4_QWEN4_PACK_PROFILE_Q4_K: return "Q4_K";
+        case DS4_QWEN4_PACK_PROFILE_IQ2_XXS_Q2_K: return "IQ2_XXS";
+        default: return NULL;
+    }
+}
+
+const char *ds4_qwen4_pack_routed_down_name(
+        ds4_qwen4_pack_profile profile) {
+    switch (profile) {
+        case DS4_QWEN4_PACK_PROFILE_Q4_K: return "Q4_K";
+        case DS4_QWEN4_PACK_PROFILE_IQ2_XXS_Q2_K: return "Q2_K";
+        default: return NULL;
+    }
+}
+
+bool ds4_qwen4_pack_routed_metadata_valid(
+        ds4_qwen4_pack_profile profile,
+        const char *routed,
+        const char *routed_gate_up,
+        const char *routed_down,
+        char *error,
+        size_t error_cap) {
+    const char *expected_routed = ds4_qwen4_pack_routed_name(profile);
+    const char *expected_gate_up =
+        ds4_qwen4_pack_routed_gate_up_name(profile);
+    const char *expected_down = ds4_qwen4_pack_routed_down_name(profile);
+    if (!expected_routed || !expected_gate_up || !expected_down) {
+        qwen4_error(error, error_cap, "unsupported Qwen quantization profile");
+        return false;
+    }
+    if (!routed || strcmp(routed, expected_routed) != 0) {
+        qwen4_error(error, error_cap,
+                    "Qwen %s metadata routed=%s; expected %s",
+                    ds4_qwen4_pack_profile_name(profile),
+                    routed ? routed : "(missing)", expected_routed);
+        return false;
+    }
+    if (profile == DS4_QWEN4_PACK_PROFILE_IQ2_XXS_Q2_K) {
+        if (!routed_gate_up || strcmp(routed_gate_up, expected_gate_up) != 0 ||
+            !routed_down || strcmp(routed_down, expected_down) != 0) {
+            qwen4_error(error, error_cap,
+                        "Qwen %s metadata gate_up/down=%s/%s; expected %s/%s",
+                        ds4_qwen4_pack_profile_name(profile),
+                        routed_gate_up ? routed_gate_up : "(missing)",
+                        routed_down ? routed_down : "(missing)",
+                        expected_gate_up, expected_down);
+            return false;
+        }
+    } else {
+        if ((routed_gate_up && strcmp(routed_gate_up, expected_gate_up) != 0) ||
+            (routed_down && strcmp(routed_down, expected_down) != 0)) {
+            qwen4_error(error, error_cap,
+                        "Qwen q4_k metadata contains a conflicting routed "
+                        "gate_up/down override");
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ds4_qwen4_pack_routed_qtypes_valid(
+        ds4_qwen4_pack_profile profile,
+        uint32_t gate_qtype,
+        uint32_t up_qtype,
+        uint32_t down_qtype,
+        char *error,
+        size_t error_cap) {
+    uint32_t expected_gate = UINT32_MAX;
+    uint32_t expected_up = UINT32_MAX;
+    uint32_t expected_down = UINT32_MAX;
+    if (profile == DS4_QWEN4_PACK_PROFILE_Q4_K) {
+        expected_gate = DS4_QWEN4_QTYPE_Q4_K;
+        expected_up = DS4_QWEN4_QTYPE_Q4_K;
+        expected_down = DS4_QWEN4_QTYPE_Q4_K;
+    } else if (profile == DS4_QWEN4_PACK_PROFILE_IQ2_XXS_Q2_K) {
+        expected_gate = DS4_QWEN4_QTYPE_IQ2_XXS;
+        expected_up = DS4_QWEN4_QTYPE_IQ2_XXS;
+        expected_down = DS4_QWEN4_QTYPE_Q2_K;
+    } else {
+        qwen4_error(error, error_cap, "unsupported Qwen quantization profile");
+        return false;
+    }
+    if (gate_qtype != expected_gate || up_qtype != expected_up ||
+        down_qtype != expected_down) {
+        qwen4_error(error, error_cap,
+                    "Qwen %s routed tensors have qtypes %u/%u/%u; "
+                    "expected %u/%u/%u",
+                    ds4_qwen4_pack_profile_name(profile),
+                    gate_qtype, up_qtype, down_qtype,
+                    expected_gate, expected_up, expected_down);
+        return false;
+    }
+    return true;
+}
+
+uint64_t ds4_qwen4_pack_fast_required_mask(
+        ds4_qwen4_pack_profile profile) {
+    switch (profile) {
+        case DS4_QWEN4_PACK_PROFILE_Q4_K:
+            return DS4_QWEN4_FAST_Q4_METAL_REQUIRED_MASK |
+                   DS4_QWEN4_FAST_PLE_STAGER;
+        case DS4_QWEN4_PACK_PROFILE_IQ2_XXS_Q2_K:
+            return DS4_QWEN4_FAST_Q2_METAL_REQUIRED_MASK |
+                   DS4_QWEN4_FAST_PLE_STAGER;
+        default:
+            return 0u;
+    }
 }
 
 typedef struct {
@@ -349,10 +533,20 @@ uint64_t ds4_qwen4_prefill_scratch_bytes(uint32_t chunk) {
     return bytes;
 }
 
-bool ds4_qwen4_admit_prefill(ds4_qwen4_prefill_mode mode,
+static uint64_t qwen4_prefill_scratch_with_extra(
+        uint32_t chunk,
+        uint64_t extra_bytes_per_token) {
+    return qwen4_sat_add(
+        ds4_qwen4_prefill_scratch_bytes(chunk),
+        qwen4_sat_mul(chunk, extra_bytes_per_token));
+}
+
+bool ds4_qwen4_admit_prefill_with_extra(
+                             ds4_qwen4_prefill_mode mode,
                              bool fast_path_complete,
                              const char *missing_fast_path,
                              uint64_t scratch_available,
+                             uint64_t extra_bytes_per_token,
                              ds4_qwen4_prefill_admission *out,
                              char *error,
                              size_t error_cap) {
@@ -365,8 +559,10 @@ bool ds4_qwen4_admit_prefill(ds4_qwen4_prefill_mode mode,
         return false;
     }
 
-    const uint64_t need_2k = ds4_qwen4_prefill_scratch_bytes(2048u);
-    const uint64_t need_8k = ds4_qwen4_prefill_scratch_bytes(8192u);
+    const uint64_t need_2k = qwen4_prefill_scratch_with_extra(
+        2048u, extra_bytes_per_token);
+    const uint64_t need_8k = qwen4_prefill_scratch_with_extra(
+        8192u, extra_bytes_per_token);
     if (scratch_available < need_2k) {
         qwen4_error(error, error_cap,
                     "Qwen prefill requires at least 2048-token scratch "
@@ -400,7 +596,8 @@ bool ds4_qwen4_admit_prefill(ds4_qwen4_prefill_mode mode,
                         ? missing_fast_path : "mandatory capability missing");
         return false;
     }
-    const uint64_t required = ds4_qwen4_prefill_scratch_bytes(requested);
+    const uint64_t required = qwen4_prefill_scratch_with_extra(
+        requested, extra_bytes_per_token);
     if (scratch_available < required) {
         qwen4_error(error, error_cap,
                     "requested Qwen --prefill-chunk %u requires %.2f GiB "
@@ -414,6 +611,18 @@ bool ds4_qwen4_admit_prefill(ds4_qwen4_prefill_mode mode,
     out->scratch_required = required;
     out->reason = "explicit chunk admitted";
     return true;
+}
+
+bool ds4_qwen4_admit_prefill(ds4_qwen4_prefill_mode mode,
+                             bool fast_path_complete,
+                             const char *missing_fast_path,
+                             uint64_t scratch_available,
+                             ds4_qwen4_prefill_admission *out,
+                             char *error,
+                             size_t error_cap) {
+    return ds4_qwen4_admit_prefill_with_extra(
+        mode, fast_path_complete, missing_fast_path, scratch_available, 0u,
+        out, error, error_cap);
 }
 
 bool ds4_qwen4_build_mrope_positions(
@@ -687,13 +896,20 @@ static const char *json_key(const char *json, const char *key) {
     char pattern[96];
     const int n = snprintf(pattern, sizeof(pattern), "\"%s\"", key);
     if (n < 0 || (size_t)n >= sizeof(pattern)) return NULL;
-    const char *p = strstr(json, pattern);
-    if (!p) return NULL;
-    p += (size_t)n;
-    while (isspace((unsigned char)*p)) p++;
-    if (*p++ != ':') return NULL;
-    while (isspace((unsigned char)*p)) p++;
-    return p;
+    const char *search = json;
+    while (search && *search) {
+        const char *match = strstr(search, pattern);
+        if (!match) return NULL;
+        const char *p = match + (size_t)n;
+        while (isspace((unsigned char)*p)) p++;
+        if (*p == ':') {
+            p++;
+            while (isspace((unsigned char)*p)) p++;
+            return p;
+        }
+        search = match + 1u;
+    }
+    return NULL;
 }
 
 static bool json_u64(const char *json, const char *key, uint64_t *out) {
@@ -1015,11 +1231,14 @@ int ds4_qwen4_pack_manifest_load(ds4_qwen4_pack_manifest *manifest,
 
     char schema[64], architecture[64];
     uint64_t version = 0;
+    ds4_qwen4_pack_profile profile = DS4_QWEN4_PACK_PROFILE_INVALID;
     const char *source = json_object(json, "source");
     bool ok = json_string_value(json, "schema", schema, sizeof(schema)) &&
               !strcmp(schema, DS4_QWEN4_PACK_SCHEMA) &&
               json_u64(json, "version", &version) &&
-              version == DS4_QWEN4_PACK_MANIFEST_VERSION &&
+              version <= UINT32_MAX &&
+              ds4_qwen4_pack_profile_from_version((uint32_t)version,
+                                                   &profile) &&
               json_string_value(json, "architecture", architecture,
                                 sizeof(architecture)) &&
               !strcmp(architecture, DS4_QWEN4_ARCHITECTURE) &&
@@ -1036,6 +1255,7 @@ int ds4_qwen4_pack_manifest_load(ds4_qwen4_pack_manifest *manifest,
         return 1;
     }
     manifest->version = (uint32_t)version;
+    manifest->profile = profile;
     manifest->base_shard_count = DS4_QWEN4_PACK_BASE_SHARDS;
 
     const char *array = json_key(json, "artifacts");
@@ -1369,6 +1589,16 @@ static bool qwen4_gguf_string_is(const qwen4_gguf_string *string,
            !memcmp(string->data, expected, size);
 }
 
+static bool qwen4_gguf_string_copy(const qwen4_gguf_string *string,
+                                   char *out,
+                                   size_t out_cap) {
+    if (!string || !out || string->size == 0u ||
+        string->size >= out_cap) return false;
+    memcpy(out, string->data, (size_t)string->size);
+    out[string->size] = '\0';
+    return true;
+}
+
 static bool qwen4_gguf_skip_value(qwen4_gguf_cursor *cursor,
                                   uint32_t type,
                                   uint32_t depth) {
@@ -1486,6 +1716,8 @@ static int qwen4_ple_table_adopt_fd(ds4_qwen4_ple_table *table,
     uint64_t alignment = 32u;
     bool architecture_seen = false;
     bool pack_version_seen = false;
+    bool pack_id_seen = false;
+    bool source_revision_seen = false;
     bool artifact_seen = false;
     bool quant_seen = false;
     for (uint64_t i = 0; ok && i < metadata_count; i++) {
@@ -1508,10 +1740,29 @@ static int qwen4_ple_table_adopt_fd(ds4_qwen4_ple_table *table,
             architecture_seen = ok;
         } else if (qwen4_gguf_string_is(&key, "ds4.pack.version")) {
             uint32_t value = 0;
+            ds4_qwen4_pack_profile profile =
+                DS4_QWEN4_PACK_PROFILE_INVALID;
             ok = type == QWEN4_GGUF_TYPE_UINT32 &&
                  qwen4_gguf_u32(&cursor, &value) &&
-                 value == DS4_QWEN4_PACK_MANIFEST_VERSION;
+                 ds4_qwen4_pack_profile_from_version(value, &profile);
+            if (ok) table->pack_version = value;
             pack_version_seen = ok;
+        } else if (qwen4_gguf_string_is(&key, "ds4.pack.id")) {
+            qwen4_gguf_string value = {0};
+            ok = !pack_id_seen && type == QWEN4_GGUF_TYPE_STRING &&
+                 qwen4_gguf_string_read(&cursor, &value) &&
+                 qwen4_gguf_string_copy(
+                     &value, table->pack_id, sizeof(table->pack_id));
+            pack_id_seen = ok;
+        } else if (qwen4_gguf_string_is(
+                       &key, "general.source.revision")) {
+            qwen4_gguf_string value = {0};
+            ok = !source_revision_seen && type == QWEN4_GGUF_TYPE_STRING &&
+                 qwen4_gguf_string_read(&cursor, &value) &&
+                 qwen4_gguf_string_copy(
+                     &value, table->source_revision,
+                     sizeof(table->source_revision));
+            source_revision_seen = ok;
         } else if (qwen4_gguf_string_is(&key, "ds4.pack.artifact")) {
             qwen4_gguf_string value = {0};
             ok = type == QWEN4_GGUF_TYPE_STRING &&
@@ -1561,8 +1812,9 @@ static int qwen4_ple_table_adopt_fd(ds4_qwen4_ple_table *table,
     }
 
     uint64_t row_bytes = 0, weight_bytes = 0;
-    ok = ok && architecture_seen && pack_version_seen && artifact_seen &&
-         quant_seen && weight.found && multipliers.found && offsets.found &&
+    ok = ok && architecture_seen && pack_version_seen && pack_id_seen &&
+         source_revision_seen && artifact_seen && quant_seen &&
+         weight.found && multipliers.found && offsets.found &&
          vocab_sizes.found &&
          weight.dimensions == 2u &&
          weight.shape[0] == DS4_QWEN4_PLE_ROW_DIM && weight.shape[1] != 0u &&
@@ -1625,7 +1877,7 @@ static int qwen4_ple_table_adopt_fd(ds4_qwen4_ple_table *table,
              expected_hash.vocab, DS4_QWEN4_NGRAM_HEADS);
     if (!ok) {
         qwen4_error(error, error_cap,
-                    "%s is not a valid DS4 v3 Q4_1 PLE GGUF", path);
+                    "%s is not a valid DS4 Qwen v3/v4 Q4_1 PLE GGUF", path);
         ds4_qwen4_ple_table_close(table);
         return 1;
     }
@@ -2189,12 +2441,14 @@ int ds4_qwen4_ple_stager_init(ds4_qwen4_ple_stager *stager,
         impl->random_advice_succeeded = advice_error == 0;
         if (impl->random_advice_succeeded) {
             fprintf(stderr,
-                    "ds4: Qwen PLE mmap gather enabled; "
-                    "POSIX_MADV_RANDOM applied to the file mapping\n");
+                    "ds4: Qwen PLE %s gather enabled; "
+                    "POSIX_MADV_RANDOM applied to the file mapping\n",
+                    ds4_qwen4_ple_gather_mode_name(mode));
         } else {
             fprintf(stderr,
-                    "ds4: Qwen PLE mmap gather enabled; "
+                    "ds4: Qwen PLE %s gather enabled; "
                     "POSIX_MADV_RANDOM failed: %s\n",
+                    ds4_qwen4_ple_gather_mode_name(mode),
                     strerror(advice_error));
         }
 #elif defined(MADV_RANDOM)
@@ -2203,17 +2457,20 @@ int ds4_qwen4_ple_stager_init(ds4_qwen4_ple_stager *stager,
         impl->random_advice_succeeded = advice_result == 0;
         if (impl->random_advice_succeeded) {
             fprintf(stderr,
-                    "ds4: Qwen PLE mmap gather enabled; "
-                    "MADV_RANDOM applied to the file mapping\n");
+                    "ds4: Qwen PLE %s gather enabled; "
+                    "MADV_RANDOM applied to the file mapping\n",
+                    ds4_qwen4_ple_gather_mode_name(mode));
         } else {
             fprintf(stderr,
-                    "ds4: Qwen PLE mmap gather enabled; MADV_RANDOM failed: %s\n",
+                    "ds4: Qwen PLE %s gather enabled; MADV_RANDOM failed: %s\n",
+                    ds4_qwen4_ple_gather_mode_name(mode),
                     strerror(errno));
         }
 #else
         fprintf(stderr,
-                "ds4: Qwen PLE mmap gather enabled; "
-                "random mapping advice is unavailable on this platform\n");
+                "ds4: Qwen PLE %s gather enabled; "
+                "random mapping advice is unavailable on this platform\n",
+                ds4_qwen4_ple_gather_mode_name(mode));
 #endif
     }
     if (pthread_mutex_init(&impl->mutex, NULL) != 0) {

@@ -24,10 +24,19 @@ from qwen4_pack import (
     GGMLQuantizer,
     MANIFEST_NAME,
     PACK_VERSION,
+    Q2_BASE_NAME,
+    Q2_MANIFEST_NAME,
+    Q2_MTP_NAME,
+    Q2_PACK_VERSION,
+    Q2_PLE_NAME,
+    Q2_PROFILE,
+    Q2_STATE_NAME,
+    Q2_VISION_NAME,
     PLE_AUX_NAMES,
     PLE_NAME,
     PleGGUFWriter,
     RandomGGUFWriter,
+    QwenGGUFImatrix,
     TensorSpec,
     artifact_for,
     base_locality_group,
@@ -37,9 +46,11 @@ from qwen4_pack import (
     create_streamed_pack,
     default_quantizer_library,
     encode_action,
+    encode_weighted_experts,
     f32_to_bf16,
     layer_of,
     make_action,
+    parse_args,
     ple_gguf_layout,
     quant_specs,
     record_ple_tensors,
@@ -71,6 +82,66 @@ def metadata_value(records, key):
     record = next(row for row in records if row.startswith(encoded_key))
     value_type = struct.unpack_from("<I", record, len(encoded_key))[0]
     return value_type, record[len(encoded_key) + 4:]
+
+
+def write_test_imatrix(path, layers=2, experts=3, width=256,
+                        missing=None, invalid_negative=None):
+    def packed_string(value):
+        raw = value.encode()
+        return struct.pack("<Q", len(raw)) + raw
+
+    metadata = [
+        packed_string("general.type") + struct.pack("<I", 8) +
+        packed_string("imatrix"),
+        packed_string("imatrix.datasets") + struct.pack("<IIQ", 9, 8, 1) +
+        packed_string("synthetic-test"),
+        packed_string("imatrix.chunk_count") + struct.pack("<II", 4, 2),
+        packed_string("imatrix.chunk_size") + struct.pack("<II", 4, 128),
+    ]
+    tensors = []
+    for layer in range(layers):
+        for part in ("gate", "up", "down"):
+            base = f"blk.{layer}.ffn_{part}_exps.weight"
+            sums_name = base + ".in_sum2"
+            counts_name = base + ".counts"
+            sums = np.arange(
+                1, experts * width + 1, dtype="<f4"
+            ).reshape(experts, width)
+            counts = np.arange(1, experts + 1, dtype="<f4")
+            if layer == 0 and part in ("gate", "down"):
+                counts[1] = 0.0
+            if invalid_negative == sums_name:
+                sums[0, 0] = -1.0
+            if sums_name != missing:
+                tensors.append((sums_name, (width, experts), sums.tobytes()))
+            if counts_name != missing:
+                tensors.append((counts_name, (1, experts), counts.tobytes()))
+
+    offsets = []
+    offset = 0
+    for _, _, raw in tensors:
+        offsets.append(offset)
+        offset = (offset + len(raw) + 31) // 32 * 32
+    directory = bytearray()
+    for (name, shape, _), tensor_offset in zip(tensors, offsets):
+        directory += packed_string(name)
+        directory += struct.pack("<I", len(shape))
+        directory += struct.pack(f"<{len(shape)}Q", *shape)
+        directory += struct.pack("<IQ", 0, tensor_offset)
+    prefix = bytearray(b"GGUF")
+    prefix += struct.pack("<IQQ", 3, len(tensors), len(metadata))
+    for record in metadata:
+        prefix += record
+    prefix += directory
+    data_offset = (len(prefix) + 31) // 32 * 32
+    prefix += bytes(data_offset - len(prefix))
+    with path.open("wb") as fp:
+        fp.write(prefix)
+        for (_, _, raw), tensor_offset in zip(tensors, offsets):
+            self_offset = fp.tell() - data_offset
+            if self_offset < tensor_offset:
+                fp.write(bytes(tensor_offset - self_offset))
+            fp.write(raw)
 
 
 def reference_q4_1(row):
@@ -117,6 +188,55 @@ class Qwen4PackTests(unittest.TestCase):
         )
         self.assertEqual(PLE_NAME, "Qwen3.8-Flash-Next-PLE-Q4_1.gguf")
         self.assertEqual(MANIFEST_NAME, "qwen3.8-flash-next-q4.manifest.json")
+
+    def test_q2_v4_has_distinct_artifact_and_state_identity(self):
+        self.assertEqual(Q2_PACK_VERSION, 4)
+        self.assertEqual(
+            Q2_BASE_NAME,
+            "Qwen3.8-Flash-Next-IQ2XXSGateUp-Q2KDown-BF16Emb-"
+            "BF16Control-Q8GDN-Q8QSA-Q8Shared-Q8Out.gguf",
+        )
+        self.assertEqual(
+            Q2_MANIFEST_NAME, "qwen3.8-flash-next-q2.manifest.json"
+        )
+        self.assertEqual(
+            Q2_STATE_NAME, "qwen3.8-flash-next-q2.conversion-state.json"
+        )
+        self.assertNotEqual(Q2_PLE_NAME, PLE_NAME)
+        self.assertNotEqual(Q2_VISION_NAME, "qwen3.8-flash-next-q4-vision.gguf")
+        self.assertNotEqual(Q2_MTP_NAME, "qwen3.8-flash-next-q4-mtp.gguf")
+
+    def test_q2_v4_metadata_declares_mixed_routed_qtypes(self):
+        records = common_metadata("pack", "a" * 40, "base", Q2_PROFILE)
+        for key, expected in (
+            ("ds4.pack.quant.routed", "mixed-q2"),
+            ("ds4.pack.quant.routed_gate_up", "IQ2_XXS"),
+            ("ds4.pack.quant.routed_down", "Q2_K"),
+        ):
+            value_type, raw = metadata_value(records, key)
+            self.assertEqual(value_type, 8)
+            length = struct.unpack_from("<Q", raw)[0]
+            self.assertEqual(raw[8:8 + length].decode(), expected)
+        value_type, raw = metadata_value(records, "ds4.pack.version")
+        self.assertEqual(value_type, 4)
+        self.assertEqual(struct.unpack("<I", raw)[0], 4)
+
+    def test_q2_cli_fails_closed_without_no_mtp(self):
+        required = [
+            "--profile", "q2",
+            "--src", "/source",
+            "--out", "/output",
+            "--source-revision", "a" * 40,
+            "--tokenizer-template", "/tokenizer.gguf",
+            "--dry-run",
+        ]
+        with mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit) as error:
+                parse_args(required)
+        self.assertEqual(error.exception.code, 2)
+        parsed = parse_args(required + ["--no-mtp"])
+        self.assertEqual(parsed.profile, "q2")
+        self.assertTrue(parsed.no_mtp)
 
     def test_v3_artifact_tensor_count_contract_is_exact(self):
         self.assertEqual(
@@ -216,6 +336,39 @@ class Qwen4PackTests(unittest.TestCase):
             )
             self.assertEqual(record["sha256"], "d" * 64)
             self.assertEqual(manifest["artifacts"], artifacts)
+
+    def test_q2_manifest_records_imatrix_and_mixed_routed_recipe(self):
+        class FakeImatrix:
+            def provenance(self):
+                return {
+                    "format": "gguf-imatrix-v3",
+                    "sha256": "a" * 64,
+                    "revision": "b" * 40,
+                    "zero_count_fallback": {
+                        "method": "per-expert-input-column-weight-energy",
+                        "count": 24,
+                    },
+                }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            out = Path(temporary)
+            args = SimpleNamespace(
+                out=out,
+                profile="q2",
+                remote_repo="Qwen/Qwen3.8-Flash-Next",
+                source_revision="a" * 40,
+            )
+            write_pack_manifest(
+                args, "pack", {}, [], FakeImatrix()
+            )
+            manifest = json.loads((out / Q2_MANIFEST_NAME).read_text())
+            self.assertEqual(manifest["version"], 4)
+            routed = manifest["quantization"]["routed_experts"]
+            self.assertEqual(routed["gate_up"]["qtype"], "IQ2_XXS")
+            self.assertEqual(routed["down"]["qtype"], "Q2_K")
+            self.assertEqual(
+                routed["imatrix"]["zero_count_fallback"]["count"], 24
+            )
 
     def test_legacy_artifacts_are_refused_even_for_a_fresh_conversion(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -546,6 +699,35 @@ class Qwen4PackTests(unittest.TestCase):
             all(spec.shape == (512, 640, 2560) for spec in action.specs)
         )
 
+    def test_q2_routed_plan_uses_iq2_gate_up_and_weighted_q2_k_down(self):
+        gate_up = "model.language_model.layers.7.mlp.experts.gate_up_proj"
+        down = "model.language_model.layers.7.mlp.experts.down_proj"
+        db = FakeDB({
+            gate_up: info("BF16", (512, 1280, 2560)),
+            down: info("BF16", (512, 2560, 640)),
+        })
+        gate_action = make_action(db, gate_up, Q2_PROFILE)
+        self.assertEqual(gate_action.qtype, "IQ2_XXS")
+        self.assertEqual(
+            [spec.dtype for spec in gate_action.specs],
+            ["IQ2_XXS", "IQ2_XXS"],
+        )
+        self.assertEqual(
+            gate_action.imatrix_names,
+            (
+                "blk.7.ffn_gate_exps.weight",
+                "blk.7.ffn_up_exps.weight",
+            ),
+        )
+        down_action = make_action(db, down, Q2_PROFILE)
+        self.assertEqual((down_action.kind, down_action.qtype),
+                         ("quant_experts", "Q2_K"))
+        self.assertEqual(
+            down_action.imatrix_names,
+            ("blk.7.ffn_down_exps.weight",),
+        )
+        self.assertEqual(down_action.specs[0].shape, (512, 2560, 768))
+
     def test_routed_down_is_zero_padded_from_640_to_768(self):
         name = "model.language_model.layers.7.mlp.experts.down_proj"
         production = make_action(
@@ -724,6 +906,96 @@ class Qwen4PackTests(unittest.TestCase):
             hashlib.sha256(encoded).hexdigest(),
             "d0cfb11a385c38c5b64f576f81c02fcbf616eecf2553a83b232500a29877546b",
         )
+
+    def test_q2_weighted_expert_encoding_is_ordered_across_thread_counts(self):
+        class FakeImatrix:
+            def expert_weights(self, name, expert, values):
+                del name
+                return np.linspace(
+                    1.0 + expert / 1024.0, 2.0, values.shape[-1],
+                    dtype=np.float32,
+                )
+
+        source = f32_to_bf16(np.linspace(
+            -2.0, 2.0, 512 * 256, dtype=np.float32
+        ).reshape(512, 1, 256))
+        serial = encode_weighted_experts(
+            source, "IQ2_XXS", FakeImatrix(), "blk.0.ffn_gate_exps.weight",
+            self.quantizer, 1,
+        )
+        parallel = encode_weighted_experts(
+            source, "IQ2_XXS", FakeImatrix(), "blk.0.ffn_gate_exps.weight",
+            self.quantizer, 4,
+        )
+        self.assertEqual(serial, parallel)
+        self.assertEqual(len(serial), 512 * 66)
+
+        down = f32_to_bf16(np.linspace(
+            -1.0, 1.0, 512 * 640, dtype=np.float32
+        ).reshape(512, 1, 640))
+        padded = encode_weighted_experts(
+            down, "Q2_K", FakeImatrix(), "blk.0.ffn_down_exps.weight",
+            self.quantizer, 4, pad_last_to=768,
+        )
+        self.assertEqual(len(padded), 512 * 3 * 84)
+
+    def test_iq2_quantizer_fails_closed_without_imatrix(self):
+        with self.assertRaisesRegex(ValueError, "requires an importance matrix"):
+            self.quantizer.encode(
+                np.zeros((1, 256), dtype=np.float32), "IQ2_XXS"
+            )
+
+    def test_qwen_gguf_imatrix_validates_normalizes_and_falls_back(self):
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+                CONFIG,
+                {"layers": 2, "experts": 3, "hidden": 256,
+                 "expert_ff": 256}):
+            path = Path(temporary) / "imatrix.gguf"
+            write_test_imatrix(path)
+            imatrix = QwenGGUFImatrix(path)
+            try:
+                self.assertEqual(len(imatrix.entries), 6)
+                self.assertEqual(imatrix.fallback_count, 2)
+                values = f32_to_bf16(np.ones((2, 256), dtype=np.float32))
+                positive = imatrix.expert_weights(
+                    "blk.0.ffn_gate_exps.weight", 0, values
+                )
+                expected = np.arange(1, 257, dtype=np.float32)
+                np.testing.assert_array_equal(positive, expected)
+                fallback = imatrix.expert_weights(
+                    "blk.0.ffn_gate_exps.weight", 1, values
+                )
+                np.testing.assert_array_equal(
+                    fallback, np.full(256, 2.0, dtype=np.float32)
+                )
+                provenance = imatrix.provenance()["zero_count_fallback"]
+                self.assertEqual(provenance["count"], 2)
+                self.assertEqual(provenance["gate_up_count"], 1)
+                self.assertEqual(provenance["down_count"], 1)
+            finally:
+                imatrix.close()
+
+    def test_qwen_gguf_imatrix_rejects_missing_or_negative_entries(self):
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+                CONFIG,
+                {"layers": 2, "experts": 3, "hidden": 256,
+                 "expert_ff": 256}):
+            root = Path(temporary)
+            missing = root / "missing.gguf"
+            write_test_imatrix(
+                missing,
+                missing="blk.1.ffn_up_exps.weight.counts",
+            )
+            with self.assertRaisesRegex(ValueError, "required Q2 imatrix"):
+                QwenGGUFImatrix(missing)
+
+            negative = root / "negative.gguf"
+            write_test_imatrix(
+                negative,
+                invalid_negative="blk.0.ffn_gate_exps.weight.in_sum2",
+            )
+            with self.assertRaisesRegex(ValueError, "nonfinite/negative"):
+                QwenGGUFImatrix(negative)
 
     def test_block_quantization_rejects_invalid_width_and_nonfinite_input(self):
         with self.assertRaisesRegex(ValueError, "block size"):

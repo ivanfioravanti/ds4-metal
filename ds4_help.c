@@ -182,10 +182,15 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         if (tool == DS4_HELP_EVAL || tool == DS4_HELP_BENCH) {
             opt(fp, c, "--mtp-model FILE", "External MTP or DSpark support GGUF.");
         }
+        if (tool == DS4_HELP_EVAL) {
+            opt(fp, c, "--mtp-draft N", "Maximum Qwen autoregressive MTP draft tokens, 1..16. Default: 1");
+            opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
+            opt(fp, c, "--mtp-timing", "Print Qwen MTP draft acceptance and cycle timing counters.");
+        }
         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
             opt(fp, c, "--mtp", "Enable model-embedded MTP speculation.");
             opt(fp, c, "--mtp-model FILE", "External MTP or DSpark support GGUF.");
-            opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
+            opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens (Qwen block verifier: 1..16). Default: 1");
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
             opt(fp, c, "--mtp-timing", "Enable embedded MTP and print acceptance/timing counters.");
             opt(fp, c, "--dspark", "Enable DSpark using the support GGUF passed with --mtp-model.");

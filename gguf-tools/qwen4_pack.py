@@ -18,6 +18,7 @@ exact GGML block geometry used by its native kernels.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import ctypes
 import dataclasses
 import hashlib
@@ -63,6 +64,22 @@ BASE_NAME = (
 PLE_NAME = "Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
 VISION_NAME = "qwen3.8-flash-next-q4-vision.gguf"
 MTP_NAME = "qwen3.8-flash-next-q4-mtp.gguf"
+Q2_PACK_VERSION = 4
+Q2_CONVERSION_STATE_VERSION = 1
+Q2_MANIFEST_NAME = "qwen3.8-flash-next-q2.manifest.json"
+Q2_STATE_NAME = "qwen3.8-flash-next-q2.conversion-state.json"
+Q2_BASE_NAME = (
+    "Qwen3.8-Flash-Next-IQ2XXSGateUp-Q2KDown-BF16Emb-BF16Control-"
+    "Q8GDN-Q8QSA-Q8Shared-Q8Out.gguf"
+)
+Q2_PLE_NAME = "Qwen3.8-Flash-Next-Q2-PLE-Q4_1.gguf"
+Q2_VISION_NAME = "qwen3.8-flash-next-q2-vision.gguf"
+Q2_MTP_NAME = "qwen3.8-flash-next-q2-mtp.gguf"
+Q2_IMATRIX_REPOSITORY = "unsloth/Qwen3.8-Flash-Next-GGUF"
+Q2_IMATRIX_REVISION = "c8b5954a88c2775c546b92593eda40ea041d3176"
+Q2_IMATRIX_SHA256 = (
+    "a5863123db1ca458727e738955bef7bfc199520aa2bee3a30142a1aff9254154"
+)
 LEGACY_ARTIFACT_NAMES = (
     "qwen3.8-flash-next-q4.gguf",
     "qwen3.8-flash-next-q4-ple.safetensors",
@@ -95,7 +112,9 @@ QTYPE_F32 = 0
 QTYPE_F16 = 1
 QTYPE_Q4_1 = 3
 QTYPE_Q8_0 = 8
+QTYPE_Q2_K = 10
 QTYPE_Q4_K = 12
+QTYPE_IQ2_XXS = 16
 QTYPE_I32 = 26
 QTYPE_I64 = 27
 QTYPE_BF16 = 30
@@ -105,7 +124,9 @@ DTYPE_TO_QTYPE = {
     "F16": QTYPE_F16,
     "Q4_1": QTYPE_Q4_1,
     "Q8_0": QTYPE_Q8_0,
+    "Q2_K": QTYPE_Q2_K,
     "Q4_K": QTYPE_Q4_K,
+    "IQ2_XXS": QTYPE_IQ2_XXS,
     "I32": QTYPE_I32,
     "U32": QTYPE_I32,
     "I64": QTYPE_I64,
@@ -123,8 +144,60 @@ DTYPE_BYTES = {key: value.itemsize for key, value in DTYPE_TO_NUMPY.items()}
 QTYPE_LAYOUT = {
     "Q4_1": (32, 20),
     "Q8_0": (32, 34),
+    "Q2_K": (256, 84),
     "Q4_K": (256, 144),
+    "IQ2_XXS": (256, 66),
 }
+
+
+@dataclasses.dataclass(frozen=True)
+class PackProfile:
+    name: str
+    pack_version: int
+    state_version: int
+    manifest_name: str
+    state_name: str
+    base_name: str
+    ple_name: str
+    vision_name: str
+    mtp_name: str
+    gate_up_qtype: str
+    down_qtype: str
+    required_ds4_version: str
+    pack_identity: str
+
+
+Q4_PROFILE = PackProfile(
+    name="q4",
+    pack_version=PACK_VERSION,
+    state_version=CONVERSION_STATE_VERSION,
+    manifest_name=MANIFEST_NAME,
+    state_name=STATE_NAME,
+    base_name=BASE_NAME,
+    ple_name=PLE_NAME,
+    vision_name=VISION_NAME,
+    mtp_name=MTP_NAME,
+    gate_up_qtype="Q4_K",
+    down_qtype="Q4_K",
+    required_ds4_version="qwen3.8-flash-next-q4",
+    pack_identity="ds4-qwen3.8-flash-next-q4-v3",
+)
+Q2_PROFILE = PackProfile(
+    name="q2",
+    pack_version=Q2_PACK_VERSION,
+    state_version=Q2_CONVERSION_STATE_VERSION,
+    manifest_name=Q2_MANIFEST_NAME,
+    state_name=Q2_STATE_NAME,
+    base_name=Q2_BASE_NAME,
+    ple_name=Q2_PLE_NAME,
+    vision_name=Q2_VISION_NAME,
+    mtp_name=Q2_MTP_NAME,
+    gate_up_qtype="IQ2_XXS",
+    down_qtype="Q2_K",
+    required_ds4_version="qwen3.8-flash-next-q2",
+    pack_identity="ds4-qwen3.8-flash-next-q2-v4",
+)
+PACK_PROFILES = {profile.name: profile for profile in (Q4_PROFILE, Q2_PROFILE)}
 
 CONFIG = {
     "layers": 48,
@@ -194,6 +267,19 @@ NORM_FOLD_SUFFIXES = (
 
 def fail(message: str):
     raise ValueError(message)
+
+
+def pack_profile(value: str | PackProfile | None = None) -> PackProfile:
+    if isinstance(value, PackProfile):
+        return value
+    try:
+        return PACK_PROFILES[value or "q4"]
+    except KeyError:
+        fail(f"unknown Qwen pack profile {value!r}")
+
+
+def profile_from_args(args) -> PackProfile:
+    return pack_profile(getattr(args, "profile", "q4"))
 
 
 def product(values: Iterable[int]) -> int:
@@ -630,6 +716,312 @@ def bf16_to_f32(values: np.ndarray) -> np.ndarray:
     return (np.asarray(values, dtype="<u2").astype("<u4") << 16).view("<f4")
 
 
+GGUF_VALUE_UINT8 = 0
+GGUF_VALUE_INT8 = 1
+GGUF_VALUE_UINT16 = 2
+GGUF_VALUE_INT16 = 3
+GGUF_VALUE_UINT32 = 4
+GGUF_VALUE_INT32 = 5
+GGUF_VALUE_FLOAT32 = 6
+GGUF_VALUE_BOOL = 7
+GGUF_VALUE_STRING = 8
+GGUF_VALUE_ARRAY = 9
+GGUF_VALUE_UINT64 = 10
+GGUF_VALUE_INT64 = 11
+GGUF_VALUE_FLOAT64 = 12
+GGUF_SCALAR_FORMATS = {
+    GGUF_VALUE_UINT8: "<B",
+    GGUF_VALUE_INT8: "<b",
+    GGUF_VALUE_UINT16: "<H",
+    GGUF_VALUE_INT16: "<h",
+    GGUF_VALUE_UINT32: "<I",
+    GGUF_VALUE_INT32: "<i",
+    GGUF_VALUE_FLOAT32: "<f",
+    GGUF_VALUE_BOOL: "<?",
+    GGUF_VALUE_UINT64: "<Q",
+    GGUF_VALUE_INT64: "<q",
+    GGUF_VALUE_FLOAT64: "<d",
+}
+
+
+def read_exact(fp, length: int, label: str) -> bytes:
+    data = fp.read(length)
+    if len(data) != length:
+        fail(f"short read for {label}")
+    return data
+
+
+def read_u32(fp, label: str) -> int:
+    return struct.unpack("<I", read_exact(fp, 4, label))[0]
+
+
+def read_u64(fp, label: str) -> int:
+    return struct.unpack("<Q", read_exact(fp, 8, label))[0]
+
+
+def read_gguf_string(fp, label: str) -> str:
+    length = read_u64(fp, f"{label} length")
+    if length > 1 << 30:
+        fail(f"unreasonable {label} length {length}")
+    try:
+        return read_exact(fp, length, label).decode("utf-8")
+    except UnicodeDecodeError as error:
+        fail(f"{label} is not valid UTF-8: {error}")
+
+
+def read_gguf_value(fp, value_type: int, label: str):
+    if value_type == GGUF_VALUE_STRING:
+        return read_gguf_string(fp, label)
+    if value_type == GGUF_VALUE_ARRAY:
+        element_type = read_u32(fp, f"{label} array type")
+        count = read_u64(fp, f"{label} array count")
+        if count > 1 << 32:
+            fail(f"unreasonable {label} array count {count}")
+        if element_type == GGUF_VALUE_STRING:
+            return [
+                read_gguf_string(fp, f"{label} array item")
+                for _ in range(count)
+            ]
+        fmt = GGUF_SCALAR_FORMATS.get(element_type)
+        if fmt is None:
+            fail(f"unsupported {label} GGUF array type {element_type}")
+        size = struct.calcsize(fmt)
+        raw = read_exact(fp, count * size, label)
+        return list(struct.unpack(f"<{count}{fmt[-1]}", raw))
+    fmt = GGUF_SCALAR_FORMATS.get(value_type)
+    if fmt is None:
+        fail(f"unsupported {label} GGUF value type {value_type}")
+    return struct.unpack(fmt, read_exact(fp, struct.calcsize(fmt), label))[0]
+
+
+@dataclasses.dataclass(frozen=True)
+class ImatrixTensor:
+    shape: tuple[int, ...]
+    qtype: int
+    offset: int
+    nbytes: int
+
+
+class QwenGGUFImatrix:
+    """Validated, mmap-backed Qwen expert importance statistics.
+
+    llama.cpp's GGUF imatrix stores raw input-square sums and a separate
+    count for every routed expert.  Keeping the 553 MB file mapped avoids a
+    second resident copy while source shards are being quantized.
+    """
+
+    def __init__(self, path: Path, expected_sha256: str | None = None,
+                 repository: str = Q2_IMATRIX_REPOSITORY,
+                 revision: str = Q2_IMATRIX_REVISION):
+        self.path = Path(path)
+        if not self.path.is_file():
+            fail(f"Q2 imatrix not found: {self.path}")
+        self.sha256 = sha256_file(self.path)
+        if expected_sha256 is not None and self.sha256 != expected_sha256:
+            fail(
+                f"Q2 imatrix checksum mismatch: expected {expected_sha256}, "
+                f"got {self.sha256}"
+            )
+        self.repository = repository
+        self.revision = revision
+        self.metadata: dict[str, object] = {}
+        self.tensors: dict[str, ImatrixTensor] = {}
+        self.entries: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self.fallback_entries: list[dict[str, int | str]] = []
+        self._mapping = np.memmap(self.path, dtype=np.uint8, mode="r")
+        self._parse()
+        self._validate_qwen_entries()
+
+    def _parse(self):
+        file_size = self.path.stat().st_size
+        with self.path.open("rb") as fp:
+            if read_exact(fp, 4, "imatrix GGUF magic") != b"GGUF":
+                fail(f"{self.path}: Q2 imatrix is not a GGUF file")
+            version = read_u32(fp, "imatrix GGUF version")
+            if version != GGUF_VERSION:
+                fail(
+                    f"{self.path}: Q2 imatrix uses GGUF v{version}, "
+                    f"expected v{GGUF_VERSION}"
+                )
+            tensor_count = read_u64(fp, "imatrix tensor count")
+            metadata_count = read_u64(fp, "imatrix metadata count")
+            if tensor_count == 0 or tensor_count > 1 << 20:
+                fail(f"{self.path}: invalid imatrix tensor count {tensor_count}")
+            if metadata_count == 0 or metadata_count > 1 << 20:
+                fail(
+                    f"{self.path}: invalid imatrix metadata count "
+                    f"{metadata_count}"
+                )
+            for _ in range(metadata_count):
+                key = read_gguf_string(fp, "imatrix metadata key")
+                if key in self.metadata:
+                    fail(f"{self.path}: duplicate imatrix metadata key {key}")
+                value_type = read_u32(fp, f"imatrix metadata type for {key}")
+                self.metadata[key] = read_gguf_value(
+                    fp, value_type, f"imatrix metadata {key}"
+                )
+            directories = []
+            for _ in range(tensor_count):
+                name = read_gguf_string(fp, "imatrix tensor name")
+                if name in self.tensors or any(row[0] == name for row in directories):
+                    fail(f"{self.path}: duplicate imatrix tensor {name}")
+                dimensions = read_u32(fp, f"imatrix dimensions for {name}")
+                if dimensions == 0 or dimensions > 4:
+                    fail(
+                        f"{self.path}: invalid imatrix rank {dimensions} "
+                        f"for {name}"
+                    )
+                shape = tuple(
+                    read_u64(fp, f"imatrix shape for {name}")
+                    for _ in range(dimensions)
+                )
+                if any(value == 0 or value > 1 << 32 for value in shape):
+                    fail(f"{self.path}: invalid imatrix shape {shape} for {name}")
+                qtype = read_u32(fp, f"imatrix qtype for {name}")
+                offset = read_u64(fp, f"imatrix offset for {name}")
+                directories.append((name, shape, qtype, offset))
+            data_offset = align(fp.tell())
+        for name, shape, qtype, offset in directories:
+            if qtype != QTYPE_F32:
+                fail(f"{self.path}: imatrix tensor {name} is not F32")
+            nbytes = product(shape) * 4
+            absolute = data_offset + offset
+            if absolute < data_offset or absolute + nbytes > file_size:
+                fail(f"{self.path}: imatrix tensor {name} is out of bounds")
+            self.tensors[name] = ImatrixTensor(
+                shape=shape, qtype=qtype, offset=absolute, nbytes=nbytes
+            )
+        if self.metadata.get("general.type") != "imatrix":
+            fail(f"{self.path}: GGUF general.type is not imatrix")
+        datasets = self.metadata.get("imatrix.datasets")
+        if (not isinstance(datasets, list) or not datasets or
+                any(not isinstance(item, str) or not item for item in datasets)):
+            fail(f"{self.path}: missing or invalid imatrix.datasets metadata")
+        for key in ("imatrix.chunk_count", "imatrix.chunk_size"):
+            value = self.metadata.get(key)
+            if not isinstance(value, int) or value <= 0:
+                fail(f"{self.path}: missing or invalid {key} metadata")
+
+    def _array(self, tensor: ImatrixTensor) -> np.ndarray:
+        return np.frombuffer(
+            self._mapping, dtype="<f4", count=product(tensor.shape),
+            offset=tensor.offset,
+        )
+
+    def _validate_qwen_entries(self):
+        for layer in range(CONFIG["layers"]):
+            for part, width in (
+                    ("gate", CONFIG["hidden"]),
+                    ("up", CONFIG["hidden"]),
+                    ("down", CONFIG["expert_ff"])):
+                base = f"blk.{layer}.ffn_{part}_exps.weight"
+                sums_name = base + ".in_sum2"
+                counts_name = base + ".counts"
+                sums_tensor = self.tensors.get(sums_name)
+                counts_tensor = self.tensors.get(counts_name)
+                if sums_tensor is None or counts_tensor is None:
+                    missing = sums_name if sums_tensor is None else counts_name
+                    fail(f"{self.path}: required Q2 imatrix tensor is missing: {missing}")
+                expected_sums = (width, CONFIG["experts"])
+                expected_counts = (1, CONFIG["experts"])
+                if sums_tensor.shape != expected_sums:
+                    fail(
+                        f"{self.path}: {sums_name} has shape "
+                        f"{sums_tensor.shape}, expected {expected_sums}"
+                    )
+                if counts_tensor.shape != expected_counts:
+                    fail(
+                        f"{self.path}: {counts_name} has shape "
+                        f"{counts_tensor.shape}, expected {expected_counts}"
+                    )
+                sums = self._array(sums_tensor).reshape(CONFIG["experts"], width)
+                counts = self._array(counts_tensor)
+                if not np.all(np.isfinite(sums)) or np.any(sums < 0.0):
+                    fail(f"{self.path}: {sums_name} has nonfinite/negative statistics")
+                if (not np.all(np.isfinite(counts)) or
+                        np.any(counts < 0.0) or
+                        not np.all(counts == np.rint(counts))):
+                    fail(f"{self.path}: {counts_name} has invalid counts")
+                self.entries[base] = (sums, counts)
+                self.fallback_entries.extend(
+                    {
+                        "tensor": base,
+                        "expert": int(expert),
+                        "part": part,
+                    }
+                    for expert in np.flatnonzero(counts == 0.0)
+                )
+        if self.fallback_entries:
+            gate_up = sum(
+                entry["part"] in ("gate", "up")
+                for entry in self.fallback_entries
+            )
+            down = self.fallback_count - gate_up
+            print(
+                "qwen4-pack: Q2 imatrix has "
+                f"{self.fallback_count} zero-count expert entries "
+                f"(gate/up={gate_up}, down={down}); using per-expert "
+                "weight-energy fallback",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    @property
+    def fallback_count(self) -> int:
+        return len(self.fallback_entries)
+
+    def expert_weights(self, name: str, expert: int,
+                       values: np.ndarray) -> np.ndarray:
+        try:
+            sums, counts = self.entries[name]
+        except KeyError:
+            fail(f"required Q2 imatrix entry is missing: {name}")
+        if expert < 0 or expert >= CONFIG["experts"]:
+            fail(f"invalid Q2 routed expert index {expert}")
+        count = counts[expert]
+        if count > 0.0:
+            return np.ascontiguousarray(sums[expert] / count, dtype="<f4")
+        source = bf16_to_f32(values)
+        weights = np.square(source, dtype=np.float32).sum(
+            axis=0, dtype=np.float32
+        )
+        if not np.all(np.isfinite(weights)):
+            fail(f"{name} expert {expert}: nonfinite weight-energy fallback")
+        return np.ascontiguousarray(weights, dtype="<f4")
+
+    def provenance(self) -> dict:
+        return {
+            "format": "gguf-imatrix-v3",
+            "repository": self.repository,
+            "revision": self.revision,
+            "sha256": self.sha256,
+            "datasets": self.metadata["imatrix.datasets"],
+            "chunk_count": self.metadata["imatrix.chunk_count"],
+            "chunk_size": self.metadata["imatrix.chunk_size"],
+            "zero_count_fallback": {
+                "method": "per-expert-input-column-weight-energy",
+                "count": self.fallback_count,
+                "gate_up_count": sum(
+                    entry["part"] in ("gate", "up")
+                    for entry in self.fallback_entries
+                ),
+                "down_count": sum(
+                    entry["part"] == "down"
+                    for entry in self.fallback_entries
+                ),
+                "entries": self.fallback_entries,
+            },
+        }
+
+    def close(self):
+        mapping = getattr(self, "_mapping", None)
+        if mapping is not None:
+            mmap = getattr(mapping, "_mmap", None)
+            if mmap is not None:
+                mmap.close()
+            self._mapping = None
+
+
 class GGMLQuantizer:
     """Thin binding to the standard GGML block packers shipped with DS4."""
 
@@ -661,7 +1053,8 @@ class GGMLQuantizer:
         ]
         self.lib.ds4q_quantize_chunk.restype = ctypes.c_size_t
 
-    def encode(self, values: np.ndarray, qtype: str) -> bytes:
+    def encode(self, values: np.ndarray, qtype: str,
+               imatrix: np.ndarray | None = None) -> bytes:
         if qtype not in QTYPE_LAYOUT:
             fail(f"unsupported GGML quantization target {qtype}")
         source = np.asarray(values)
@@ -684,6 +1077,22 @@ class GGMLQuantizer:
         source = np.ascontiguousarray(source, dtype="<f4")
         nrows = product(source.shape[:-1])
         ncols = source.shape[-1]
+        if qtype == "IQ2_XXS" and imatrix is None:
+            fail("IQ2_XXS quantization requires an importance matrix")
+        if imatrix is not None:
+            imatrix = np.ascontiguousarray(imatrix, dtype="<f4")
+            if imatrix.ndim != 1 or imatrix.size != ncols:
+                fail(
+                    f"{qtype} imatrix width {imatrix.size} does not match "
+                    f"tensor width {ncols}"
+                )
+            if not np.all(np.isfinite(imatrix)) or np.any(imatrix < 0.0):
+                fail(f"{qtype} imatrix contains nonfinite/negative weights")
+            imatrix_ptr = imatrix.ctypes.data_as(
+                ctypes.POINTER(ctypes.c_float)
+            )
+        else:
+            imatrix_ptr = None
         row_size = self.lib.ds4q_row_size(qtype_id, ncols)
         if row_size <= 0:
             fail(f"invalid {qtype} row geometry {ncols}")
@@ -696,7 +1105,7 @@ class GGMLQuantizer:
             0,
             nrows,
             ncols,
-            None,
+            imatrix_ptr,
         )
         if written != output.nbytes:
             fail(
@@ -756,6 +1165,7 @@ class Action:
     qtype: str | None = None
     scale: float = 1.0
     pad_last_to: int = 0
+    imatrix_names: tuple[str, ...] = ()
 
 
 def quant_specs(base: str, shape: tuple[int, ...], role: str,
@@ -839,7 +1249,9 @@ def q8_role(target: str) -> str:
     return "dense"
 
 
-def make_action(db: SourceDB, source: str) -> Action | None:
+def make_action(db: SourceDB, source: str,
+                profile: str | PackProfile = "q4") -> Action | None:
+    profile = pack_profile(profile)
     info = db.tensors[source]
     shape = info["shape"]
     dtype = info["dtype"]
@@ -888,11 +1300,24 @@ def make_action(db: SourceDB, source: str) -> Action | None:
         half_shape = (shape[0], shape[1] // 2, shape[2])
         prefix = target[:-len("experts.gate_up_proj")] + "switch_mlp."
         specs = quant_specs(prefix + "gate_proj.weight", half_shape,
-                            "routed_expert", source, "Q4_K")
+                            "routed_expert", source,
+                            profile.gate_up_qtype)
         specs += quant_specs(prefix + "up_proj.weight", half_shape,
-                             "routed_expert", source, "Q4_K")
+                             "routed_expert", source,
+                             profile.gate_up_qtype)
+        imatrix_names = ()
+        if profile.name == "q2":
+            layer = layer_of(renamed(source))
+            if layer is None:
+                fail(f"{source}: Q2 routed gate/up has no imatrix layer")
+            imatrix_names = (
+                f"blk.{layer}.ffn_gate_exps.weight",
+                f"blk.{layer}.ffn_up_exps.weight",
+            )
         return Action(
-            source, "split_gate_up", "routed_expert", specs, "Q4_K"
+            source, "split_gate_up", "routed_expert", specs,
+            profile.gate_up_qtype,
+            imatrix_names=imatrix_names,
         )
     if target.endswith(".mlp.experts.down_proj"):
         expected = (
@@ -902,13 +1327,24 @@ def make_action(db: SourceDB, source: str) -> Action | None:
             fail(f"{source}: invalid routed down tensor")
         base = target[:-len("experts.down_proj")] + "switch_mlp.down_proj.weight"
         physical_shape = shape[:-1] + (CONFIG["routed_down_physical_input"],)
+        kind = "quant"
+        imatrix_names = ()
+        if profile.name == "q2":
+            layer = layer_of(renamed(source))
+            if layer is None:
+                fail(f"{source}: Q2 routed down has no imatrix layer")
+            kind = "quant_experts"
+            imatrix_names = (f"blk.{layer}.ffn_down_exps.weight",)
         return Action(
-            source, "quant", "routed_expert",
+            source, kind, "routed_expert",
             quant_specs(
-                base, physical_shape, "routed_expert", source, "Q4_K",
+                base, physical_shape, "routed_expert", source,
+                profile.down_qtype,
                 logical_shape=shape,
             ),
-            "Q4_K", pad_last_to=CONFIG["routed_down_physical_input"],
+            profile.down_qtype,
+            pad_last_to=CONFIG["routed_down_physical_input"],
+            imatrix_names=imatrix_names,
         )
 
     if dtype == "BF16" and len(shape) == 2 and not is_bf16_control(target):
@@ -937,8 +1373,52 @@ def make_action(db: SourceDB, source: str) -> Action | None:
     return Action(source, kind, role, [spec], scale=scale)
 
 
+def encode_weighted_experts(values: np.ndarray, qtype: str,
+                            imatrix: QwenGGUFImatrix,
+                            imatrix_name: str,
+                            quantizer: GGMLQuantizer,
+                            threads: int,
+                            pad_last_to: int = 0) -> bytes:
+    if (values.ndim != 3 or
+            values.shape[0] != CONFIG["experts"] or threads < 1):
+        fail(f"{imatrix_name}: invalid weighted expert conversion geometry")
+
+    def convert(expert: int) -> bytes:
+        source_values = np.ascontiguousarray(values[expert])
+        weights = imatrix.expert_weights(
+            imatrix_name, expert, source_values
+        )
+        expert_values = source_values
+        if pad_last_to:
+            if pad_last_to < source_values.shape[-1]:
+                fail(f"{imatrix_name}: physical padding shrinks the source")
+            padding = pad_last_to - source_values.shape[-1]
+            expert_values = np.pad(
+                source_values, ((0, 0), (0, padding)), mode="constant"
+            )
+            weights = np.pad(weights, (0, padding), mode="constant")
+        return quantizer.encode(expert_values, qtype, weights)
+
+    encoded = bytearray()
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=threads) as executor:
+        window = max(threads * 2, 1)
+        for start in range(0, values.shape[0], window):
+            futures = [
+                executor.submit(convert, expert)
+                for expert in range(
+                    start, min(start + window, values.shape[0])
+                )
+            ]
+            for future in futures:
+                encoded += future.result()
+    return bytes(encoded)
+
+
 def encode_action(action: Action, db: SourceDB,
-                  quantizer: GGMLQuantizer) -> list[bytes]:
+                  quantizer: GGMLQuantizer,
+                  imatrix: QwenGGUFImatrix | None = None,
+                  threads: int = 1) -> list[bytes]:
     value = db.read(action.source)
     if action.scale != 1.0:
         if db.tensors[action.source]["dtype"] != "BF16":
@@ -963,12 +1443,34 @@ def encode_action(action: Action, db: SourceDB,
                 mode="constant",
             )
         return [quantizer.encode(value, action.qtype)]
+    if action.kind == "quant_experts":
+        if imatrix is None or len(action.imatrix_names) != 1:
+            fail(
+                f"{action.source}: weighted Q2 expert conversion requires "
+                "the validated Qwen GGUF imatrix"
+            )
+        return [encode_weighted_experts(
+            value, action.qtype, imatrix, action.imatrix_names[0],
+            quantizer, threads, action.pad_last_to,
+        )]
     if action.kind == "split_gate_up":
         half = value.shape[1] // 2
         result = []
-        for part in (value[:, :half], value[:, half:]):
-            result.append(quantizer.encode(
-                np.ascontiguousarray(part), action.qtype
+        for part_index, part in enumerate((value[:, :half], value[:, half:])):
+            if action.qtype != "IQ2_XXS":
+                result.append(quantizer.encode(
+                    np.ascontiguousarray(part), action.qtype
+                ))
+                continue
+            if imatrix is None or len(action.imatrix_names) != 2:
+                fail(
+                    f"{action.source}: Q2 routed gate/up conversion requires "
+                    "the validated Qwen GGUF imatrix"
+                )
+            imatrix_name = action.imatrix_names[part_index]
+            result.append(encode_weighted_experts(
+                part, action.qtype, imatrix, imatrix_name,
+                quantizer, threads,
             ))
         return result
     fail(f"unknown conversion action {action.kind}")
@@ -999,21 +1501,29 @@ def tensor_record(spec: TensorSpec, artifact: str, sha256: str) -> dict:
 
 
 def common_metadata(pack_id: str, source_revision: str,
-                    artifact: str) -> list[bytes]:
+                    artifact: str,
+                    profile: str | PackProfile = "q4") -> list[bytes]:
+    profile = pack_profile(profile)
     c = CONFIG
     records = [
         kv_string("general.architecture", ARCH if artifact == "base" else f"{ARCH}-{artifact}"),
-        kv_string("general.name", f"Qwen3.8-Flash-Next DS4 Q4 {artifact}"),
+        kv_string(
+            "general.name",
+            f"Qwen3.8-Flash-Next DS4 {profile.name.upper()} {artifact}",
+        ),
         kv_u32("general.alignment", GGUF_ALIGNMENT),
         kv_string("general.source.revision", source_revision),
-        kv_u32("ds4.pack.version", PACK_VERSION),
+        kv_u32("ds4.pack.version", profile.pack_version),
         kv_string("ds4.pack.id", pack_id),
         kv_string("ds4.pack.artifact", artifact),
-        kv_string("ds4.pack.manifest.file", MANIFEST_NAME),
+        kv_string("ds4.pack.manifest.file", profile.manifest_name),
         kv_u32("ds4.pack.shard.count", 1),
         kv_u32("ds4.pack.shard.index", 0),
         kv_string("ds4.pack.quant.format", "ggml-block"),
-        kv_string("ds4.pack.quant.routed", "Q4_K"),
+        kv_string(
+            "ds4.pack.quant.routed",
+            "Q4_K" if profile.name == "q4" else "mixed-q2",
+        ),
         kv_string("ds4.pack.quant.embedding", "BF16"),
         kv_string("ds4.pack.quant.control", "source"),
         kv_string("ds4.pack.quant.dense", "Q8_0"),
@@ -1077,11 +1587,22 @@ def common_metadata(pack_id: str, source_revision: str,
         kv_u32("qwen4-exp.vision.start_token_id", c["vision_start_token"]),
         kv_u32("qwen4-exp.vision.end_token_id", c["vision_end_token"]),
     ]
+    if profile.name == "q2":
+        routed_index = next(
+            index for index, record in enumerate(records)
+            if record.startswith(pack_string("ds4.pack.quant.routed"))
+        ) + 1
+        records[routed_index:routed_index] = [
+            kv_string("ds4.pack.quant.routed_gate_up", "IQ2_XXS"),
+            kv_string("ds4.pack.quant.routed_down", "Q2_K"),
+        ]
     return records
 
 
 def write_gguf(path: Path, actions: list[Action], metadata: list[bytes],
-               tensor_records: dict, quantizer: GGMLQuantizer):
+               tensor_records: dict, quantizer: GGMLQuantizer,
+               imatrix: QwenGGUFImatrix | None = None,
+               threads: int = 1):
     specs = [spec for action in actions for spec in action.specs]
     names = [spec.name for spec in specs]
     if len(names) != len(set(names)):
@@ -1104,7 +1625,9 @@ def write_gguf(path: Path, actions: list[Action], metadata: list[bytes],
             fp.write(tensor_header(spec))
         fp.write(b"\0" * (data_offset - fp.tell()))
         for action in actions:
-            payloads = encode_action(action, SOURCE, quantizer)
+            payloads = encode_action(
+                action, SOURCE, quantizer, imatrix, threads
+            )
             if len(payloads) != len(action.specs):
                 fail(f"{action.source}: internal output-count mismatch")
             for spec, raw in zip(action.specs, payloads):
@@ -1194,8 +1717,12 @@ class RandomGGUFWriter:
         self.fp = path.open("r+b")
 
     def write_action(self, action: Action, db: SourceDB,
-                     quantizer: GGMLQuantizer, tensor_records: dict):
-        payloads = encode_action(action, db, quantizer)
+                     quantizer: GGMLQuantizer, tensor_records: dict,
+                     imatrix: QwenGGUFImatrix | None = None,
+                     threads: int = 1):
+        payloads = encode_action(
+            action, db, quantizer, imatrix, threads
+        )
         if len(payloads) != len(action.specs):
             fail(f"{action.source}: internal output-count mismatch")
         digests = {}
@@ -1267,7 +1794,9 @@ def ple_tensor_specs(rows: int, dim: int = 160) -> list[TensorSpec]:
 
 
 def ple_gguf_layout(rows: int, pack_id: str, source_revision: str,
-                    dim: int = 160) -> PleGGUFLayout:
+                    dim: int = 160,
+                    profile: str | PackProfile = "q4") -> PleGGUFLayout:
+    profile = pack_profile(profile)
     specs = ple_tensor_specs(rows, dim)
     if len(specs) != ARTIFACT_TENSOR_COUNTS["ple"]:
         fail(
@@ -1277,9 +1806,9 @@ def ple_gguf_layout(rows: int, pack_id: str, source_revision: str,
     actions = [
         Action(spec.source, "copy", spec.role, [spec]) for spec in specs
     ]
-    metadata = common_metadata(pack_id, source_revision, "ple")
+    metadata = common_metadata(pack_id, source_revision, "ple", profile)
     laid_out, offsets, data_offset, final_size = gguf_layout(
-        actions, metadata, PLE_NAME
+        actions, metadata, profile.ple_name
     )
     for spec, offset in zip(laid_out, offsets):
         spec.offset = offset
@@ -1306,12 +1835,16 @@ class PleGGUFWriter:
 
     def __init__(self, path: Path, rows: int, pack_id: str,
                  source_revision: str, quantizer: GGMLQuantizer,
-                 dim: int = 160, resume: bool = False):
+                 dim: int = 160, resume: bool = False,
+                 profile: str | PackProfile = "q4"):
         self.path = path
         self.rows = rows
         self.dim = dim
         self.quantizer = quantizer
-        layout = ple_gguf_layout(rows, pack_id, source_revision, dim)
+        self.profile = pack_profile(profile)
+        layout = ple_gguf_layout(
+            rows, pack_id, source_revision, dim, self.profile
+        )
         self.data_offset = layout.data_offset
         self.specs = layout.specs
         self.specs_by_name = {spec.name: spec for spec in self.specs}
@@ -1556,10 +2089,12 @@ def ple_aux_target(source: str) -> str:
 
 def create_ple(db: SourceDB, destination: Path, tensor_records: dict,
                pack_id: str, source_revision: str,
-               quantizer: GGMLQuantizer):
+               quantizer: GGMLQuantizer,
+               profile: str | PackProfile = "q4"):
     names, row_offsets, rows, aux_by_name = ple_source_layout(db)
     writer = PleGGUFWriter(
-        destination, rows, pack_id, source_revision, quantizer
+        destination, rows, pack_id, source_revision, quantizer,
+        profile=profile,
     )
     for name, expected in aux_by_name.items():
         validate_ple_aux_tensor(db, name, expected)
@@ -1577,14 +2112,19 @@ def create_ple(db: SourceDB, destination: Path, tensor_records: dict,
     record_ple_tensors(destination, writer, tensor_records)
 
 
-def build_plan(db: SourceDB) -> dict[str, list[Action]]:
+def build_plan(db: SourceDB,
+               profile: str | PackProfile = "q4",
+               include_mtp: bool = True) -> dict[str, list[Action]]:
+    profile = pack_profile(profile)
     plan = {"base": [], "vision": [], "mtp": []}
     base_groups: list[list[Action]] = [[] for _ in range(4)]
     for source in sorted(db.tensors):
         artifact = artifact_for(source)
         if artifact == "ple":
             continue
-        action = make_action(db, source)
+        if artifact == "mtp" and not include_mtp:
+            continue
+        action = make_action(db, source, profile)
         if action is not None:
             if artifact == "base":
                 base_groups[base_locality_group(source)].append(action)
@@ -1629,12 +2169,16 @@ def artifact_record(path: Path, kind: str) -> dict:
     }
 
 
-def refuse_legacy_artifacts(output_root: Path):
+def refuse_legacy_artifacts(output_root: Path,
+                            profile: str | PackProfile = "q4"):
+    profile = pack_profile(profile)
+    if profile.name != "q4":
+        return
     legacy = [output_root / name for name in LEGACY_ARTIFACT_NAMES]
     found = [path for path in legacy if path.exists() or path.is_symlink()]
     if found:
         fail(
-            f"legacy Qwen pack artifact is not accepted by pack v{PACK_VERSION}: "
+            f"legacy Qwen pack artifact is not accepted by pack v{profile.pack_version}: "
             f"{found[0]}; convert into a new output directory"
         )
 
@@ -1651,14 +2195,16 @@ def record_ple_tensors(destination: Path, writer: PleGGUFWriter,
 
 
 def write_pack_manifest(args, pack_id: str, tensor_records: dict,
-                        artifacts: list[dict]):
+                        artifacts: list[dict],
+                        imatrix: QwenGGUFImatrix | None = None):
+    profile = profile_from_args(args)
     tensor_manifest = json.dumps(
         tensor_records, sort_keys=True, separators=(",", ":")
     ).encode()
     manifest = {
         "schema": "ds4.qwen4.fast-pack",
-        "version": PACK_VERSION,
-        "required_ds4_version": "qwen3.8-flash-next-q4",
+        "version": profile.pack_version,
+        "required_ds4_version": profile.required_ds4_version,
         "architecture": ARCH,
         "pack_id": pack_id,
         "source": {
@@ -1716,7 +2262,23 @@ def write_pack_manifest(args, pack_id: str, tensor_records: dict,
         "tensor_manifest_sha256": hashlib.sha256(tensor_manifest).hexdigest(),
         "tensors": tensor_records,
     }
-    manifest_path = args.out / MANIFEST_NAME
+    if profile.name == "q2":
+        if imatrix is None:
+            fail("Q2 pack manifest requires validated imatrix provenance")
+        manifest["quantization"]["routed_experts"] = {
+            "gate_up": {
+                "qtype": "IQ2_XXS",
+                "block_size": QTYPE_LAYOUT["IQ2_XXS"][0],
+                "block_bytes": QTYPE_LAYOUT["IQ2_XXS"][1],
+            },
+            "down": {
+                "qtype": "Q2_K",
+                "block_size": QTYPE_LAYOUT["Q2_K"][0],
+                "block_bytes": QTYPE_LAYOUT["Q2_K"][1],
+            },
+            "imatrix": imatrix.provenance(),
+        }
+    manifest_path = args.out / profile.manifest_name
     temporary = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
     with temporary.open("w") as fp:
         fp.write(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
@@ -1770,8 +2332,12 @@ def require_conversion_space(output_root: Path, staging_root: Path,
 
 def create_streamed_pack(args, db: SourceDB, plan: dict[str, list[Action]],
                          quantizer: GGMLQuantizer, pack_id: str,
-                         tokenizer: list[bytes], chat_template: bytes):
-    refuse_legacy_artifacts(args.out)
+                         tokenizer: list[bytes], chat_template: bytes,
+                         imatrix: QwenGGUFImatrix | None = None):
+    profile = profile_from_args(args)
+    if profile.name == "q2" and imatrix is None:
+        fail("Q2 pack conversion requires a validated GGUF imatrix")
+    refuse_legacy_artifacts(args.out, profile)
     selected = ["base"]
     if not args.no_vision:
         if not plan["vision"]:
@@ -1783,15 +2349,15 @@ def create_streamed_pack(args, db: SourceDB, plan: dict[str, list[Action]],
         selected.append("mtp")
 
     filenames = {
-        "base": BASE_NAME,
-        "vision": VISION_NAME,
-        "mtp": MTP_NAME,
+        "base": profile.base_name,
+        "vision": profile.vision_name,
+        "mtp": profile.mtp_name,
     }
     metadata = {}
     for key in selected:
         if key == "base":
             records = common_metadata(
-                pack_id, args.source_revision, "base"
+                pack_id, args.source_revision, "base", profile
             )
             records += tokenizer
             records.append(
@@ -1799,7 +2365,7 @@ def create_streamed_pack(args, db: SourceDB, plan: dict[str, list[Action]],
             )
         else:
             records = common_metadata(
-                pack_id, args.source_revision, key
+                pack_id, args.source_revision, key, profile
             )
         metadata[key] = records
 
@@ -1818,7 +2384,7 @@ def create_streamed_pack(args, db: SourceDB, plan: dict[str, list[Action]],
                    separators=(",", ":")).encode()
     ).hexdigest()
     identity = {
-        "state_version": CONVERSION_STATE_VERSION,
+        "state_version": profile.state_version,
         "pack_id": pack_id,
         "source_revision": args.source_revision,
         "source_index_sha256": source_identity,
@@ -1827,8 +2393,12 @@ def create_streamed_pack(args, db: SourceDB, plan: dict[str, list[Action]],
         "remote_repo": args.remote_repo,
         "selected_artifacts": selected,
     }
-    state_path = args.out / STATE_NAME
-    manifest_path = args.out / MANIFEST_NAME
+    if profile.name == "q2":
+        identity["profile"] = profile.name
+        identity["pack_version"] = profile.pack_version
+        identity["imatrix"] = imatrix.provenance()
+    state_path = args.out / profile.state_name
+    manifest_path = args.out / profile.manifest_name
     if manifest_path.exists():
         fail(
             f"{args.out} already contains a finalized Qwen pack; choose a "
@@ -1840,7 +2410,7 @@ def create_streamed_pack(args, db: SourceDB, plan: dict[str, list[Action]],
     resume = state_path.is_file()
     partial_artifacts = [
         args.out / filenames[key] for key in selected
-    ] + [args.out / PLE_NAME]
+    ] + [args.out / profile.ple_name]
     if not resume and not args.fresh:
         existing = [path for path in partial_artifacts if path.exists()]
         if existing:
@@ -1898,7 +2468,7 @@ def create_streamed_pack(args, db: SourceDB, plan: dict[str, list[Action]],
     ple_writer = None
     try:
         ple_names, ple_rows, total_ple_rows, aux_by_name = ple_source_layout(db)
-        ple_path = args.out / PLE_NAME
+        ple_path = args.out / profile.ple_name
 
         work_by_shard: dict[str, list[tuple[str, Action]]] = {}
         for key in selected:
@@ -1925,7 +2495,11 @@ def create_streamed_pack(args, db: SourceDB, plan: dict[str, list[Action]],
                 f"{sorted(unknown_completed)[0]}"
             )
 
-        staging_root = args.staging_dir or (args.out / ".qwen4-source-stage")
+        staging_root = args.staging_dir or (
+            args.out /
+            (".qwen4-source-stage" if profile.name == "q4" else
+             ".qwen2-source-stage")
+        )
         artifact_sizes = {
             args.out / filenames[key]: gguf_layout(
                 plan[key], metadata[key], filenames[key]
@@ -1933,7 +2507,8 @@ def create_streamed_pack(args, db: SourceDB, plan: dict[str, list[Action]],
             for key in selected
         }
         artifact_sizes[ple_path] = ple_gguf_layout(
-            total_ple_rows, pack_id, args.source_revision
+            total_ple_rows, pack_id, args.source_revision,
+            profile=profile,
         ).final_size
         if resume:
             artifact_bytes = 0
@@ -1967,7 +2542,7 @@ def create_streamed_pack(args, db: SourceDB, plan: dict[str, list[Action]],
             )
         ple_writer = PleGGUFWriter(
             ple_path, total_ple_rows, pack_id, args.source_revision,
-            quantizer, resume=resume
+            quantizer, resume=resume, profile=profile
         )
         authenticated_tensors = set()
         for source_shard in sorted(completed):
@@ -2021,7 +2596,8 @@ def create_streamed_pack(args, db: SourceDB, plan: dict[str, list[Action]],
                     }
                 for key, action in work_by_shard.get(source_shard, []):
                     digests = writers[key].write_action(
-                        action, db, quantizer, tensor_records
+                        action, db, quantizer, tensor_records, imatrix,
+                        getattr(args, "threads", 1),
                     )
                     overlap = set(shard_auth["tensors"]) & set(digests)
                     if overlap:
@@ -2085,15 +2661,19 @@ def create_streamed_pack(args, db: SourceDB, plan: dict[str, list[Action]],
         ple_writer.close()
 
         record_ple_tensors(ple_path, ple_writer, tensor_records)
-        artifacts = [artifact_record(args.out / BASE_NAME, "base")]
+        artifacts = [artifact_record(args.out / profile.base_name, "base")]
         artifacts.append(artifact_record(ple_path, "ple"))
         if "vision" in selected:
             artifacts.append(
-                artifact_record(args.out / VISION_NAME, "vision")
+                artifact_record(args.out / profile.vision_name, "vision")
             )
         if "mtp" in selected:
-            artifacts.append(artifact_record(args.out / MTP_NAME, "mtp"))
-        write_pack_manifest(args, pack_id, tensor_records, artifacts)
+            artifacts.append(
+                artifact_record(args.out / profile.mtp_name, "mtp")
+            )
+        write_pack_manifest(
+            args, pack_id, tensor_records, artifacts, imatrix
+        )
         state_path.unlink()
         try:
             staging_root.rmdir()
@@ -2109,7 +2689,8 @@ def create_streamed_pack(args, db: SourceDB, plan: dict[str, list[Action]],
 def rebuild_vision_artifact(args, db: SourceDB,
                             plan: dict[str, list[Action]],
                             quantizer: GGMLQuantizer,
-                            pack_id: str):
+                            pack_id: str,
+                            imatrix: QwenGGUFImatrix | None = None):
     """Atomically rebuild the small vision sidecar in a finalized pack.
 
     The official visual graph lives in one source shard.  Keeping this repair
@@ -2117,12 +2698,13 @@ def rebuild_vision_artifact(args, db: SourceDB,
     practice without rewriting a valid 100 GB base/PLE pack.  The existing
     manifest is the authority for every untouched artifact and tensor record.
     """
-    manifest_path = args.out / MANIFEST_NAME
+    profile = profile_from_args(args)
+    manifest_path = args.out / profile.manifest_name
     if not manifest_path.is_file():
         fail(f"--rebuild-vision requires an existing {manifest_path}")
     manifest = json.loads(manifest_path.read_text())
     if (manifest.get("schema") != "ds4.qwen4.fast-pack" or
-            manifest.get("version") != PACK_VERSION or
+            manifest.get("version") != profile.pack_version or
             manifest.get("pack_id") != pack_id or
             manifest.get("source", {}).get("revision") !=
             args.source_revision):
@@ -2135,17 +2717,20 @@ def rebuild_vision_artifact(args, db: SourceDB,
         entry for entry in artifacts
         if isinstance(entry, dict) and entry.get("kind") == "vision"
     ]
-    if len(vision_entries) != 1 or vision_entries[0].get("path") != VISION_NAME:
+    if (len(vision_entries) != 1 or
+            vision_entries[0].get("path") != profile.vision_name):
         fail("existing Qwen pack manifest has no unique vision sidecar")
 
     actions = plan["vision"]
     if not actions:
         fail("official checkpoint has no model.visual tensors")
     validate_artifact_tensor_counts(plan, ["vision"])
-    temporary = args.out / (VISION_NAME + ".rebuild")
+    temporary = args.out / (profile.vision_name + ".rebuild")
     if temporary.exists():
         temporary.unlink()
-    metadata = common_metadata(pack_id, args.source_revision, "vision")
+    metadata = common_metadata(
+        pack_id, args.source_revision, "vision", profile
+    )
     writer = RandomGGUFWriter(temporary, actions, metadata, resume=False)
     new_records = {}
     staging_root = args.staging_dir or (args.out / ".qwen4-vision-stage")
@@ -2172,13 +2757,13 @@ def rebuild_vision_artifact(args, db: SourceDB,
             fail("rebuilt vision tensor directory is incomplete")
         writer.close()
         for record in new_records.values():
-            record["artifact"] = VISION_NAME
-        final_path = args.out / VISION_NAME
+            record["artifact"] = profile.vision_name
+        final_path = args.out / profile.vision_name
         os.replace(temporary, final_path)
 
         merged_records = {
             name: record for name, record in tensors.items()
-            if record.get("artifact") != VISION_NAME
+            if record.get("artifact") != profile.vision_name
         }
         merged_records.update(new_records)
         merged_artifacts = []
@@ -2188,7 +2773,7 @@ def rebuild_vision_artifact(args, db: SourceDB,
             else:
                 merged_artifacts.append(entry)
         write_pack_manifest(
-            args, pack_id, merged_records, merged_artifacts
+            args, pack_id, merged_records, merged_artifacts, imatrix
         )
     finally:
         writer.close()
@@ -2200,21 +2785,59 @@ def rebuild_vision_artifact(args, db: SourceDB,
             pass
 
 
-def plan_summary(plan: dict[str, list[Action]], db: SourceDB):
-    print("DS4 Qwen3.8-Flash-Next pack plan")
+def plan_summary(plan: dict[str, list[Action]], db: SourceDB,
+                 profile: str | PackProfile = "q4"):
+    profile = pack_profile(profile)
+    print(
+        "DS4 Qwen3.8-Flash-Next pack plan" if profile.name == "q4" else
+        "DS4 Qwen3.8-Flash-Next Q2 pack plan"
+    )
     print(f"source tensors: {len(db.tensors)}")
+    type_bytes: dict[str, int] = {}
     for name in ("base", "vision", "mtp"):
         actions = plan[name]
         specs = [spec for action in actions for spec in action.specs]
+        for spec in specs:
+            type_bytes[spec.dtype] = type_bytes.get(spec.dtype, 0) + spec.nbytes
         print(f"{name}: actions={len(actions)} tensors={len(specs)} "
               f"payload={sum(spec.nbytes for spec in specs) / 1e9:.3f} GB")
     ngram = [name for name in db.tensors if NGRAM_MARK in name]
-    print(f"ple: source_shards={len(ngram)} rows="
-          f"{sum(db.tensors[name]['shape'][0] for name in ngram)}")
+    ple_rows = sum(db.tensors[name]["shape"][0] for name in ngram)
+    print(f"ple: source_shards={len(ngram)} rows={ple_rows}")
+    if profile.name == "q2":
+        print(
+            "q2_recipe: gate_up=IQ2_XXS down=Q2_K dense=Q8_0 "
+            "embedding_control=BF16 ple=Q4_1"
+        )
+        for qtype, nbytes in sorted(type_bytes.items()):
+            print(f"type_bytes: {qtype} {nbytes}")
+        ple_bytes = ple_rows * (
+            CONFIG["ple_row_dim"] // QTYPE_LAYOUT["Q4_1"][0]
+        ) * QTYPE_LAYOUT["Q4_1"][1]
+        base_bytes = sum(
+            spec.nbytes for action in plan["base"] for spec in action.specs
+        )
+        sidecar_bytes = sum(
+            spec.nbytes
+            for name in ("vision", "mtp")
+            for action in plan[name]
+            for spec in action.specs
+        )
+        print(f"projected_base_bytes: {base_bytes}")
+        print(f"projected_ple_bytes: {ple_bytes}")
+        print(f"projected_optional_sidecar_bytes: {sidecar_bytes}")
+        print(
+            "projected_all_payload_bytes: "
+            f"{base_bytes + ple_bytes + sidecar_bytes}"
+        )
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--profile", choices=tuple(PACK_PROFILES), default="q4",
+        help="pack recipe: q4 keeps pack v3; q2 emits mixed-IQ2/Q2 pack v4",
+    )
     parser.add_argument("--src", required=True, type=Path,
                         help="official checkpoint or local metadata directory")
     parser.add_argument("--out", required=True, type=Path)
@@ -2224,6 +2847,19 @@ def parse_args(argv=None):
                         help="GGUF with the exact 248320-token Qwen tokenizer")
     parser.add_argument("--quants-library", type=Path,
                         help="path to libds4quants (defaults beside this script)")
+    parser.add_argument(
+        "--imatrix", type=Path,
+        help="Q2 GGUF imatrix (required by --profile q2 except --dry-run)",
+    )
+    parser.add_argument(
+        "--imatrix-revision", default=Q2_IMATRIX_REVISION,
+        help="immutable source revision recorded for the Q2 imatrix",
+    )
+    parser.add_argument(
+        "--threads", type=int,
+        default=min(8, os.cpu_count() or 1),
+        help="ordered parallel IQ2 expert encodes (default: min(8, CPU count))",
+    )
     parser.add_argument(
         "--remote-repo",
         help=(
@@ -2250,7 +2886,19 @@ def parse_args(argv=None):
             "existing finalized pack"
         ),
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.threads < 1 or args.threads > 64:
+        parser.error("--threads must be between 1 and 64")
+    if args.profile == "q4" and args.imatrix is not None:
+        parser.error("--imatrix applies only to --profile q2")
+    if args.profile == "q2" and not args.dry_run and args.imatrix is None:
+        parser.error("--profile q2 requires --imatrix")
+    if args.profile == "q2" and not args.no_mtp:
+        parser.error(
+            "--profile q2 requires --no-mtp until a calibrated MTP "
+            "expert imatrix is available"
+        )
+    return args
 
 
 SOURCE: SourceDB
@@ -2259,46 +2907,76 @@ SOURCE: SourceDB
 def main(argv=None):
     global SOURCE
     args = parse_args(argv)
+    profile = profile_from_args(args)
     if (len(args.source_revision) != 40 or
             any(ch not in "0123456789abcdefABCDEF" for ch in args.source_revision)):
         fail("--source-revision must be a 40-character immutable commit SHA")
-    token = get_token() if args.remote_repo else None
-    SOURCE = SourceDB(
-        args.src, args.remote_repo, args.source_revision, token
-    )
-    validate_source_config(SOURCE.config)
-    plan = build_plan(SOURCE)
-    validate_artifact_tensor_counts(
-        plan,
-        ["base"] + [name for name in ("vision", "mtp") if plan[name]],
-    )
-    plan_summary(plan, SOURCE)
-    if args.dry_run:
-        return 0
+    if (profile.name == "q2" and
+            (len(args.imatrix_revision) != 40 or
+             any(ch not in "0123456789abcdefABCDEF"
+                 for ch in args.imatrix_revision))):
+        fail("--imatrix-revision must be a 40-character immutable commit SHA")
+    imatrix = None
+    try:
+        if profile.name == "q2" and args.imatrix is not None:
+            imatrix = QwenGGUFImatrix(
+                args.imatrix,
+                expected_sha256=Q2_IMATRIX_SHA256,
+                repository=Q2_IMATRIX_REPOSITORY,
+                revision=args.imatrix_revision,
+            )
+        token = get_token() if args.remote_repo else None
+        SOURCE = SourceDB(
+            args.src, args.remote_repo, args.source_revision, token
+        )
+        validate_source_config(SOURCE.config)
+        plan = build_plan(
+            SOURCE, profile,
+            include_mtp=(profile.name == "q4" or not args.no_mtp),
+        )
+        validate_artifact_tensor_counts(
+            plan,
+            ["base"] + [name for name in ("vision", "mtp") if plan[name]],
+        )
+        plan_summary(plan, SOURCE, profile)
+        if args.dry_run:
+            return 0
 
-    args.out.mkdir(parents=True, exist_ok=True)
-    refuse_legacy_artifacts(args.out)
-    quantizer = GGMLQuantizer(
-        args.quants_library or default_quantizer_library()
-    )
-    pack_id = hashlib.sha256(
-        ("ds4-qwen3.8-flash-next-q4-v3\0" + args.source_revision).encode()
-    ).hexdigest()[:32]
-    if args.rebuild_vision:
-        if args.no_vision or args.fresh:
-            fail("--rebuild-vision is incompatible with --no-vision/--fresh")
-        rebuild_vision_artifact(args, SOURCE, plan, quantizer, pack_id)
+        args.out.mkdir(parents=True, exist_ok=True)
+        refuse_legacy_artifacts(args.out, profile)
+        quantizer = GGMLQuantizer(
+            args.quants_library or default_quantizer_library()
+        )
+        identity = profile.pack_identity + "\0" + args.source_revision
+        if profile.name == "q2":
+            identity += (
+                "\0" + imatrix.sha256 + "\0" + args.imatrix_revision
+            )
+        pack_id = hashlib.sha256(identity.encode()).hexdigest()[:32]
+        if args.rebuild_vision:
+            if args.no_vision or args.fresh:
+                fail("--rebuild-vision is incompatible with --no-vision/--fresh")
+            rebuild_vision_artifact(
+                args, SOURCE, plan, quantizer, pack_id, imatrix
+            )
+            return 0
+        tokenizer, tokens = load_tokenizer_records(args.tokenizer_template)
+        if len(tokens) != CONFIG["vocab"]:
+            fail(
+                f"tokenizer template has {len(tokens)} tokens, "
+                f"expected {CONFIG['vocab']}"
+            )
+        chat_template = SOURCE.read_metadata_file("chat_template.jinja")
+        if not chat_template.strip():
+            fail("official chat template is empty")
+        create_streamed_pack(
+            args, SOURCE, plan, quantizer, pack_id, tokenizer,
+            chat_template, imatrix,
+        )
         return 0
-    tokenizer, tokens = load_tokenizer_records(args.tokenizer_template)
-    if len(tokens) != CONFIG["vocab"]:
-        fail(f"tokenizer template has {len(tokens)} tokens, expected {CONFIG['vocab']}")
-    chat_template = SOURCE.read_metadata_file("chat_template.jinja")
-    if not chat_template.strip():
-        fail("official chat template is empty")
-    create_streamed_pack(
-        args, SOURCE, plan, quantizer, pack_id, tokenizer, chat_template
-    )
-    return 0
+    finally:
+        if imatrix is not None:
+            imatrix.close()
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ bool ds4_log_is_tty(FILE *fp) {
 static void *model_fixture_allocation;
 static size_t model_fixture_size;
 static void *moe_rows8_fixture_allocation;
+static void *moe_q2_rows8_fixture_allocation;
 static void *vision_fc2_fixture_allocation;
 
 static void require_ok(int ok, const char *what) {
@@ -39,6 +40,10 @@ static void test_fast_path_capabilities(void) {
     require_ok(caps.missing_mask == 0u,
                caps.missing_reason[0] ? caps.missing_reason
                                       : "Qwen mandatory Metal capabilities");
+    require_ok((caps.available_mask & DS4_QWEN4_FAST_EXACT_Q2_MOE) != 0u,
+               "Qwen exact IQ2_XXS/Q2_K prefill capability");
+    require_ok((caps.available_mask & DS4_QWEN4_FAST_DECODE_Q2) != 0u,
+               "Qwen IQ2_XXS/Q2_K decode capability");
 
     const char *forced = "kernel_qwen4_qsa_score_m1_f32_bf16";
     require_ok(setenv("DS4_QWEN4_TEST_MISSING_PIPELINE", forced, 1) == 0,
@@ -53,6 +58,21 @@ static void test_fast_path_capabilities(void) {
                "Qwen missing pipeline reason");
     require_ok(unsetenv("DS4_QWEN4_TEST_MISSING_PIPELINE") == 0,
                "clear Qwen missing-pipeline override");
+
+    const char *forced_q2 =
+        "kernel_qwen4_moe_iq2_xxs_gate_up_rows8";
+    require_ok(setenv("DS4_QWEN4_TEST_MISSING_PIPELINE", forced_q2, 1) == 0,
+               "set Qwen Q2 missing-pipeline override");
+    require_ok(ds4_gpu_qwen4_query_fast_path_caps(&caps),
+               "Qwen Q2 overridden fast-path capability query");
+    require_ok((caps.available_mask & DS4_QWEN4_FAST_EXACT_Q2_MOE) == 0u,
+               "Qwen missing exact Q2 capability is reported");
+    require_ok((caps.available_mask & DS4_QWEN4_FAST_DECODE_Q2) != 0u,
+               "Qwen unrelated Q2 decode capability remains available");
+    require_ok(strstr(caps.missing_reason, forced_q2) != NULL,
+               "Qwen missing Q2 pipeline reason");
+    require_ok(unsetenv("DS4_QWEN4_TEST_MISSING_PIPELINE") == 0,
+               "clear Qwen Q2 missing-pipeline override");
 }
 
 static uint16_t f32_to_bf16(float value) {
@@ -174,8 +194,22 @@ typedef struct {
     uint8_t qs[128];
 } test_block_q4_k;
 
+typedef struct {
+    uint16_t d;
+    uint16_t qs[32];
+} test_block_iq2_xxs;
+
+typedef struct {
+    uint8_t scales[16];
+    uint8_t qs[64];
+    uint16_t d;
+    uint16_t dmin;
+} test_block_q2_k;
+
 _Static_assert(sizeof(test_block_q8_0) == 34u, "Q8_0 block size");
 _Static_assert(sizeof(test_block_q4_k) == 144u, "Q4_K block size");
+_Static_assert(sizeof(test_block_iq2_xxs) == 66u, "IQ2_XXS block size");
+_Static_assert(sizeof(test_block_q2_k) == 84u, "Q2_K block size");
 
 enum {
     QWEN4_VISION_FC2_LOGICAL_DIM = 4304,
@@ -370,6 +404,127 @@ static float q4_k_value(const test_block_q4_k *matrix,
     const uint32_t q = (packed >> ((group & 1u) * 4u)) & 15u;
     uint32_t scale, minimum;
     q4_k_scale_min(qb->scales, group, &scale, &minimum);
+    return f16_to_f32(qb->d) * (float)scale * (float)q -
+           f16_to_f32(qb->dmin) * (float)minimum;
+}
+
+static uint8_t iq2_sign_mask(uint32_t code) {
+    uint32_t parity = 0u;
+    for (uint32_t bits = code; bits != 0u; bits >>= 1u)
+        parity ^= bits & 1u;
+    return (uint8_t)(code | (parity << 7u));
+}
+
+static void fill_iq2_xxs_matrix(test_block_iq2_xxs *blocks,
+                                uint32_t out_dim,
+                                uint32_t physical_in_dim,
+                                uint32_t seed) {
+    const uint32_t row_blocks = physical_in_dim / 256u;
+    for (uint32_t row = 0; row < out_dim; row++) {
+        for (uint32_t block = 0; block < row_blocks; block++) {
+            test_block_iq2_xxs *qb =
+                blocks + (size_t)row * row_blocks + block;
+            memset(qb, 0, sizeof(*qb));
+            qb->d = f32_to_f16(0.0005f *
+                (float)(1u + ((row + 3u * block + seed) % 7u)));
+            for (uint32_t group = 0; group < 8u; group++) {
+                uint16_t *q = qb->qs + 4u * group;
+                uint8_t *selectors = (uint8_t *)q;
+                uint32_t aux =
+                    ((row + block + group + seed) & 3u) << 28u;
+                for (uint32_t sub = 0; sub < 4u; sub++) {
+                    selectors[sub] = (uint8_t)(
+                        (row + block + group + sub + seed) & 1u);
+                    const uint32_t sign_code =
+                        (row * 11u + block * 7u + group * 5u +
+                         sub * 13u + seed) & 127u;
+                    aux |= sign_code << (7u * sub);
+                }
+                q[2] = (uint16_t)aux;
+                q[3] = (uint16_t)(aux >> 16u);
+            }
+        }
+    }
+}
+
+static float iq2_xxs_value(const test_block_iq2_xxs *matrix,
+                           uint32_t physical_in_dim,
+                           uint32_t row,
+                           uint32_t col) {
+    const uint32_t row_blocks = physical_in_dim / 256u;
+    const test_block_iq2_xxs *qb = matrix +
+        (size_t)row * row_blocks + col / 256u;
+    const uint32_t within = col % 256u;
+    const uint32_t group = within / 32u;
+    const uint32_t in_group = within % 32u;
+    const uint32_t sub = in_group / 8u;
+    const uint32_t j = in_group % 8u;
+    const uint16_t *q = qb->qs + 4u * group;
+    const uint8_t *selectors = (const uint8_t *)q;
+    const uint32_t aux = (uint32_t)q[2] | ((uint32_t)q[3] << 16u);
+    const uint32_t sign_code = (aux >> (7u * sub)) & 127u;
+    const uint8_t signs = iq2_sign_mask(sign_code);
+    /* Fixtures use the first two official IQ2_XXS grid rows. Grid 0 is
+     * eight 8s; grid 1 is 43 followed by seven 8s on little-endian Metal. */
+    const float grid = selectors[sub] == 1u && j == 0u ? 43.0f : 8.0f;
+    const float sign = signs & (uint8_t)(1u << j) ? -1.0f : 1.0f;
+    return f16_to_f32(qb->d) *
+           (0.5f + (float)(aux >> 28u)) * 0.25f * grid * sign;
+}
+
+static void fill_q2_k_matrix(test_block_q2_k *blocks,
+                             uint32_t out_dim,
+                             uint32_t physical_in_dim,
+                             uint32_t seed) {
+    const uint32_t row_blocks = physical_in_dim / 256u;
+    for (uint32_t row = 0; row < out_dim; row++) {
+        for (uint32_t block = 0; block < row_blocks; block++) {
+            test_block_q2_k *qb =
+                blocks + (size_t)row * row_blocks + block;
+            memset(qb, 0, sizeof(*qb));
+            qb->d = f32_to_f16(0.001f *
+                (float)(1u + ((row + block + seed) % 5u)));
+            qb->dmin = f32_to_f16(0.0003f *
+                (float)(1u + ((2u * row + block + seed) % 3u)));
+            for (uint32_t group = 0; group < 16u; group++) {
+                const bool poison_alignment_tail =
+                    physical_in_dim == 768u && block == 2u && group >= 8u;
+                const uint32_t scale = poison_alignment_tail ? 15u :
+                    1u + ((row + block + group + seed) % 7u);
+                const uint32_t minimum = poison_alignment_tail ? 0u :
+                    (row + 2u * block + group + seed) % 4u;
+                qb->scales[group] =
+                    (uint8_t)(scale | (minimum << 4u));
+                const uint32_t q_base =
+                    32u * (group / 8u) + 16u * (group & 1u);
+                const uint32_t shift = ((group / 2u) & 3u) * 2u;
+                for (uint32_t j = 0; j < 16u; j++) {
+                    const uint32_t q = poison_alignment_tail ? 3u :
+                        (row * 3u + block * 5u + group * 7u +
+                         j * 11u + seed) & 3u;
+                    qb->qs[q_base + j] |= (uint8_t)(q << shift);
+                }
+            }
+        }
+    }
+}
+
+static float q2_k_value(const test_block_q2_k *matrix,
+                        uint32_t physical_in_dim,
+                        uint32_t row,
+                        uint32_t col) {
+    const uint32_t row_blocks = physical_in_dim / 256u;
+    const test_block_q2_k *qb = matrix +
+        (size_t)row * row_blocks + col / 256u;
+    const uint32_t within = col % 256u;
+    const uint32_t group = within / 16u;
+    const uint32_t j = within % 16u;
+    const uint32_t q_base =
+        32u * (group / 8u) + 16u * (group & 1u);
+    const uint32_t shift = ((group / 2u) & 3u) * 2u;
+    const uint32_t q = (qb->qs[q_base + j] >> shift) & 3u;
+    const uint32_t scale = qb->scales[group] & 15u;
+    const uint32_t minimum = qb->scales[group] >> 4u;
     return f16_to_f32(qb->d) * (float)scale * (float)q -
            f16_to_f32(qb->dmin) * (float)minimum;
 }
@@ -829,6 +984,144 @@ static void test_moe_q4_k(void) {
         require_ok(ds4_gpu_set_model_map(model_fixture_allocation,
                                          model_fixture_size),
                    "restore Q8_0 model fixture registration");
+}
+
+static void test_moe_iq2_xxs_q2_k(void) {
+    enum {
+        IN = 256, FF = 640, DOWN = 768, OUT = 33,
+        EXPERTS = 12, TOP_K = 10, ROWS = 9,
+    };
+    const size_t gate_bytes = (size_t)EXPERTS * FF * (IN / 256u) *
+        sizeof(test_block_iq2_xxs);
+    const size_t down_bytes = (size_t)EXPERTS * OUT * (DOWN / 256u) *
+        sizeof(test_block_q2_k);
+    size_t cursor = 0u;
+    const size_t gate_offset = cursor;
+    cursor = align_size(cursor + gate_bytes, 64u);
+    const size_t up_offset = cursor;
+    cursor = align_size(cursor + gate_bytes, 64u);
+    const size_t down_offset = cursor;
+    cursor = align_size(cursor + down_bytes, 4096u);
+    require_ok(posix_memalign(&moe_q2_rows8_fixture_allocation,
+                              4096u, cursor) == 0,
+               "IQ2_XXS/Q2_K MoE model allocation");
+    uint8_t *model = moe_q2_rows8_fixture_allocation;
+    memset(model, 0, cursor);
+    test_block_iq2_xxs *gate =
+        (test_block_iq2_xxs *)(model + gate_offset);
+    test_block_iq2_xxs *up =
+        (test_block_iq2_xxs *)(model + up_offset);
+    test_block_q2_k *down =
+        (test_block_q2_k *)(model + down_offset);
+    fill_iq2_xxs_matrix(gate, EXPERTS * FF, IN, 5u);
+    fill_iq2_xxs_matrix(up, EXPERTS * FF, IN, 19u);
+    fill_q2_k_matrix(down, EXPERTS * OUT, DOWN, 37u);
+    require_ok(ds4_gpu_set_model_map(model, cursor),
+               "IQ2_XXS/Q2_K MoE model fixture registration");
+
+    float input[ROWS * IN];
+    int32_t selected[ROWS * TOP_K];
+    float route[ROWS * TOP_K];
+    float expected_mid[ROWS * TOP_K * FF];
+    float expected_out[ROWS * OUT];
+    for (uint32_t i = 0; i < ROWS * IN; i++)
+        input[i] = cosf((float)(i + 1u) * 0.021f) * 0.2f;
+    for (uint32_t row = 0; row < ROWS; row++) {
+        float route_sum = 0.0f;
+        for (uint32_t slot = 0; slot < TOP_K; slot++) {
+            selected[row * TOP_K + slot] =
+                (int32_t)((row * 7u + slot * 5u) % EXPERTS);
+            route[row * TOP_K + slot] = (float)(slot + 1u);
+            route_sum += route[row * TOP_K + slot];
+        }
+        for (uint32_t slot = 0; slot < TOP_K; slot++)
+            route[row * TOP_K + slot] /= route_sum;
+    }
+    for (uint32_t row = 0; row < ROWS; row++) {
+        for (uint32_t slot = 0; slot < TOP_K; slot++) {
+            const uint32_t expert = (uint32_t)selected[row * TOP_K + slot];
+            for (uint32_t output = 0; output < FF; output++) {
+                const uint32_t weight_row = expert * FF + output;
+                float g = 0.0f, u = 0.0f;
+                for (uint32_t k = 0; k < IN; k++) {
+                    const float xv = input[row * IN + k];
+                    g = fmaf(iq2_xxs_value(gate, IN, weight_row, k), xv, g);
+                    u = fmaf(iq2_xxs_value(up, IN, weight_row, k), xv, u);
+                }
+                expected_mid[((size_t)row * TOP_K + slot) * FF + output] =
+                    (g / (1.0f + expf(-g))) * u;
+            }
+        }
+        for (uint32_t output = 0; output < OUT; output++) {
+            float total = 0.0f;
+            for (uint32_t slot = 0; slot < TOP_K; slot++) {
+                const uint32_t expert =
+                    (uint32_t)selected[row * TOP_K + slot];
+                const uint32_t weight_row = expert * OUT + output;
+                float sum = 0.0f;
+                for (uint32_t k = 0; k < FF; k++)
+                    sum = fmaf(q2_k_value(down, DOWN, weight_row, k),
+                        expected_mid[((size_t)row * TOP_K + slot) * FF + k],
+                        sum);
+                total = fmaf(sum, route[row * TOP_K + slot], total);
+            }
+            expected_out[row * OUT + output] = total;
+        }
+    }
+
+    ds4_gpu_tensor *xt = tensor_from(input, sizeof(input));
+    ds4_gpu_tensor *st = tensor_from(selected, sizeof(selected));
+    ds4_gpu_tensor *rt = tensor_from(route, sizeof(route));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(sizeof(expected_mid));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(sizeof(expected_out));
+    float *actual_mid = malloc(sizeof(expected_mid));
+    float *actual_out = malloc(sizeof(expected_out));
+    require_ok(mid && out && actual_mid && actual_out,
+               "IQ2_XXS/Q2_K MoE output allocations");
+    require_ok(setenv("DS4_QWEN4_MOE_EXACT_MIN_ROWS", "1", 1) == 0,
+               "enable IQ2_XXS/Q2_K rows8 fixture");
+    require_ok(ds4_gpu_qwen4_moe_iq2_xxs_q2_k_model(
+        out, mid, xt, st, rt, model, cursor,
+        gate_offset, up_offset, down_offset,
+        IN, FF, OUT, EXPERTS, TOP_K, ROWS),
+        "Qwen IQ2_XXS/Q2_K exact rows8 MoE");
+    require_ok(unsetenv("DS4_QWEN4_MOE_EXACT_MIN_ROWS") == 0,
+               "clear IQ2_XXS/Q2_K rows8 fixture");
+    require_ok(ds4_gpu_tensor_read(mid, 0, actual_mid, sizeof(expected_mid)) &&
+               ds4_gpu_tensor_read(out, 0, actual_out, sizeof(expected_out)),
+               "IQ2_XXS/Q2_K MoE readback");
+    require_array_close_stats("Qwen IQ2_XXS gate/up rows8 mid", actual_mid,
+                              expected_mid, ROWS * TOP_K * FF,
+                              5e-3f, 2e-3f);
+    require_array_close_stats("Qwen Q2_K down rows8 output", actual_out,
+                              expected_out, ROWS * OUT, 3e-2f, 3e-3f);
+
+    ds4_gpu_tensor *mid_m1 = ds4_gpu_tensor_alloc(TOP_K * FF * sizeof(float));
+    ds4_gpu_tensor *out_m1 = ds4_gpu_tensor_alloc(OUT * sizeof(float));
+    require_ok(mid_m1 && out_m1, "IQ2_XXS/Q2_K M=1 allocations");
+    require_ok(ds4_gpu_qwen4_moe_iq2_xxs_q2_k_model(
+        out_m1, mid_m1, xt, st, rt, model, cursor,
+        gate_offset, up_offset, down_offset,
+        IN, FF, OUT, EXPERTS, TOP_K, 1u),
+        "Qwen IQ2_XXS/Q2_K M=1 MoE");
+    require_ok(ds4_gpu_tensor_read(out_m1, 0, actual_out,
+                                   OUT * sizeof(float)),
+               "IQ2_XXS/Q2_K M=1 readback");
+    require_array_close("Qwen IQ2_XXS/Q2_K M=1", actual_out, expected_out,
+                        OUT, 3e-2f, 3e-3f);
+    ds4_gpu_tensor_free(out_m1);
+    ds4_gpu_tensor_free(mid_m1);
+    free(actual_out);
+    free(actual_mid);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(rt);
+    ds4_gpu_tensor_free(st);
+    ds4_gpu_tensor_free(xt);
+    if (model_fixture_allocation != NULL)
+        require_ok(ds4_gpu_set_model_map(model_fixture_allocation,
+                                         model_fixture_size),
+                   "restore Q8_0 model fixture after Q2 MoE");
 }
 
 enum {
@@ -2976,9 +3269,18 @@ int main(void) {
     }
     if (getenv("DS4_QWEN4_MOE_EXACT_FIXTURE_ONLY") != NULL) {
         test_moe_q4_k();
+        test_moe_iq2_xxs_q2_k();
         ds4_gpu_cleanup();
         free(moe_rows8_fixture_allocation);
-        puts("Qwen exact rows8 Q4_K MoE focused fixture PASS");
+        free(moe_q2_rows8_fixture_allocation);
+        puts("Qwen exact rows8 Q4_K and IQ2_XXS/Q2_K MoE focused fixtures PASS");
+        return 0;
+    }
+    if (getenv("DS4_QWEN4_MOE_Q2_FIXTURE_ONLY") != NULL) {
+        test_moe_iq2_xxs_q2_k();
+        ds4_gpu_cleanup();
+        free(moe_q2_rows8_fixture_allocation);
+        puts("Qwen exact rows8 IQ2_XXS/Q2_K MoE focused fixture PASS");
         return 0;
     }
     test_vision_gelu_tail();
@@ -2987,6 +3289,7 @@ int main(void) {
     test_vision_fc2_q8_0_stride();
     test_moe_topk();
     test_moe_q4_k();
+    test_moe_iq2_xxs_q2_k();
     test_ple_gate_conv();
     test_ple_long_tiled_schedule();
     test_gdn_prepare_and_output_norm();
@@ -3009,6 +3312,7 @@ int main(void) {
     test_qsa_streaming_topk();
     ds4_gpu_cleanup();
     free(moe_rows8_fixture_allocation);
+    free(moe_q2_rows8_fixture_allocation);
     free(vision_fc2_fixture_allocation);
     free(model_fixture_allocation);
     puts("Qwen3.8-Flash-Next Metal fixtures PASS");

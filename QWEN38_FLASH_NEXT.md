@@ -1,10 +1,12 @@
 # Qwen3.8-Flash-Next Q4 fast pack
 
-This branch adds the versioned `ds4.qwen4.fast-pack` v3 format and the
+This branch adds the versioned `ds4.qwen4.fast-pack` v3 Q4 format and the
 Qwen3.8-Flash-Next model identity. The model architecture and pack manifest are
 DS4-specific, but every quantized tensor uses a standard GGML/GGUF block type.
 An arbitrary GGUF or an Unsloth quant is not accepted. Legacy custom v1/v2 packs are
 deliberately rejected instead of being interpreted as the v3 block recipe.
+The same loader also accepts the fixed v4 mixed-Q2 profile documented below;
+the version is part of the quantization contract, not a generic format switch.
 
 ## Pack conversion
 
@@ -63,6 +65,66 @@ model state. The external PLE uses `Q4_1` instead of padding every 160-value row
 to a 256-value `Q4_K` block. This keeps each sparse SSD row at 100 bytes while
 removing the former custom weight/scale/bias planes.
 
+### 64 GiB mixed-Q2 profile
+
+Pack v4 is the smaller-backbone profile for a 64 GiB Mac. It quantizes routed
+expert gate/up tensors as standard `IQ2_XXS` and routed down tensors as
+standard `Q2_K`; embeddings, control tensors, Q8 dense projections, shared
+experts, output, and the SSD-backed `Q4_1` PLE keep the v3 precision choices.
+The base metadata must declare `routed=mixed-q2`,
+`routed_gate_up=IQ2_XXS`, and `routed_down=Q2_K`. The loader checks those
+values and every routed tensor type before allocating Metal caches.
+
+```sh
+uv run --script gguf-tools/qwen4_pack.py \
+  --profile q2 \
+  --src /path/to/Qwen3.8-Flash-Next-metadata \
+  --out /path/to/qwen3.8-flash-next-q2 \
+  --remote-repo Qwen/Qwen3.8-Flash-Next \
+  --source-revision de4b8e4d43b917e7706784d8bb445c9af86a3540 \
+  --tokenizer-template /path/to/qwen-tokenizer-template.gguf \
+  --imatrix /path/to/imatrix_unsloth.gguf_file \
+  --threads 4 \
+  --no-mtp
+```
+
+The v4 artifacts and resumable state are distinct from v3:
+`Qwen3.8-Flash-Next-IQ2XXSGateUp-Q2KDown-BF16Emb-BF16Control-Q8GDN-Q8QSA-Q8Shared-Q8Out.gguf`,
+`Qwen3.8-Flash-Next-Q2-PLE-Q4_1.gguf`,
+`qwen3.8-flash-next-q2-vision.gguf`,
+`qwen3.8-flash-next-q2.manifest.json`, and
+`qwen3.8-flash-next-q2.conversion-state.json`. The current geometry projects
+43.139 GB (40.176 GiB) of base tensor payload, 32.00 GB for the SSD-only PLE, and 0.48 GB
+for optional vision. The PLE mapping is sparse and is not made resident as part
+of the base mapping.
+
+`IQ2_XXS` requires the pinned Qwen GGUF importance matrix from
+`unsloth/Qwen3.8-Flash-Next-GGUF` revision
+`c8b5954a88c2775c546b92593eda40ea041d3176`. The converter requires SHA-256
+`a5863123db1ca458727e738955bef7bfc199520aa2bee3a30142a1aff9254154`, validates
+all gate/up/down sum and count tensors for 48 layers by 512 experts, normalizes
+every positive-count expert independently, and records the dataset, chunk
+geometry, digest, revision, and fallback provenance in both conversion identity
+and the final manifest. The verified matrix has 24 zero-count part-experts:
+16 gate/up and eight down. Only those entries use the deterministic
+per-expert input-column weight-energy fallback; missing or malformed entries,
+negative/nonfinite statistics, and any other imatrix digest fail closed.
+
+Routed down remains logically 640 columns and physically 768 columns. The
+converter quantizes each expert independently with its normalized 640-value
+importance vector, zero-pads both source rows and importance to 768, and emits
+three standard `Q2_K` blocks per row. `--threads` controls a bounded ordered
+expert executor; changing the worker count does not change artifact bytes or
+the resumable conversion identity. Use a low value while another conversion is
+active, then resume with more workers later.
+
+Q2 MTP is a matching-profile
+sidecar contract in the runtime, but conversion remains disabled until a
+separately calibrated MTP-expert importance matrix is available. A v3/Q4 MTP
+sidecar is rejected with a v4/Q2 base, and the converter requires explicit
+`--no-mtp` even for `--dry-run`. Vision and PLE sidecars likewise carry the v4
+pack ID/version even though their tensor recipes are unchanged.
+
 The small visual position grid remains BF16 because the patch kernel performs
 direct four-row lookup and bilinear interpolation rather than a projection.
 The official visual FC2 width is 4304, so conversion appends 16 zero columns
@@ -102,15 +164,19 @@ cache allocation.
 
 Loading rejects legacy v1/v2 manifests, missing, duplicate, or extra tensors
 and artifacts, geometry drift, wrong GGUF block recipes, unsafe artifact
-names, checksum failures, a mismatched tensor-manifest digest, and sidecars
-from another pack. The v3 directories are exact: 1,211 base tensors, 333
+names, a mismatched tensor-manifest digest, and sidecars from another pack.
+Like the DeepSeek and GLM loaders, the default trusted-local policy checks
+artifact sizes, GGUF structure and metadata without scanning every payload byte.
+Set `DS4_QWEN4_VERIFY=always` to additionally require every selected artifact's
+manifest SHA-256 before graph allocation. The v3 directories are exact: 1,211 base tensors, 333
 vision tensors, 32 MTP tensors, and four PLE tensors. The summary reports the
 admitted prefill cap, QSA microtile size, active Metal specializations, PLE
 staging mode, partial-RoPE behavior, and sidecar state.
 
-Single-base packaging reduces the number of files, not the authenticated data
-volume. Every cold startup still streams SHA-256 over the complete base GGUF
-and external 29.8 GiB PLE sidecar.
+Single-base packaging reduces the number of files. Normal trusted-local startup
+does not stream the 73.6 GiB base GGUF or external 29.8 GiB PLE sidecar merely
+to recompute their converter-recorded hashes. Strict verification remains
+available with `DS4_QWEN4_VERIFY=always`.
 
 Automatic prefill admits 8192 tokens only for an uncached suffix of at least 8192
 tokens with native kernels and sufficient transient memory. Prefix-cache
@@ -145,9 +211,9 @@ validated artifact unchanged and switch back to `pread` if mmap page-fault or
 memory-pressure behavior is unsuitable. This experiment deliberately adds no
 row cache, deduplication, page coalescing, `DONTNEED`, or pack-format change.
 
-The mandatory PLE checksum is streamed with macOS `F_NOCACHE` before graph
-allocation. DS4 records whether enabling and clearing `F_NOCACHE` actually
-succeeded, retains that exact validated file descriptor, and records whether
+Under `DS4_QWEN4_VERIFY=always`, the PLE checksum is streamed with macOS
+`F_NOCACHE` before graph allocation. DS4 records whether enabling and clearing
+`F_NOCACHE` actually succeeded, retains that exact validated file descriptor, and records whether
 disabling sequential read-ahead for the default sparse runtime `pread` workload
 succeeded. This keeps startup validation from turning a nominally cold PLE
 benchmark into a warm 29.8 GiB page-cache benchmark and avoids a
@@ -317,11 +383,12 @@ matching Qwen3.8 MTP sidecar. The MTP phase starts DS4 with
 `--mtp-draft 4 --mtp-timing`; the core phase does not load an MTP sidecar. For every successful
 DS4 MTP request the harness parses the request-local Qwen timing lines and
 records total cycles, drafted and accepted draft tokens, target tokens, cycle
-time, and verifier modes. Acceptance requires nonzero cycles, drafts, and
-accepts, never permits accepts to exceed drafts, observes the sequential
-verifier, and requires the timing lines' target-token sum to equal the API's
-fixed 500-token completion.
-Every core, chunk, and MTP invocation first creates or verifies this cold record
+time, maximum per-cycle draft depth, and verifier modes. Acceptance requires
+nonzero cycles, drafts, and accepts, never permits accepts to exceed drafts or
+the configured depth four, observes the block verifier, proves
+`target_tokens = cycles + accepted`, and requires that target-token sum to
+equal the API's fixed 500-token completion.
+The dedicated cold-evidence invocation uses `DS4_QWEN4_VERIFY=always` before it creates this record
 and must retain the same PLE device/inode/size/times, manifest SHA-256, pack ID,
 tensor-manifest digest, PLE SHA-256, and SSD descriptor for the complete phase.
 The `chunks` phase restarts DS4 at explicit 2K, explicit 8K, and automatic
@@ -335,7 +402,20 @@ only the DS4-only first-request phase carries that claim.
 Pack conversion, strict loading, single-base Metal mapping, adaptive admission,
 SSD-overlapped PLE staging, chat/token identities, the end-to-end 48-layer
 native graph, optional Q4 MTP, and the native Qwen vision/M-RoPE path are
-implemented. Kernel and host fixtures pass on the target M3 Ultra. The bounded,
+implemented. Qwen MTP recursively drafts up to 16 tokens on device and verifies
+the proposed suffix with one target-model graph pass. Full accepts rebuild the
+canonical MTP history and commit the target state directly; partial accepts
+restore one transaction checkpoint and replay only the accepted prefix. The
+checkpoint covers Gated DeltaNet, PLE, and MTP state, while rolled-back QSA tails
+remain hidden behind their restored logical lengths. The current
+correctness-first transaction reserves about 129 MiB per MTP session and copies
+about 114 MiB once per multi-token speculative cycle; state-buffer swapping is
+the follow-up after real-model parity is established. Admission also prices the
+row-scaled target-hidden MTP capture (80 MiB at 2K or 320 MiB at 8K), including
+the live/checkpoint tensors and CPU logits rows. Native batched-server mode,
+which already disables speculative MTP, does not allocate these optional
+per-session verifier tensors. Kernel and host fixtures pass on the target M3
+Ultra. The bounded,
 resumable official BF16 converter validates the complete pinned Hub tensor
 directory before any output allocation. Remaining acceptance work is producing
 and validating the pack, full-model reference/golden runs, and the native DS4

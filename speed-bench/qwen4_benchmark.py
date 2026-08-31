@@ -316,10 +316,22 @@ def parse_qwen_mtp_timing(text: str) -> dict | None:
         if match is None:
             raise ValueError(f"malformed DS4 Qwen MTP timing line: {record}")
         drafted, accepted, target_tokens, cycle_ms, verifier = match.groups()
+        drafted = int(drafted)
+        accepted = int(accepted)
+        target_tokens = int(target_tokens)
+        if accepted > drafted:
+            raise ValueError(
+                "malformed DS4 Qwen MTP timing line: accepted exceeds drafted"
+            )
+        if target_tokens != 1 + accepted:
+            raise ValueError(
+                "malformed DS4 Qwen MTP timing line: "
+                "target_tokens must equal 1 + accepted"
+            )
         records.append({
-            "drafted": int(drafted),
-            "accepted": int(accepted),
-            "target_tokens": int(target_tokens),
+            "drafted": drafted,
+            "accepted": accepted,
+            "target_tokens": target_tokens,
             "cycle_ms": float(cycle_ms),
             "verifier": verifier or "unlabeled",
         })
@@ -334,6 +346,7 @@ def parse_qwen_mtp_timing(text: str) -> dict | None:
         "version": 1,
         "cycles": len(records),
         "drafted": sum(record["drafted"] for record in records),
+        "max_drafted": max(record["drafted"] for record in records),
         "accepted": sum(record["accepted"] for record in records),
         "target_tokens": sum(record["target_tokens"] for record in records),
         "cycle_ms": sum(record["cycle_ms"] for record in records),
@@ -350,17 +363,22 @@ def require_ds4_mtp_timing(evidence: dict | None,
     try:
         cycles = int(evidence["cycles"])
         drafted = int(evidence["drafted"])
+        max_drafted = int(evidence["max_drafted"])
         accepted = int(evidence["accepted"])
         target_tokens = int(evidence["target_tokens"])
-        sequential = int(evidence.get("verifier", {}).get("sequential", 0))
+        block = int(evidence.get("verifier", {}).get("block", 0))
     except (KeyError, TypeError, ValueError, AttributeError) as error:
         raise RuntimeError("DS4 MTP timing evidence is incomplete") from error
     if cycles <= 0 or drafted <= 0 or accepted <= 0:
         raise RuntimeError("DS4 MTP phase performed no successful speculation")
     if accepted > drafted:
         raise RuntimeError("DS4 MTP accepted more tokens than it drafted")
-    if sequential <= 0:
-        raise RuntimeError("DS4 MTP sequential verifier was not observed")
+    if max_drafted <= 0 or max_drafted > 4 or max_drafted > drafted:
+        raise RuntimeError("DS4 MTP evidence exceeds the configured draft depth")
+    if target_tokens != cycles + accepted:
+        raise RuntimeError("DS4 MTP cycle/token accounting is inconsistent")
+    if block <= 0:
+        raise RuntimeError("DS4 MTP block verifier was not observed")
     if target_tokens != completion_tokens:
         raise RuntimeError(
             "DS4 MTP timing target-token total differs from completion usage"
@@ -626,6 +644,7 @@ def command_lines(args, mtp: bool, log_dir: Path,
     if cold_evidence:
         ds4_environment = dict(os.environ)
         ds4_environment["DS4_QWEN4_PLE_COLD_EVIDENCE"] = "1"
+        ds4_environment["DS4_QWEN4_VERIFY"] = "always"
     return ServerProcess(
         "ds4", ds4_command, args.ds4_port,
         log_dir / f"ds4-{phase}.log", args.startup_timeout,

@@ -4,7 +4,11 @@
 
 **DwarfStar** is a small native inference engine optimized first for
 **DeepSeek V4 Flash**. It also supports **GLM 5.2 and 5.3**, **GLM 5.3 Flash**, and,
-on very high-memory machines, **DeepSeek V4 PRO**. It is self-contained and
+on very high-memory machines, **DeepSeek V4 PRO**. The
+`qwen3.8-flash-next-q4` branch additionally contains the versioned
+**Qwen3.8-Flash-Next Q4** standard-block (`Q4_K`/`Q8_0`/`Q4_1`) fast-pack
+loader and Metal integration described in
+[QWEN38_FLASH_NEXT.md](QWEN38_FLASH_NEXT.md). It is self-contained and
 deliberately narrow, not a general GGUF runner. Model loading, prompt rendering,
 tool calls, KV state, the HTTP server, and the coding agent are built and tested together.
 The repository also includes tools and data for GGUF, imatrix, quality, and speed.
@@ -92,6 +96,8 @@ next sections.
   vector generation, and usage.
 - [speed-bench/README.md](speed-bench/README.md): benchmark commands, charts,
   and CSV generation.
+- [QWEN38_FLASH_NEXT.md](QWEN38_FLASH_NEXT.md): Qwen3.8-Flash-Next Q4 pack,
+  loader, adaptive prefill, native-kernel tests, and integration status.
 - [tests/test-vectors/README.md](tests/test-vectors/README.md): official
   continuation vectors used for regression checks.
 

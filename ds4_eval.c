@@ -1192,6 +1192,7 @@ typedef struct {
 
 typedef struct {
     const char *model_path;
+    const char *ple_path;
     const char *mtp_path;
     const char *trace_path;
     const char *regrade_trace_path;
@@ -1208,6 +1209,8 @@ typedef struct {
     int pause_ms;
     int power_percent;
     uint32_t prefill_chunk;
+    ds4_qwen4_prefill_mode qwen4_prefill_mode;
+    bool qwen4_prefill_mode_set;
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
     uint32_t ssd_streaming_full_layers;
@@ -1552,6 +1555,8 @@ static eval_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--ple")) {
+            c.ple_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-model")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
@@ -1633,7 +1638,17 @@ static eval_config parse_options(int argc, char **argv) {
                 exit(2);
             }
         } else if (!strcmp(arg, "--prefill-chunk")) {
-            int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            const char *value = need_arg(&i, argc, argv, arg);
+            char mode_error[128];
+            if (ds4_qwen4_parse_prefill_mode(value,
+                                              &c.qwen4_prefill_mode,
+                                              mode_error,
+                                              sizeof(mode_error))) {
+                c.qwen4_prefill_mode_set = true;
+                c.prefill_chunk = (uint32_t)c.qwen4_prefill_mode;
+                continue;
+            }
+            int v = parse_int_arg(value, arg);
             if (v <= 0) {
                 fprintf(stderr, "ds4-eval: --prefill-chunk must be positive\n");
                 exit(2);
@@ -4153,6 +4168,7 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .ple_path = cfg.ple_path,
         .mtp_path = cfg.mtp_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
@@ -4161,6 +4177,8 @@ int main(int argc, char **argv) {
         .mtp_margin = 3.0f,
         .power_percent = cfg.power_percent,
         .prefill_chunk = cfg.prefill_chunk,
+        .qwen4_prefill_mode = cfg.qwen4_prefill_mode,
+        .qwen4_prefill_mode_set = cfg.qwen4_prefill_mode_set,
         .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
         .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
         .ssd_streaming_full_layers = cfg.ssd_streaming_full_layers,

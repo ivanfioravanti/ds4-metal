@@ -140,11 +140,12 @@ The user's original replay-free partial-MTP request is attached at:
 ## Repository state and operating rules
 
 - Repository: `/Users/ifioravanti/github/ds4`
-- Branch: `qwen3.8-flash-next-q4`
+- Branch: `qwen3.8-flash-next` (renamed from `qwen3.8-flash-next-q4`
+  after the standardization; the old remote branch was deleted)
 - Previous HEAD before this campaign's commits: `5084a7c`
 - Session twenty-one committed `754986b` (the campaign plus the
-  Q4_0-routed standardization) and pushed it to
-  `origin/qwen3.8-flash-next-q4` (ivanfioravanti/ds4-metal).
+  Q4_0-routed standardization) and pushed it to the fork
+  (ivanfioravanti/ds4-metal).
 - Prefix every shell command with `rtk`.
 - Use `apply_patch` for source edits.
 - Use `uv` for Python work where possible.

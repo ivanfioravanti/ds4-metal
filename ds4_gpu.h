@@ -185,6 +185,11 @@ void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 #ifdef __APPLE__
 int ds4_gpu_device_is_pre_m5_apple_silicon(void);
 int ds4_gpu_device_is_m5_apple_silicon(void);
+/* Nonzero when the Metal 4 TensorOps (matmul2d) route is compiled in for
+ * this session: M5-class automatic enable or DS4_METAL_ENABLE_TENSOR=1
+ * opt-in, and not overridden by --quality.  Fixtures gate TensorOps parity
+ * cases on it. */
+int ds4_gpu_metal4_tensor_route_enabled(void);
 int ds4_gpu_set_decode_pipeline_fast_lookup(int enabled);
 /* Strict test oracle for the fixed decode mul_mv pipeline lookup cache. */
 int ds4_gpu_test_decode_pipeline_fast_lookup(void);
@@ -207,6 +212,7 @@ void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #else
 static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }
 static inline int ds4_gpu_device_is_m5_apple_silicon(void) { return 0; }
+static inline int ds4_gpu_metal4_tensor_route_enabled(void) { return 0; }
 #endif
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);

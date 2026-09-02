@@ -2494,6 +2494,14 @@ int ds4_gpu_device_is_m5_apple_silicon(void) {
             g_metal_device_name[8] == ' ');
 }
 
+/* Whether the Metal 4 TensorOps route is compiled in for this session: the
+ * M5-class automatic enable or the DS4_METAL_ENABLE_TENSOR opt-in succeeded
+ * and --quality has not forced the reference kernels.  Fixtures use this to
+ * gate TensorOps parity cases. */
+int ds4_gpu_metal4_tensor_route_enabled(void) {
+    return g_metal4_tensor_api_enabled && !g_quality_mode;
+}
+
 static bool ds4_gpu_ported_m5_decode_feature_enabled(
         const char *pre_m5_disable_env,
         const char *m5_disable_env) {
@@ -2607,12 +2615,22 @@ static void ds4_gpu_detect_metal4_features(void) {
              * Accelerator/TensorOps path is expected to pay off; older Metal
              * machines continue to use the established kernels unless a future
              * device is explicitly added here.
+             *
+             * DS4_METAL_ENABLE_TENSOR=1 opts any Metal 4 GPU into the
+             * TensorOps route: parity validation on pre-M5 hardware, and the
+             * explicit performance opt-in.  On pre-M5 devices matmul2d can
+             * map to portable fallbacks, so the forced route stays numerically
+             * checkable there but is not a throughput path.
              */
-            if (default_enable) {
+            const int force_enable =
+                ds4_gpu_env_bool("DS4_METAL_ENABLE_TENSOR") > 0;
+            if (default_enable || force_enable) {
                 g_metal4_tensor_api_compile_supported = ds4_gpu_compile_tensor_probe();
                 g_metal4_tensor_api_enabled = g_metal4_tensor_api_compile_supported;
                 if (!g_metal4_tensor_api_enabled) {
                     fprintf(stderr, "ds4: Metal 4 tensor API probe failed; using legacy Metal kernels\n");
+                } else if (force_enable && !default_enable) {
+                    fprintf(stderr, "ds4: Metal 4 tensor API enabled via DS4_METAL_ENABLE_TENSOR on a pre-M5/pre-A19 device (portable fallback; not a throughput route)\n");
                 }
             } else {
                 fprintf(stderr, "ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices\n");
@@ -6419,6 +6437,16 @@ static int ds4_gpu_qwen4_use_mul_mm_q8_0(uint32_t n_rows) {
     return threshold != 0u && n_rows >= threshold;
 }
 
+/* Metal4 TensorOps dense route for prefill-sized Q8_0 projections: the
+ * direct-RHS NAX kernels shared with the DeepSeek/GLM dense prefill path.
+ * Zero disables the route (for A/B and drift isolation); the value is the
+ * minimum aligned row count, mirroring DS4_QWEN4_Q8_0_MUL_MM_MIN_ROWS. */
+static int ds4_gpu_qwen4_use_mpp_q8_0(uint32_t n_rows) {
+    const uint64_t threshold = ds4_gpu_env_u64(
+        "DS4_QWEN4_Q8_0_MPP_MIN_ROWS", 32u, 0u, UINT32_MAX);
+    return threshold != 0u && n_rows >= threshold;
+}
+
 static int g_qwen4_silu_wide_scope = 0;
 
 void ds4_gpu_qwen4_silu_wide_scope(int enable) {
@@ -6455,31 +6483,123 @@ static int ds4_gpu_qwen4_dispatch_q8_0(
     if (!weight_buffer || !x_buffer || !out_buffer || in_dim == 0u ||
         out_dim == 0u || n_rows == 0u || (in_dim % 32u) != 0u) return 0;
     if (ds4_gpu_qwen4_use_mul_mm_q8_0(n_rows)) {
-        const bool bc_out = (out_dim % 64u) != 0u || (n_rows % 32u) != 0u;
-        id<MTLComputePipelineState> tiled = ds4_gpu_get_mul_mm_pipeline(
-            "kernel_mul_mm_q8_0_f32", false, bc_out);
-        if (tiled) {
-            ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(
-                in_dim, out_dim, n_rows, (uint64_t)(in_dim / 32u) * 34u);
+        /*
+         * Metal4 TensorOps route, mirroring the DeepSeek dense prefill
+         * dispatch: the retained direct-RHS kernel dequantizes each 64x32
+         * Q8_0 weight tile to half in threadgroup memory while TensorOps
+         * reads the dense F32 activation tile straight from device memory.
+         * The host picks the widest token tile that divides the aligned row
+         * count; an unaligned tail (n_rows >= 192 only, so tiny prompts do
+         * not pay a second dispatch) keeps the boundary-checked tiled kernel
+         * for just its own rows.  --quality and non-M5-class devices without
+         * the explicit DS4_METAL_ENABLE_TENSOR opt-in stay on the tiled
+         * simdgroup kernels.
+         */
+        const bool split_nax_prefix =
+            !g_quality_mode && n_rows >= 192u && (n_rows % 32u) != 0u;
+        const uint32_t nax_rows =
+            (n_rows % 32u) == 0u ? n_rows :
+            (split_nax_prefix ? n_rows - (n_rows % 32u) : 0u);
+        uint32_t nax_tile_n = 32u;
+        id<MTLComputePipelineState> nax_pipeline = nil;
+        if (ds4_gpu_qwen4_use_mpp_q8_0(nax_rows) &&
+            ds4_gpu_mpp_available() &&
+            (in_dim % 64u) == 0u &&
+            (out_dim % 64u) == 0u) {
+            if ((nax_rows % 128u) == 0u) {
+                nax_tile_n = 128u;
+            } else if ((nax_rows % 64u) == 0u) {
+                nax_tile_n = 64u;
+            }
+            const bool nax_f32stage =
+                getenv("DS4_QWEN4_Q8_0_MPP_F32STAGE") != NULL;
+            const char *nax_fn = nax_tile_n == 128u
+                ? (nax_f32stage
+                       ? "kernel_mul_mm_q8_0_f32_nax_direct_rhs_f32stage_n128"
+                       : "kernel_mul_mm_q8_0_f32_nax_direct_rhs_n128")
+                : (nax_tile_n == 64u
+                       ? (nax_f32stage
+                              ? "kernel_mul_mm_q8_0_f32_nax_direct_rhs_f32stage_n64"
+                              : "kernel_mul_mm_q8_0_f32_nax_direct_rhs_n64")
+                       : (nax_f32stage
+                              ? "kernel_mul_mm_q8_0_f32_nax_direct_rhs_f32stage"
+                              : "kernel_mul_mm_q8_0_f32_nax_direct_rhs"));
+            nax_pipeline = ds4_gpu_get_mul_mm_pipeline(nax_fn, false, false);
+            if (!nax_pipeline) ds4_gpu_warn_mpp_fallback();
+        }
+        const uint32_t generic_row0 = nax_pipeline ? nax_rows : 0u;
+        const uint32_t generic_rows = n_rows - generic_row0;
+        const bool bc_out =
+            (out_dim % 64u) != 0u || (generic_rows % 32u) != 0u;
+        id<MTLComputePipelineState> tiled =
+            (generic_rows != 0u || !nax_pipeline)
+                ? ds4_gpu_get_mul_mm_pipeline(
+                      "kernel_mul_mm_q8_0_f32", false, bc_out)
+                : nil;
+        if (nax_pipeline && generic_rows != 0u && !tiled) {
+            /* No boundary-safe kernel for the tail: keep this dispatch
+             * atomic and leave the whole projection to the scalar path. */
+            nax_pipeline = nil;
+        }
+        if (nax_pipeline || tiled) {
             int owned = 0;
             id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
-            id<MTLComputeCommandEncoder> enc =
-                cb ? ds4_gpu_compute_encoder(cb) : nil;
-            if (!enc) return 0;
-            enc.label = label;
-            [enc setComputePipelineState:tiled];
-            [enc setBytes:&args length:sizeof(args) atIndex:0];
-            [enc setBuffer:weight_buffer offset:weight_offset atIndex:1];
-            [enc setBuffer:x_buffer offset:x_offset atIndex:2];
-            [enc setBuffer:out_buffer offset:out_offset atIndex:3];
-            [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u)
-                                  atIndex:0];
-            [enc insertDebugSignpost:@"Qwen Q8_0 tensor matmul"];
-            [enc dispatchThreadgroups:MTLSizeMake((n_rows + 31u) / 32u,
-                                                  (out_dim + 63u) / 64u,
-                                                  1u)
-                 threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
-            ds4_gpu_end_compute_encoder(cb, enc);
+            if (!cb) return 0;
+            if (nax_pipeline) {
+                id<MTLComputeCommandEncoder> enc =
+                    ds4_gpu_compute_encoder(cb);
+                if (!enc) return 0;
+                enc.label = label;
+                [enc setComputePipelineState:nax_pipeline];
+                ds4_gpu_mul_mm_args nax_args = ds4_gpu_make_mm_args(
+                    in_dim, out_dim, nax_rows,
+                    (uint64_t)(in_dim / 32u) * 34u);
+                [enc setBytes:&nax_args length:sizeof(nax_args) atIndex:0];
+                [enc setBuffer:weight_buffer offset:weight_offset atIndex:1];
+                [enc setBuffer:x_buffer offset:x_offset atIndex:2];
+                [enc setBuffer:out_buffer offset:out_offset atIndex:3];
+                [enc setThreadgroupMemoryLength:
+                    2u * 64u * 32u *
+                        (getenv("DS4_QWEN4_Q8_0_MPP_F32STAGE") != NULL
+                             ? sizeof(float)
+                             : sizeof(uint16_t))
+                    atIndex:0];
+                [enc insertDebugSignpost:@"Qwen Q8_0 NAX tensor matmul"];
+                [enc dispatchThreadgroups:MTLSizeMake(nax_rows / nax_tile_n,
+                                                      out_dim / 64u,
+                                                      1u)
+                     threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+            }
+            if (tiled) {
+                id<MTLComputeCommandEncoder> enc =
+                    ds4_gpu_compute_encoder(cb);
+                if (!enc) return 0;
+                enc.label = label;
+                [enc setComputePipelineState:tiled];
+                ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(
+                    in_dim, out_dim, generic_rows,
+                    (uint64_t)(in_dim / 32u) * 34u);
+                [enc setBytes:&args length:sizeof(args) atIndex:0];
+                [enc setBuffer:weight_buffer offset:weight_offset atIndex:1];
+                [enc setBuffer:x_buffer
+                        offset:x_offset +
+                               (NSUInteger)generic_row0 * in_dim * sizeof(float)
+                       atIndex:2];
+                [enc setBuffer:out_buffer
+                        offset:out_offset +
+                               (NSUInteger)generic_row0 * out_dim * sizeof(float)
+                       atIndex:3];
+                [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u)
+                                      atIndex:0];
+                [enc insertDebugSignpost:@"Qwen Q8_0 tensor matmul"];
+                [enc dispatchThreadgroups:MTLSizeMake(
+                        (generic_rows + 31u) / 32u,
+                        (out_dim + 63u) / 64u,
+                        1u)
+                     threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+            }
             return ds4_gpu_finish_command_buffer(cb, owned, [label UTF8String]);
         }
     }
@@ -47411,6 +47531,15 @@ static int ds4_gpu_qwen4_use_moe_mul_mm_id(
            n_experts <= 512u && top_k == 10u;
 }
 
+/* Metal4 TensorOps swap for the grouped routed-expert tiles: gate, up, and
+ * down run kernel_mul_mm_id_q4_{0,K}_f32_mpp at the identical route map,
+ * work tiles, and dispatch geometry (the DeepSeek routed MPP structure).
+ * Kill switch for A/B and drift isolation: DS4_QWEN4_MOE_MUL_MM_ID_MPP=0. */
+static int ds4_gpu_qwen4_moe_mul_mm_id_mpp_enabled(void) {
+    const char *raw = getenv("DS4_QWEN4_MOE_MUL_MM_ID_MPP");
+    return !(raw && strcmp(raw, "0") == 0);
+}
+
 /* Row granularity of the grouped routed-expert work tiles.  Small tiles keep
  * the mid/contribution scratch bounded, but every tile re-reads each touched
  * expert's weights and pads sparse per-expert row counts up to the 32-row MMA
@@ -47460,6 +47589,26 @@ static int ds4_gpu_qwen4_try_moe_mul_mm_id(
     id<MTLComputePipelineState> mm_pipeline = ds4_gpu_get_mul_mm_id_pipeline(
         q4_0 ? "kernel_mul_mm_id_q4_0_f32" : "kernel_mul_mm_id_q4_K_f32",
         false);
+    const bool moe_mpp_f32stage =
+        getenv("DS4_METAL_MPP_MOE_F32STAGE") != NULL ||
+        getenv("DS4_QWEN4_MOE_MUL_MM_ID_F32STAGE") != NULL;
+    if (ds4_gpu_qwen4_moe_mul_mm_id_mpp_enabled() && ds4_gpu_mpp_available()) {
+        id<MTLComputePipelineState> mpp =
+            ds4_gpu_get_mul_mm_id_pipeline(
+                q4_0 ? (moe_mpp_f32stage
+                            ? "kernel_mul_mm_id_q4_0_f32_mpp_f32stage"
+                            : "kernel_mul_mm_id_q4_0_f32_mpp")
+                     : (moe_mpp_f32stage
+                            ? "kernel_mul_mm_id_q4_K_f32_mpp_f32stage"
+                            : "kernel_mul_mm_id_q4_K_f32_mpp"),
+                false);
+        if (mpp) {
+            mm_pipeline = mpp;
+        } else {
+            ds4_gpu_warn_mpp_fallback();
+        }
+    }
+    const NSUInteger mm_tg_bytes = moe_mpp_f32stage ? 12288u : 8192u;
     id<MTLComputePipelineState> swiglu_pipeline = ds4_gpu_get_pipeline(
         "kernel_qwen4_swiglu_f32");
     id<MTLComputePipelineState> sum_pipeline = ds4_gpu_get_pipeline(
@@ -47598,7 +47747,7 @@ static int ds4_gpu_qwen4_try_moe_mul_mm_id(
         [enc setBuffer:g_moe_id_map_buffer offset:counts_bytes atIndex:4];
         [enc setBuffer:g_qwen4_moe_mid_gate_buffer offset:0 atIndex:5];
         [enc setBuffer:g_moe_id_map_buffer offset:work_offset atIndex:6];
-        [enc setThreadgroupMemoryLength:8192u atIndex:0];
+        [enc setThreadgroupMemoryLength:mm_tg_bytes atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(work_cap,
                                               (expert_dim + 63u) / 64u,
                                               1u)
@@ -47664,7 +47813,7 @@ static int ds4_gpu_qwen4_try_moe_mul_mm_id(
         [enc setBuffer:g_moe_id_map_buffer offset:counts_bytes atIndex:4];
         [enc setBuffer:g_moe_down_scratch_buffer offset:0 atIndex:5];
         [enc setBuffer:g_moe_id_map_buffer offset:work_offset atIndex:6];
-        [enc setThreadgroupMemoryLength:8192u atIndex:0];
+        [enc setThreadgroupMemoryLength:mm_tg_bytes atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(work_cap,
                                               (out_dim + 63u) / 64u,
                                               1u)

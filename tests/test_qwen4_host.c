@@ -466,6 +466,26 @@ static void test_ngram_hash(void) {
     CHECK(ds4_qwen4_ngram_row_ids(&hash, previous, 2, tokens, 5,
                                    rows, sizeof(rows) / sizeof(rows[0])));
     CHECK(!memcmp(rows, expected, sizeof(expected)));
+
+    /* Splitting verification immediately before or after EOS must produce
+     * the same PLE rows as one uninterrupted target pass. */
+    const uint32_t before_eos[] = {5, 7};
+    const uint32_t from_eos[] = {DS4_QWEN4_NGRAM_EOS, 9, 11};
+    int64_t split_from_eos[3 * DS4_QWEN4_NGRAM_HEADS];
+    CHECK(ds4_qwen4_ngram_row_ids(
+        &hash, before_eos, 2, from_eos, 3, split_from_eos,
+        sizeof(split_from_eos) / sizeof(split_from_eos[0])));
+    CHECK(!memcmp(split_from_eos, rows + 2 * DS4_QWEN4_NGRAM_HEADS,
+                  sizeof(split_from_eos)));
+
+    const uint32_t after_eos_history[] = {7, DS4_QWEN4_NGRAM_EOS};
+    const uint32_t after_eos[] = {9, 11};
+    int64_t split_after_eos[2 * DS4_QWEN4_NGRAM_HEADS];
+    CHECK(ds4_qwen4_ngram_row_ids(
+        &hash, after_eos_history, 2, after_eos, 2, split_after_eos,
+        sizeof(split_after_eos) / sizeof(split_after_eos[0])));
+    CHECK(!memcmp(split_after_eos, rows + 3 * DS4_QWEN4_NGRAM_HEADS,
+                  sizeof(split_after_eos)));
 }
 
 static void test_ple_table(void) {

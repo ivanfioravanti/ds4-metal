@@ -2337,17 +2337,45 @@ static bool qwen4_pread_exact(int fd, void *dst, size_t size, uint64_t offset) {
     return true;
 }
 
-static bool qwen4_ple_gather_pread_bf16(
-        const ds4_qwen4_ple_table *table,
-        const int64_t *rows,
-        size_t row_count,
-        uint16_t *out) {
-    if (!table || table->fd < 0 || !rows || !out) return false;
+/* Prefill gathers thousands of scattered 100-byte rows per 512-token tile;
+ * one serial pread per row runs the SSD at queue depth one and a cold
+ * region costs ~60us/row (7.7 s per fresh 8K chunk, measured on the M3
+ * Ultra).  Splitting one gather across threads keeps the staged bytes
+ * identical because every row writes a disjoint output slice.  Decode and
+ * verifier gathers stay serial through the row-count threshold. */
+static uint32_t qwen4_ple_pread_thread_count(size_t row_count) {
+    static int32_t configured = -1;
+    if (configured < 0) {
+        const char *raw = getenv("DS4_QWEN4_PLE_GATHER_THREADS");
+        configured = raw && *raw ? atoi(raw) : 32;
+        if (configured < 1) configured = 1;
+        if (configured > 64) configured = 64;
+    }
+    if ((uint32_t)configured < 2u || row_count < 512u) return 1u;
+    if ((size_t)configured > row_count) return (uint32_t)row_count;
+    return (uint32_t)configured;
+}
+
+typedef struct {
+    const ds4_qwen4_ple_table *table;
+    const int64_t *rows;
+    uint16_t *out;
+    size_t begin;
+    size_t end;
+    bool ok;
+} qwen4_ple_pread_slice;
+
+static void qwen4_ple_gather_pread_slice(qwen4_ple_pread_slice *slice) {
+    const ds4_qwen4_ple_table *table = slice->table;
+    const int64_t *rows = slice->rows;
     const size_t row_bytes = table->row_bytes;
     uint8_t *row_buffer = malloc(row_bytes ? row_bytes : 1u);
-    if (!row_buffer) return false;
+    if (!row_buffer) {
+        slice->ok = false;
+        return;
+    }
     bool ok = true;
-    for (size_t r = 0; ok && r < row_count; r++) {
+    for (size_t r = slice->begin; ok && r < slice->end; r++) {
         if (rows[r] < 0 || (uint64_t)rows[r] >= table->rows) {
             ok = false;
             break;
@@ -2357,9 +2385,64 @@ static bool qwen4_ple_gather_pread_bf16(
              qwen4_pread_exact(table->fd, row_buffer, row_bytes, offset);
         if (ok)
             qwen4_q4_1_row_bf16(row_buffer, table->blocks_per_row,
-                                out + r * table->dim);
+                                slice->out + r * table->dim);
     }
     free(row_buffer);
+    slice->ok = ok;
+}
+
+static void *qwen4_ple_gather_pread_thread(void *opaque) {
+    qwen4_ple_pread_slice *slice = opaque;
+    qwen4_ple_gather_pread_slice(slice);
+    return NULL;
+}
+
+static bool qwen4_ple_gather_pread_bf16(
+        const ds4_qwen4_ple_table *table,
+        const int64_t *rows,
+        size_t row_count,
+        uint16_t *out) {
+    if (!table || table->fd < 0 || !rows || !out) return false;
+    const uint32_t threads = qwen4_ple_pread_thread_count(row_count);
+    if (threads < 2u) {
+        qwen4_ple_pread_slice serial = {
+            .table = table, .rows = rows, .out = out,
+            .begin = 0, .end = row_count, .ok = false,
+        };
+        qwen4_ple_gather_pread_slice(&serial);
+        return serial.ok;
+    }
+    qwen4_ple_pread_slice *slices = calloc(threads, sizeof(*slices));
+    if (!slices) return false;
+    pthread_t helpers[64];
+    bool helper_created[64];
+    memset(helper_created, 0, sizeof(helper_created));
+    const size_t rows_per_slice = (row_count + threads - 1u) / threads;
+    for (uint32_t t = 0; t < threads; t++) {
+        const size_t begin = (size_t)t * rows_per_slice;
+        slices[t].table = table;
+        slices[t].rows = rows;
+        slices[t].out = out;
+        slices[t].begin = begin;
+        slices[t].end = begin + rows_per_slice < row_count
+            ? begin + rows_per_slice : row_count;
+    }
+    for (uint32_t t = 0; t + 1u < threads; t++) {
+        /* A failed creation degrades to fewer workers, never to wrong
+         * output: the calling slot thread runs that slice itself. */
+        if (pthread_create(&helpers[t], NULL,
+                           qwen4_ple_gather_pread_thread,
+                           &slices[t]) == 0)
+            helper_created[t] = true;
+        else
+            qwen4_ple_gather_pread_slice(&slices[t]);
+    }
+    qwen4_ple_gather_pread_slice(&slices[threads - 1u]);
+    for (uint32_t t = 0; t + 1u < threads; t++)
+        if (helper_created[t]) pthread_join(helpers[t], NULL);
+    bool ok = true;
+    for (uint32_t t = 0; t < threads; t++) ok = ok && slices[t].ok;
+    free(slices);
     return ok;
 }
 

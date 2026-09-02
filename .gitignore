@@ -43,3 +43,6 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+/speed-bench/gqa_mma_proto
+/speed-bench/hc_chain_proto_bench
+/speed-bench/qsa_prefill_bench

@@ -73,7 +73,7 @@ endif
 .PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch test-qwen4-release test-qwen4-release-core dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
-.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
+.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut hc-chain-proto-bench qsa-prefill-bench
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
 
@@ -133,6 +133,22 @@ speed-bench/metal_prefill_variant_bench: speed-bench/metal_prefill_variant_bench
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 metal-prefill-variant-bench: speed-bench/metal_prefill_variant_bench
+
+speed-bench/hc_chain_proto_bench.o: speed-bench/hc_chain_proto_bench.c speed-bench/hc_chain_proto_kernels.h
+	$(CC) $(OBJCFLAGS) -x objective-c -I speed-bench -c -o $@ speed-bench/hc_chain_proto_bench.c
+
+speed-bench/hc_chain_proto_bench: speed-bench/hc_chain_proto_bench.o
+	$(CC) $(OBJCFLAGS) -o $@ speed-bench/hc_chain_proto_bench.o -framework Foundation -framework Metal
+
+hc-chain-proto-bench: speed-bench/hc_chain_proto_bench
+
+speed-bench/qsa_prefill_bench.o: speed-bench/qsa_prefill_bench.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ speed-bench/qsa_prefill_bench.c
+
+speed-bench/qsa_prefill_bench: speed-bench/qsa_prefill_bench.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ speed-bench/qsa_prefill_bench.o ds4_metal.o $(LDLIBS) -framework Foundation -framework Metal
+
+qsa-prefill-bench: speed-bench/qsa_prefill_bench
 
 tests/test_mxfp4_metal.o: tests/test_mxfp4_metal.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -677,4 +693,4 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_qwen4_host tests/test_qwen4_metal tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/hc_chain_proto_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_qwen4_host tests/test_qwen4_metal tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

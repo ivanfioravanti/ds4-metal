@@ -64,6 +64,9 @@ BASE_NAME = (
 PLE_NAME = "Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
 VISION_NAME = "qwen3.8-flash-next-q4-vision.gguf"
 MTP_NAME = "qwen3.8-flash-next-q4-mtp.gguf"
+
+# Selected MTP routed-expert importance mode (None or "weight-energy").
+MTP_IMATRIX_MODE: str | None = None
 Q2_PACK_VERSION = 4
 Q2_CONVERSION_STATE_VERSION = 1
 Q2_MANIFEST_NAME = "qwen3.8-flash-next-q2.manifest.json"
@@ -1166,6 +1169,7 @@ class Action:
     scale: float = 1.0
     pad_last_to: int = 0
     imatrix_names: tuple[str, ...] = ()
+    mtp_fallback: bool = False
 
 
 def quant_specs(base: str, shape: tuple[int, ...], role: str,
@@ -1306,18 +1310,24 @@ def make_action(db: SourceDB, source: str,
                              "routed_expert", source,
                              profile.gate_up_qtype)
         imatrix_names = ()
+        mtp_fallback = False
         if profile.name == "q2":
             layer = layer_of(renamed(source))
             if layer is None:
-                fail(f"{source}: Q2 routed gate/up has no imatrix layer")
-            imatrix_names = (
-                f"blk.{layer}.ffn_gate_exps.weight",
-                f"blk.{layer}.ffn_up_exps.weight",
-            )
+                if ".mtp." in target and MTP_IMATRIX_MODE == "weight-energy":
+                    mtp_fallback = True
+                else:
+                    fail(f"{source}: Q2 routed gate/up has no imatrix layer")
+            else:
+                imatrix_names = (
+                    f"blk.{layer}.ffn_gate_exps.weight",
+                    f"blk.{layer}.ffn_up_exps.weight",
+                )
         return Action(
             source, "split_gate_up", "routed_expert", specs,
             profile.gate_up_qtype,
             imatrix_names=imatrix_names,
+            mtp_fallback=mtp_fallback,
         )
     if target.endswith(".mlp.experts.down_proj"):
         expected = (
@@ -1329,12 +1339,18 @@ def make_action(db: SourceDB, source: str,
         physical_shape = shape[:-1] + (CONFIG["routed_down_physical_input"],)
         kind = "quant"
         imatrix_names = ()
+        mtp_fallback = False
         if profile.name == "q2":
             layer = layer_of(renamed(source))
             if layer is None:
-                fail(f"{source}: Q2 routed down has no imatrix layer")
-            kind = "quant_experts"
-            imatrix_names = (f"blk.{layer}.ffn_down_exps.weight",)
+                if ".mtp." in target and MTP_IMATRIX_MODE == "weight-energy":
+                    mtp_fallback = True
+                    kind = "quant_experts"
+                else:
+                    fail(f"{source}: Q2 routed down has no imatrix layer")
+            else:
+                kind = "quant_experts"
+                imatrix_names = (f"blk.{layer}.ffn_down_exps.weight",)
         return Action(
             source, kind, "routed_expert",
             quant_specs(
@@ -1345,6 +1361,7 @@ def make_action(db: SourceDB, source: str,
             profile.down_qtype,
             pad_last_to=CONFIG["routed_down_physical_input"],
             imatrix_names=imatrix_names,
+            mtp_fallback=mtp_fallback,
         )
 
     if dtype == "BF16" and len(shape) == 2 and not is_bf16_control(target):
@@ -1371,6 +1388,48 @@ def make_action(db: SourceDB, source: str,
         kind = "norm_fold"
     spec = TensorSpec(target, dtype, shape, role, source, logical_shape=shape)
     return Action(source, kind, role, [spec], scale=scale)
+
+
+def weight_energy_weights(source_values: np.ndarray) -> np.ndarray:
+    source = bf16_to_f32(source_values)
+    weights = np.square(source, dtype=np.float32).sum(
+        axis=0, dtype=np.float32
+    )
+    if not np.all(np.isfinite(weights)):
+        fail('MTP expert: nonfinite weight-energy fallback')
+    return np.ascontiguousarray(weights, dtype='<f4')
+
+
+def encode_fallback_experts(values: np.ndarray, qtype: str,
+                            quantizer: GGMLQuantizer,
+                            threads: int,
+                            source_name: str,
+                            pad_last_to: int = 0) -> bytes:
+    # Deterministic per-expert weight-energy importance for MTP experts.
+    # The calibrated GGUF imatrix covers only the 48 base layers; the MTP
+    # routed experts use the same fallback selection the imatrix applies
+    # to its zero-count experts, recorded as such in the manifest.
+    if (values.ndim != 3 or
+            values.shape[0] != CONFIG['experts'] or threads < 1):
+        fail(f'{source_name}: invalid fallback expert geometry')
+
+    def convert(expert: int) -> bytes:
+        source_values = np.ascontiguousarray(values[expert])
+        weights = weight_energy_weights(source_values)
+        expert_values = source_values
+        if pad_last_to:
+            if pad_last_to < source_values.shape[-1]:
+                fail(f'{source_name}: physical padding shrinks the source')
+            padding = pad_last_to - source_values.shape[-1]
+            expert_values = np.pad(
+                source_values, ((0, 0), (0, padding)), mode='constant'
+            )
+            weights = np.pad(weights, (0, padding), mode='constant')
+        return quantizer.encode(expert_values, qtype, weights)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
+        blocks = list(pool.map(convert, range(values.shape[0])))
+    return b''.join(blocks)
 
 
 def encode_weighted_experts(values: np.ndarray, qtype: str,
@@ -1444,6 +1503,11 @@ def encode_action(action: Action, db: SourceDB,
             )
         return [quantizer.encode(value, action.qtype)]
     if action.kind == "quant_experts":
+        if action.mtp_fallback:
+            return [encode_fallback_experts(
+                value, action.qtype, quantizer, threads,
+                action.source, action.pad_last_to,
+            )]
         if imatrix is None or len(action.imatrix_names) != 1:
             fail(
                 f"{action.source}: weighted Q2 expert conversion requires "
@@ -1460,6 +1524,11 @@ def encode_action(action: Action, db: SourceDB,
             if action.qtype != "IQ2_XXS":
                 result.append(quantizer.encode(
                     np.ascontiguousarray(part), action.qtype
+                ))
+                continue
+            if action.mtp_fallback:
+                result.append(encode_fallback_experts(
+                    part, action.qtype, quantizer, threads, action.source,
                 ))
                 continue
             if imatrix is None or len(action.imatrix_names) != 2:
@@ -2425,10 +2494,31 @@ def create_streamed_pack(args, db: SourceDB, plan: dict[str, list[Action]],
     if resume:
         state = json.loads(state_path.read_text())
         if state.get("identity") != identity:
-            fail(
-                f"{state_path} belongs to a different conversion; pass "
-                "--fresh to replace the partial artifacts"
-            )
+            stored_identity = state.get("identity")
+            if isinstance(stored_identity, dict):
+                identity_keys = sorted(
+                    set(stored_identity).union(identity)
+                )
+                changed = [
+                    key for key in identity_keys
+                    if stored_identity.get(key) != identity.get(key)
+                ]
+                detail = f" (changed identity fields: {', '.join(changed)})"
+                tokenizer_only = changed == ["tokenizer_template_sha256"]
+            else:
+                detail = " (stored identity is malformed)"
+                tokenizer_only = False
+            if tokenizer_only:
+                print(
+                    "qwen4-pack: tokenizer template file changed; "
+                    "requiring the regenerated GGUF header to match the "
+                    "partial pack exactly"
+                )
+            else:
+                fail(
+                    f"{state_path} belongs to a different conversion{detail}; "
+                    "pass --fresh to replace the partial artifacts"
+                )
         completed_entries = state.get("completed_shards", [])
         if (not isinstance(completed_entries, list) or
                 any(not isinstance(name, str) for name in completed_entries) or
@@ -2785,6 +2875,97 @@ def rebuild_vision_artifact(args, db: SourceDB,
             pass
 
 
+def rebuild_mtp_artifact(args, db: SourceDB,
+                        plan: dict[str, list[Action]],
+                        quantizer: GGMLQuantizer,
+                        pack_id: str,
+                        imatrix: QwenGGUFImatrix | None = None):
+    # Atomically add the MTP sidecar to a finalized pack.  The existing
+    # manifest is the authority for every untouched artifact and tensor
+    # record; the pack must not already carry an MTP sidecar.
+    profile = profile_from_args(args)
+    manifest_path = args.out / profile.manifest_name
+    if not manifest_path.is_file():
+        fail(f'--rebuild-mtp requires an existing {manifest_path}')
+    manifest = json.loads(manifest_path.read_text())
+    if (manifest.get('schema') != 'ds4.qwen4.fast-pack' or
+            manifest.get('version') != profile.pack_version or
+            manifest.get('pack_id') != pack_id or
+            manifest.get('source', {}).get('revision') !=
+            args.source_revision):
+        fail('existing Qwen pack manifest does not match this conversion')
+    tensors = manifest.get('tensors')
+    artifacts = manifest.get('artifacts')
+    if not isinstance(tensors, dict) or not isinstance(artifacts, list):
+        fail('existing Qwen pack manifest has no tensor/artifact directory')
+    mtp_entries = [
+        entry for entry in artifacts
+        if isinstance(entry, dict) and entry.get('kind') == 'mtp'
+    ]
+    if mtp_entries:
+        fail('--rebuild-mtp requires a pack without an existing MTP sidecar')
+    actions = plan['mtp']
+    if not actions:
+        fail('official checkpoint has no MTP tensors')
+    validate_artifact_tensor_counts(plan, ['mtp'])
+    temporary = args.out / (profile.mtp_name + '.rebuild')
+    if temporary.exists():
+        temporary.unlink()
+    metadata = common_metadata(
+        pack_id, args.source_revision, 'mtp', profile
+    )
+    writer = RandomGGUFWriter(temporary, actions, metadata, resume=False)
+    new_records = {}
+    staging_root = args.staging_dir or (args.out / '.qwen4-mtp-stage')
+    try:
+        work_by_shard: dict[str, list[Action]] = {}
+        for action in actions:
+            shard = db.tensors[action.source]['filename']
+            work_by_shard.setdefault(shard, []).append(action)
+        for ordinal, source_shard in enumerate(sorted(work_by_shard), 1):
+            print(
+                f'mtp source {ordinal}/{len(work_by_shard)} '
+                f'{source_shard} '
+                f"({db.shards[source_shard]['size'] / 1e9:.3f} GB)",
+                flush=True,
+            )
+            with db.materialize(source_shard, staging_root):
+                for action in work_by_shard[source_shard]:
+                    writer.write_action(
+                        action, db, quantizer, new_records, imatrix,
+                        getattr(args, 'threads', 1),
+                    )
+                writer.sync()
+        expected = {
+            spec.name for action in actions for spec in action.specs
+        }
+        if set(new_records) != expected:
+            fail('rebuilt MTP tensor directory is incomplete')
+        writer.close()
+        for record in new_records.values():
+            record['artifact'] = profile.mtp_name
+        final_path = args.out / profile.mtp_name
+        os.replace(temporary, final_path)
+        merged_records = dict(tensors)
+        overlap = set(merged_records) & set(new_records)
+        if overlap:
+            fail(f'--rebuild-mtp tensor collision: {sorted(overlap)[0]}')
+        merged_records.update(new_records)
+        merged_artifacts = list(artifacts)
+        merged_artifacts.append(artifact_record(final_path, 'mtp'))
+        write_pack_manifest(
+            args, pack_id, merged_records, merged_artifacts, imatrix
+        )
+    finally:
+        writer.close()
+        if temporary.exists():
+            temporary.unlink()
+        try:
+            staging_root.rmdir()
+        except OSError:
+            pass
+
+
 def plan_summary(plan: dict[str, list[Action]], db: SourceDB,
                  profile: str | PackProfile = "q4"):
     profile = pack_profile(profile)
@@ -2843,7 +3024,7 @@ def parse_args(argv=None):
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--source-revision", required=True,
                         help="immutable official Hub commit SHA")
-    parser.add_argument("--tokenizer-template", required=True, type=Path,
+    parser.add_argument("--tokenizer-template", default=None, type=Path,
                         help="GGUF with the exact 248320-token Qwen tokenizer")
     parser.add_argument("--quants-library", type=Path,
                         help="path to libds4quants (defaults beside this script)")
@@ -2877,7 +3058,25 @@ def parse_args(argv=None):
     )
     parser.add_argument("--no-vision", action="store_true")
     parser.add_argument("--no-mtp", action="store_true")
+    parser.add_argument(
+        "--mtp-imatrix",
+        choices=("weight-energy",),
+        default=None,
+        help=(
+            "select the MTP routed-expert importance source for --profile "
+            "q2; weight-energy uses the deterministic per-expert "
+            "input-column weight-energy fallback for every MTP expert"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--rebuild-mtp",
+        action="store_true",
+        help=(
+            "atomically add an MTP sidecar to an existing finalized pack "
+            "that was converted without one"
+        ),
+    )
     parser.add_argument(
         "--rebuild-vision",
         action="store_true",
@@ -2894,10 +3093,16 @@ def parse_args(argv=None):
     if args.profile == "q2" and not args.dry_run and args.imatrix is None:
         parser.error("--profile q2 requires --imatrix")
     if args.profile == "q2" and not args.no_mtp:
-        parser.error(
-            "--profile q2 requires --no-mtp until a calibrated MTP "
-            "expert imatrix is available"
-        )
+        if args.mtp_imatrix != "weight-energy":
+            parser.error(
+                "--profile q2 with an MTP sidecar requires "
+                "--mtp-imatrix weight-energy (no calibrated MTP expert "
+                "imatrix exists; the deterministic per-expert weight-energy "
+                "fallback is the only supported selection)"
+            )
+    if (args.tokenizer_template is None and not args.dry_run and
+            not args.rebuild_vision and not args.rebuild_mtp):
+        parser.error("--tokenizer-template is required")
     return args
 
 
@@ -2916,6 +3121,8 @@ def main(argv=None):
              any(ch not in "0123456789abcdefABCDEF"
                  for ch in args.imatrix_revision))):
         fail("--imatrix-revision must be a 40-character immutable commit SHA")
+    global MTP_IMATRIX_MODE
+    MTP_IMATRIX_MODE = args.mtp_imatrix
     imatrix = None
     try:
         if profile.name == "q2" and args.imatrix is not None:
@@ -2957,6 +3164,13 @@ def main(argv=None):
             if args.no_vision or args.fresh:
                 fail("--rebuild-vision is incompatible with --no-vision/--fresh")
             rebuild_vision_artifact(
+                args, SOURCE, plan, quantizer, pack_id, imatrix
+            )
+            return 0
+        if args.rebuild_mtp:
+            if args.no_mtp:
+                fail("--rebuild-mtp is incompatible with --no-mtp")
+            rebuild_mtp_artifact(
                 args, SOURCE, plan, quantizer, pack_id, imatrix
             )
             return 0

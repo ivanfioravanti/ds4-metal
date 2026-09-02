@@ -19,6 +19,7 @@ static size_t model_fixture_size;
 static void *moe_rows8_fixture_allocation;
 static void *moe_q2_rows8_fixture_allocation;
 static void *vision_fc2_fixture_allocation;
+static void *dense_matvec_bench_allocation;
 
 static void require_ok(int ok, const char *what) {
     if (!ok) {
@@ -189,6 +190,11 @@ typedef struct {
 
 typedef struct {
     uint16_t d;
+    uint8_t qs[16];
+} test_block_q4_0;
+
+typedef struct {
+    uint16_t d;
     uint16_t dmin;
     uint8_t scales[12];
     uint8_t qs[128];
@@ -207,6 +213,7 @@ typedef struct {
 } test_block_q2_k;
 
 _Static_assert(sizeof(test_block_q8_0) == 34u, "Q8_0 block size");
+_Static_assert(sizeof(test_block_q4_0) == 18u, "Q4_0 block size");
 _Static_assert(sizeof(test_block_q4_k) == 144u, "Q4_K block size");
 _Static_assert(sizeof(test_block_iq2_xxs) == 66u, "IQ2_XXS block size");
 _Static_assert(sizeof(test_block_q2_k) == 84u, "Q2_K block size");
@@ -264,6 +271,41 @@ static void q8_0_matmul_reference(float *out,
             out[(size_t)token * out_dim + row] = sum;
         }
     }
+}
+
+static void fill_q4_0_matrix(test_block_q4_0 *blocks,
+                             uint32_t out_dim,
+                             uint32_t in_dim,
+                             uint32_t seed) {
+    const uint32_t row_blocks = in_dim / 32u;
+    for (uint32_t row = 0; row < out_dim; row++) {
+        for (uint32_t block = 0; block < row_blocks; block++) {
+            test_block_q4_0 *qb = blocks +
+                (size_t)row * row_blocks + block;
+            qb->d = f32_to_f16(0.0125f *
+                (float)(1u + ((row + block + seed) % 7u)));
+            for (uint32_t i = 0; i < 16u; i++) {
+                const uint8_t q0 = (uint8_t)((row * 11u + block * 5u +
+                    i * 3u + seed) & 15u);
+                const uint8_t q1 = (uint8_t)((row * 7u + block * 13u +
+                    i * 9u + seed + 1u) & 15u);
+                qb->qs[i] = (uint8_t)(q0 | (q1 << 4));
+            }
+        }
+    }
+}
+
+static float q4_0_value(const test_block_q4_0 *matrix,
+                        uint32_t in_dim,
+                        uint32_t row,
+                        uint32_t col) {
+    const uint32_t row_blocks = in_dim / 32u;
+    const test_block_q4_0 *qb = matrix +
+        (size_t)row * row_blocks + col / 32u;
+    const uint32_t within = col & 31u;
+    const uint8_t packed = qb->qs[within & 15u];
+    const uint8_t q = within < 16u ? packed & 15u : packed >> 4u;
+    return f16_to_f32(qb->d) * ((float)q - 8.0f);
 }
 
 static void test_q8_0_matmul(void) {
@@ -375,6 +417,356 @@ static void fill_q4_k_matrix(test_block_q4_k *blocks,
             }
         }
     }
+}
+
+static double monotonic_seconds(void) {
+    struct timespec ts;
+    require_ok(clock_gettime(CLOCK_MONOTONIC, &ts) == 0,
+               "monotonic clock");
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static int compare_double(const void *a, const void *b) {
+    const double lhs = *(const double *)a;
+    const double rhs = *(const double *)b;
+    return (lhs > rhs) - (lhs < rhs);
+}
+
+static double bench_dense_matvec_batch(bool q4,
+                                       void *model,
+                                       size_t model_size,
+                                       size_t weight_offset,
+                                       ds4_gpu_tensor *x,
+                                       ds4_gpu_tensor *out,
+                                       uint32_t in_dim,
+                                       uint32_t out_dim,
+                                       uint32_t iterations) {
+    const double start = monotonic_seconds();
+    require_ok(ds4_gpu_begin_commands(), "dense matvec benchmark begin");
+    for (uint32_t i = 0; i < iterations; i++) {
+        if (q4) {
+            require_ok(ds4_gpu_matmul_quant_tensor(
+                           out, model, model_size, weight_offset, 12u,
+                           in_dim, out_dim, x, 1u),
+                       "Q4_K dense matvec benchmark dispatch");
+        } else {
+            require_ok(ds4_gpu_qwen4_q8_0_matmul_model(
+                           out, model, model_size, weight_offset, x,
+                           in_dim, out_dim, 1u),
+                       "Q8_0 dense matvec benchmark dispatch");
+        }
+    }
+    require_ok(ds4_gpu_end_commands(), "dense matvec benchmark end");
+    return (monotonic_seconds() - start) * 1000.0 / (double)iterations;
+}
+
+static void benchmark_dense_q8_vs_q4(void) {
+    static const struct {
+        const char *name;
+        uint32_t in_dim;
+        uint32_t out_dim;
+    } shapes[] = {
+        {"GDN qkv", 2560u, 10240u},
+        {"QSA q", 2560u, 12288u},
+        {"GDN out", 6144u, 2560u},
+    };
+    enum { SAMPLES = 9, ITERATIONS = 64 };
+
+    size_t allocation_size = 0u;
+    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+        const size_t q8_bytes = (size_t)shapes[i].out_dim *
+            (shapes[i].in_dim / 32u) * sizeof(test_block_q8_0);
+        const size_t q4_bytes = (size_t)shapes[i].out_dim *
+            (shapes[i].in_dim / 256u) * sizeof(test_block_q4_k);
+        const size_t needed = align_size(q8_bytes, 4096u) + q4_bytes;
+        if (needed > allocation_size) allocation_size = needed;
+    }
+    allocation_size = align_size(allocation_size, 4096u);
+    require_ok(posix_memalign(&dense_matvec_bench_allocation,
+                              4096u, allocation_size) == 0,
+               "dense matvec benchmark model allocation");
+    memset(dense_matvec_bench_allocation, 0, allocation_size);
+    require_ok(ds4_gpu_set_model_map(dense_matvec_bench_allocation,
+                                     allocation_size),
+               "dense matvec benchmark model registration");
+
+    puts("Qwen dense decode matvec benchmark (batched command buffer):");
+    for (size_t shape = 0; shape < sizeof(shapes) / sizeof(shapes[0]); shape++) {
+        const uint32_t in_dim = shapes[shape].in_dim;
+        const uint32_t out_dim = shapes[shape].out_dim;
+        const size_t q8_bytes = (size_t)out_dim * (in_dim / 32u) *
+            sizeof(test_block_q8_0);
+        const size_t q4_offset = align_size(q8_bytes, 4096u);
+        const size_t q4_bytes = (size_t)out_dim * (in_dim / 256u) *
+            sizeof(test_block_q4_k);
+        require_ok(q4_offset + q4_bytes <= allocation_size,
+                   "dense matvec benchmark model bounds");
+        test_block_q8_0 *q8 = dense_matvec_bench_allocation;
+        test_block_q4_k *q4 = (test_block_q4_k *)(
+            (uint8_t *)dense_matvec_bench_allocation + q4_offset);
+        fill_q8_0_matrix(q8, out_dim, in_dim, 101u + (uint32_t)shape);
+        fill_q4_k_matrix(q4, out_dim, in_dim, 151u + (uint32_t)shape);
+
+        float *input = malloc((size_t)in_dim * sizeof(float));
+        require_ok(input != NULL, "dense matvec benchmark input allocation");
+        for (uint32_t i = 0; i < in_dim; i++)
+            input[i] = sinf((float)(i + 1u) * 0.0031f);
+        ds4_gpu_tensor *x = tensor_from(input, (size_t)in_dim * sizeof(float));
+        ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(
+            (size_t)out_dim * sizeof(float));
+        require_ok(out != NULL, "dense matvec benchmark output allocation");
+
+        (void)bench_dense_matvec_batch(false,
+                                       dense_matvec_bench_allocation,
+                                       allocation_size, 0u, x, out,
+                                       in_dim, out_dim, 2u);
+        (void)bench_dense_matvec_batch(true,
+                                       dense_matvec_bench_allocation,
+                                       allocation_size, q4_offset, x, out,
+                                       in_dim, out_dim, 2u);
+        double q8_ms[SAMPLES], q4_ms[SAMPLES];
+        for (uint32_t sample = 0; sample < SAMPLES; sample++) {
+            if ((sample & 1u) == 0u) {
+                q8_ms[sample] = bench_dense_matvec_batch(
+                    false, dense_matvec_bench_allocation, allocation_size,
+                    0u, x, out, in_dim, out_dim, ITERATIONS);
+                q4_ms[sample] = bench_dense_matvec_batch(
+                    true, dense_matvec_bench_allocation, allocation_size,
+                    q4_offset, x, out, in_dim, out_dim, ITERATIONS);
+            } else {
+                q4_ms[sample] = bench_dense_matvec_batch(
+                    true, dense_matvec_bench_allocation, allocation_size,
+                    q4_offset, x, out, in_dim, out_dim, ITERATIONS);
+                q8_ms[sample] = bench_dense_matvec_batch(
+                    false, dense_matvec_bench_allocation, allocation_size,
+                    0u, x, out, in_dim, out_dim, ITERATIONS);
+            }
+        }
+        qsort(q8_ms, SAMPLES, sizeof(q8_ms[0]), compare_double);
+        qsort(q4_ms, SAMPLES, sizeof(q4_ms[0]), compare_double);
+        const double q8_median = q8_ms[SAMPLES / 2u];
+        const double q4_median = q4_ms[SAMPLES / 2u];
+        printf("  %-8s %u->%u: Q8_0 %.4f ms, Q4_K %.4f ms, %.2fx\n",
+               shapes[shape].name, in_dim, out_dim,
+               q8_median, q4_median, q8_median / q4_median);
+
+        ds4_gpu_tensor_free(out);
+        ds4_gpu_tensor_free(x);
+        free(input);
+    }
+}
+
+static double bench_moe_q4_batch(bool q4_0,
+                                 void *model,
+                                 size_t model_size,
+                                 size_t gate_offset,
+                                 size_t up_offset,
+                                 size_t down_offset,
+                                 ds4_gpu_tensor *x,
+                                 ds4_gpu_tensor *selected,
+                                 ds4_gpu_tensor *route,
+                                 ds4_gpu_tensor *mid,
+                                 ds4_gpu_tensor *out,
+                                 uint32_t iterations) {
+    enum {
+        IN = 2560, FF = 640, OUT = 2560,
+        EXPERTS = 10, TOP_K = 10,
+    };
+    const double start = monotonic_seconds();
+    require_ok(ds4_gpu_begin_commands(), "MoE Q4 benchmark begin");
+    for (uint32_t i = 0; i < iterations; i++) {
+        const int ok = q4_0
+            ? ds4_gpu_qwen4_moe_q4_0_model(
+                  out, mid, x, selected, route, model, model_size,
+                  gate_offset, up_offset, down_offset,
+                  IN, FF, OUT, EXPERTS, TOP_K, 1u)
+            : ds4_gpu_qwen4_moe_q4_k_model(
+                  out, mid, x, selected, route, model, model_size,
+                  gate_offset, up_offset, down_offset,
+                  IN, FF, OUT, EXPERTS, TOP_K, 1u);
+        require_ok(ok, q4_0 ? "Q4_0 MoE benchmark dispatch"
+                            : "Q4_K MoE benchmark dispatch");
+    }
+    require_ok(ds4_gpu_end_commands(), "MoE Q4 benchmark end");
+    return (monotonic_seconds() - start) * 1000.0 / (double)iterations;
+}
+
+static void benchmark_moe_q4_k_vs_q4_0(void) {
+    enum {
+        IN = 2560, FF = 640, DOWN = 768, OUT = 2560,
+        EXPERTS = 10, TOP_K = 10, SAMPLES = 7, ITERATIONS = 48,
+    };
+    const size_t gate_bytes = (size_t)EXPERTS * FF * (IN / 256u) *
+        sizeof(test_block_q4_k);
+    const size_t down_bytes = (size_t)EXPERTS * OUT * (DOWN / 256u) *
+        sizeof(test_block_q4_k);
+    size_t cursor = 0u;
+    const size_t q4k_gate = cursor;
+    cursor = align_size(cursor + gate_bytes, 4096u);
+    const size_t q4k_up = cursor;
+    cursor = align_size(cursor + gate_bytes, 4096u);
+    const size_t q4k_down = cursor;
+    cursor = align_size(cursor + down_bytes, 4096u);
+    const size_t q40_gate = cursor;
+    cursor = align_size(cursor + gate_bytes, 4096u);
+    const size_t q40_up = cursor;
+    cursor = align_size(cursor + gate_bytes, 4096u);
+    const size_t q40_down = cursor;
+    cursor = align_size(cursor + down_bytes, 4096u);
+    require_ok(posix_memalign(&dense_matvec_bench_allocation,
+                              4096u, cursor) == 0,
+               "Q4 expert benchmark model allocation");
+    memset(dense_matvec_bench_allocation, 0, cursor);
+    uint8_t *model = dense_matvec_bench_allocation;
+    fill_q4_k_matrix((test_block_q4_k *)(model + q4k_gate),
+                     EXPERTS * FF, IN, 101u);
+    fill_q4_k_matrix((test_block_q4_k *)(model + q4k_up),
+                     EXPERTS * FF, IN, 131u);
+    fill_q4_k_matrix((test_block_q4_k *)(model + q4k_down),
+                     EXPERTS * OUT, DOWN, 151u);
+    fill_q4_0_matrix((test_block_q4_0 *)(model + q40_gate),
+                     EXPERTS * FF, IN, 101u);
+    fill_q4_0_matrix((test_block_q4_0 *)(model + q40_up),
+                     EXPERTS * FF, IN, 131u);
+    fill_q4_0_matrix((test_block_q4_0 *)(model + q40_down),
+                     EXPERTS * OUT, DOWN, 151u);
+    require_ok(ds4_gpu_set_model_map(model, cursor),
+               "Q4 expert benchmark model registration");
+
+    float input[IN];
+    int32_t ids[TOP_K];
+    float weights[TOP_K];
+    for (uint32_t i = 0; i < IN; i++)
+        input[i] = sinf((float)(i + 1u) * 0.0031f);
+    for (uint32_t i = 0; i < TOP_K; i++) {
+        ids[i] = (int32_t)i;
+        weights[i] = 1.0f / (float)TOP_K;
+    }
+    ds4_gpu_tensor *x = tensor_from(input, sizeof(input));
+    ds4_gpu_tensor *selected = tensor_from(ids, sizeof(ids));
+    ds4_gpu_tensor *route = tensor_from(weights, sizeof(weights));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(
+        (size_t)TOP_K * FF * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((size_t)OUT * sizeof(float));
+    require_ok(mid && out, "Q4 expert benchmark tensor allocation");
+
+    (void)bench_moe_q4_batch(false, model, cursor,
+                             q4k_gate, q4k_up, q4k_down,
+                             x, selected, route, mid, out, 2u);
+    (void)bench_moe_q4_batch(true, model, cursor,
+                             q40_gate, q40_up, q40_down,
+                             x, selected, route, mid, out, 2u);
+    double q4k_ms[SAMPLES], q40_ms[SAMPLES];
+    for (uint32_t sample = 0; sample < SAMPLES; sample++) {
+        if ((sample & 1u) == 0u) {
+            q4k_ms[sample] = bench_moe_q4_batch(
+                false, model, cursor, q4k_gate, q4k_up, q4k_down,
+                x, selected, route, mid, out, ITERATIONS);
+            q40_ms[sample] = bench_moe_q4_batch(
+                true, model, cursor, q40_gate, q40_up, q40_down,
+                x, selected, route, mid, out, ITERATIONS);
+        } else {
+            q40_ms[sample] = bench_moe_q4_batch(
+                true, model, cursor, q40_gate, q40_up, q40_down,
+                x, selected, route, mid, out, ITERATIONS);
+            q4k_ms[sample] = bench_moe_q4_batch(
+                false, model, cursor, q4k_gate, q4k_up, q4k_down,
+                x, selected, route, mid, out, ITERATIONS);
+        }
+    }
+    qsort(q4k_ms, SAMPLES, sizeof(q4k_ms[0]), compare_double);
+    qsort(q40_ms, SAMPLES, sizeof(q40_ms[0]), compare_double);
+    printf("Qwen routed MoE M=1 real-active geometry: "
+           "Q4_K %.4f ms/layer, Q4_0 %.4f ms/layer, %.2fx\n",
+           q4k_ms[SAMPLES / 2u], q40_ms[SAMPLES / 2u],
+           q4k_ms[SAMPLES / 2u] / q40_ms[SAMPLES / 2u]);
+
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(route);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(x);
+}
+
+static double bench_gdn_batch(ds4_gpu_tensor *out,
+                              ds4_gpu_tensor *state,
+                              const ds4_gpu_tensor *q,
+                              const ds4_gpu_tensor *k,
+                              const ds4_gpu_tensor *v,
+                              const ds4_gpu_tensor *decay,
+                              const ds4_gpu_tensor *beta,
+                              uint32_t iterations) {
+    enum { KEY_HEADS = 16, VALUE_HEADS = 48, HEAD_DIM = 128 };
+    const double start = monotonic_seconds();
+    require_ok(ds4_gpu_begin_commands(), "GDN benchmark begin");
+    for (uint32_t i = 0; i < iterations; i++) {
+        require_ok(ds4_gpu_qwen4_gdn_prefill(
+                       out, state, q, k, v, decay, beta, NULL,
+                       1u, KEY_HEADS, VALUE_HEADS, HEAD_DIM, 4u),
+                   "GDN benchmark dispatch");
+    }
+    require_ok(ds4_gpu_end_commands(), "GDN benchmark end");
+    return (monotonic_seconds() - start) * 1000.0 / (double)iterations;
+}
+
+static void benchmark_gdn_decode(void) {
+    enum {
+        KEY_HEADS = 16,
+        VALUE_HEADS = 48,
+        HEAD_DIM = 128,
+        SAMPLES = 9,
+        ITERATIONS = 128,
+    };
+    const size_t qk_elements = KEY_HEADS * HEAD_DIM;
+    const size_t value_elements = VALUE_HEADS * HEAD_DIM;
+    const size_t state_elements = VALUE_HEADS * HEAD_DIM * HEAD_DIM;
+    float *q_data = malloc(qk_elements * sizeof(float));
+    float *k_data = malloc(qk_elements * sizeof(float));
+    float *v_data = malloc(value_elements * sizeof(float));
+    float decay_data[VALUE_HEADS];
+    float beta_data[VALUE_HEADS];
+    require_ok(q_data && k_data && v_data, "GDN benchmark host allocation");
+    for (size_t i = 0; i < qk_elements; i++) {
+        q_data[i] = sinf((float)(i + 1u) * 0.003f) * 0.08f;
+        k_data[i] = cosf((float)(i + 1u) * 0.005f) * 0.08f;
+    }
+    for (size_t i = 0; i < value_elements; i++)
+        v_data[i] = sinf((float)(i + 1u) * 0.007f) * 0.1f;
+    for (uint32_t i = 0; i < VALUE_HEADS; i++) {
+        decay_data[i] = 0.97f;
+        beta_data[i] = 0.11f;
+    }
+    ds4_gpu_tensor *q = tensor_from(q_data, qk_elements * sizeof(float));
+    ds4_gpu_tensor *k = tensor_from(k_data, qk_elements * sizeof(float));
+    ds4_gpu_tensor *v = tensor_from(v_data, value_elements * sizeof(float));
+    ds4_gpu_tensor *decay = tensor_from(decay_data, sizeof(decay_data));
+    ds4_gpu_tensor *beta = tensor_from(beta_data, sizeof(beta_data));
+    ds4_gpu_tensor *state = ds4_gpu_tensor_alloc(
+        state_elements * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(
+        value_elements * sizeof(float));
+    require_ok(state && out, "GDN benchmark device allocation");
+    require_ok(ds4_gpu_tensor_fill_f32(state, 0.0f, state_elements),
+               "GDN benchmark state clear");
+    (void)bench_gdn_batch(out, state, q, k, v, decay, beta, 4u);
+    double samples[SAMPLES];
+    for (uint32_t sample = 0; sample < SAMPLES; sample++) {
+        samples[sample] = bench_gdn_batch(
+            out, state, q, k, v, decay, beta, ITERATIONS);
+    }
+    qsort(samples, SAMPLES, sizeof(samples[0]), compare_double);
+    printf("Qwen GDN decode benchmark: %.4f ms/dispatch\n",
+           samples[SAMPLES / 2u]);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(state);
+    ds4_gpu_tensor_free(beta);
+    ds4_gpu_tensor_free(decay);
+    ds4_gpu_tensor_free(v);
+    ds4_gpu_tensor_free(k);
+    ds4_gpu_tensor_free(q);
+    free(v_data);
+    free(k_data);
+    free(q_data);
 }
 
 static void q4_k_scale_min(const uint8_t scales[12], uint32_t group,
@@ -633,7 +1025,7 @@ static void test_model_q8_0_paths(void) {
     for (uint32_t i = 0; i < OUT; i++)
         activated[i] = a_m1[i] / (1.0f + expf(-a_m1[i]));
     require_ok(ds4_gpu_qwen4_q8_0_silu_model(
-        oa, model, model_fixture_size, a_offset, x, IN, OUT),
+        oa, model, model_fixture_size, a_offset, x, IN, OUT, 1u),
         "Q8_0 SiLU dispatch");
     require_ok(ds4_gpu_tensor_read(oa, 0, actual, sizeof(activated)),
                "Q8_0 SiLU readback");
@@ -642,7 +1034,7 @@ static void test_model_q8_0_paths(void) {
     for (uint32_t i = 0; i < OUT; i++) activated[i] *= b_m1[i];
     require_ok(ds4_gpu_qwen4_q8_0_swiglu_model(
         oa, model, model_fixture_size, a_offset,
-        model, model_fixture_size, b_offset, x, IN, OUT),
+        model, model_fixture_size, b_offset, x, IN, OUT, 1u),
         "Q8_0 SwiGLU dispatch");
     require_ok(ds4_gpu_tensor_read(oa, 0, actual, sizeof(activated)),
                "Q8_0 SwiGLU readback");
@@ -692,7 +1084,7 @@ static void test_model_q8_0_paths(void) {
     require_ok(mixed != NULL, "Q8_0 HC mix allocation");
     require_ok(ds4_gpu_qwen4_q8_0_hc_up_mix_model(
         mixed, norm, x, model, model_fixture_size, hc_offset,
-        IN, HC_HIDDEN, HC_STREAMS), "Q8_0 HC up/mix dispatch");
+        IN, HC_HIDDEN, 1u, HC_STREAMS), "Q8_0 HC up/mix dispatch");
     require_ok(ds4_gpu_tensor_read(mixed, 0, hc_actual, sizeof(hc_actual)),
                "Q8_0 HC up/mix readback");
     require_array_close("Qwen Q8_0 HC up/mix", hc_actual, hc_expected,
@@ -720,12 +1112,155 @@ static void test_model_q8_0_paths(void) {
     ds4_gpu_tensor *stream_t = tensor_from(streams, sizeof(streams));
     require_ok(ds4_gpu_qwen4_q8_0_hc_write_model(
         stream_t, partials, model, model_fixture_size, a_offset,
-        x, IN, OUT, HC_STREAMS), "Q8_0 HC write dispatch");
+        x, IN, OUT, 1u, HC_STREAMS), "Q8_0 HC write dispatch");
     require_ok(ds4_gpu_tensor_read(stream_t, 0, streams_actual,
                                    sizeof(streams_actual)),
                "Q8_0 HC write readback");
     require_array_close("Qwen Q8_0 HC write", streams_actual, streams_expected,
                         HC_STREAMS * OUT, 5e-4f, 5e-4f);
+
+    /* Tiny-verifier fusion parity: the four row-1 fusions above must match
+     * their standalone arithmetic for multi-row MTP batches as well.  The
+     * references stay per-row CPU dot products over the same Q8_0 blocks. */
+    {
+        float a_rows[ROWS * OUT], b_rows[ROWS * OUT];
+        q8_0_matmul_reference(a_rows, a, input, IN, OUT, ROWS);
+        q8_0_matmul_reference(b_rows, b, input, IN, OUT, ROWS);
+        ds4_gpu_tensor *o_rows =
+            ds4_gpu_tensor_alloc((uint64_t)ROWS * OUT * sizeof(float));
+        require_ok(o_rows != NULL, "Q8_0 multirow output allocation");
+
+        float silu_rows[ROWS * OUT];
+        for (uint32_t i = 0; i < ROWS * OUT; i++)
+            silu_rows[i] = a_rows[i] / (1.0f + expf(-a_rows[i]));
+        require_ok(ds4_gpu_qwen4_q8_0_silu_model(
+            o_rows, model, model_fixture_size, a_offset,
+            x, IN, OUT, ROWS), "Q8_0 SiLU multirow dispatch");
+        require_ok(ds4_gpu_tensor_read(o_rows, 0, actual,
+                                       (uint64_t)ROWS * OUT * sizeof(float)),
+                   "Q8_0 SiLU multirow readback");
+        require_array_close("Qwen Q8_0 fused SiLU rows>1", actual, silu_rows,
+                            ROWS * OUT, 4e-4f, 4e-4f);
+
+        float swiglu_rows[ROWS * OUT];
+        for (uint32_t i = 0; i < ROWS * OUT; i++)
+            swiglu_rows[i] = silu_rows[i] * b_rows[i];
+        require_ok(ds4_gpu_qwen4_q8_0_swiglu_model(
+            o_rows, model, model_fixture_size, a_offset,
+            model, model_fixture_size, b_offset, x, IN, OUT, ROWS),
+            "Q8_0 SwiGLU multirow dispatch");
+        require_ok(ds4_gpu_tensor_read(o_rows, 0, actual,
+                                       (uint64_t)ROWS * OUT * sizeof(float)),
+                   "Q8_0 SwiGLU multirow readback");
+        require_array_close("Qwen Q8_0 fused SwiGLU rows>1", actual,
+                            swiglu_rows, ROWS * OUT, 5e-4f, 5e-4f);
+
+        float normalized_rows[ROWS * HC_STREAMS * HC_HIDDEN];
+        for (uint32_t i = 0; i < ROWS * HC_STREAMS * HC_HIDDEN; i++)
+            normalized_rows[i] = sinf((float)(i + 5u) * 0.023f);
+        float hc_rows_expected[ROWS * HC_HIDDEN];
+        for (uint32_t row = 0; row < ROWS; row++) {
+            for (uint32_t dim = 0; dim < HC_HIDDEN; dim++) {
+                float value = 0.0f;
+                for (uint32_t stream = 0; stream < HC_STREAMS; stream++) {
+                    float raw = 0.0f;
+                    const uint32_t hc_row = stream * HC_HIDDEN + dim;
+                    for (uint32_t k = 0; k < IN; k++)
+                        raw = fmaf(q8_0_value(hc, IN, hc_row, k),
+                                   input[row * IN + k], raw);
+                    value = fmaf(
+                        normalized_rows[
+                            row * HC_STREAMS * HC_HIDDEN +
+                            stream * HC_HIDDEN + dim],
+                        1.0f / (1.0f + expf(-raw)), value);
+                }
+                hc_rows_expected[row * HC_HIDDEN + dim] =
+                    value / (float)HC_STREAMS;
+            }
+        }
+        ds4_gpu_tensor *norm_rows = tensor_from(normalized_rows,
+                                                sizeof(normalized_rows));
+        ds4_gpu_tensor *mixed_rows = ds4_gpu_tensor_alloc(
+            (uint64_t)ROWS * HC_HIDDEN * sizeof(float));
+        require_ok(norm_rows && mixed_rows,
+                   "Q8_0 HC up/mix multirow allocation");
+        require_ok(ds4_gpu_qwen4_q8_0_hc_up_mix_model(
+            mixed_rows, norm_rows, x, model, model_fixture_size, hc_offset,
+            IN, HC_HIDDEN, ROWS, HC_STREAMS),
+            "Q8_0 HC up/mix multirow dispatch");
+        float hc_rows_actual[ROWS * HC_HIDDEN];
+        require_ok(ds4_gpu_tensor_read(mixed_rows, 0, hc_rows_actual,
+                                       sizeof(hc_rows_actual)),
+                   "Q8_0 HC up/mix multirow readback");
+        require_array_close("Qwen Q8_0 HC up/mix rows>1", hc_rows_actual,
+                            hc_rows_expected, ROWS * HC_HIDDEN,
+                            5e-4f, 5e-4f);
+        ds4_gpu_tensor_free(mixed_rows);
+        ds4_gpu_tensor_free(norm_rows);
+
+        float partials_rows[ROWS * HC_STREAMS * HC_STREAMS];
+        float streams_rows[ROWS * HC_STREAMS * OUT];
+        float streams_rows_actual[ROWS * HC_STREAMS * OUT];
+        for (uint32_t i = 0; i < ROWS * HC_STREAMS * HC_STREAMS; i++)
+            partials_rows[i] = ((int)(i % 5u) - 2) * 0.11f;
+        for (uint32_t i = 0; i < ROWS * HC_STREAMS * OUT; i++)
+            streams_rows[i] = ((int)(i % 9u) - 4) * 0.021f;
+        for (uint32_t row = 0; row < ROWS; row++) {
+            for (uint32_t stream = 0; stream < HC_STREAMS; stream++) {
+                float raw = 0.0f;
+                for (uint32_t source = 0; source < HC_STREAMS; source++)
+                    raw += partials_rows[
+                        row * HC_STREAMS * HC_STREAMS +
+                        source * HC_STREAMS + stream];
+                const float inject = 2.0f / (1.0f + expf(-raw));
+                for (uint32_t dim = 0; dim < OUT; dim++)
+                    streams_rows[
+                        row * HC_STREAMS * OUT + stream * OUT + dim] = fmaf(
+                        a_rows[row * OUT + dim], inject,
+                        streams_rows[
+                            row * HC_STREAMS * OUT + stream * OUT + dim]);
+            }
+        }
+        float streams_rows_init[ROWS * HC_STREAMS * OUT];
+        for (uint32_t i = 0; i < ROWS * HC_STREAMS * OUT; i++)
+            streams_rows_init[i] = ((int)(i % 9u) - 4) * 0.021f;
+        memcpy(streams_rows, streams_rows_init, sizeof(streams_rows));
+        for (uint32_t row = 0; row < ROWS; row++) {
+            for (uint32_t stream = 0; stream < HC_STREAMS; stream++) {
+                float raw = 0.0f;
+                for (uint32_t source = 0; source < HC_STREAMS; source++)
+                    raw += partials_rows[
+                        row * HC_STREAMS * HC_STREAMS +
+                        source * HC_STREAMS + stream];
+                const float inject = 2.0f / (1.0f + expf(-raw));
+                for (uint32_t dim = 0; dim < OUT; dim++)
+                    streams_rows[
+                        row * HC_STREAMS * OUT + stream * OUT + dim] = fmaf(
+                        a_rows[row * OUT + dim], inject,
+                        streams_rows_init[
+                            row * HC_STREAMS * OUT + stream * OUT + dim]);
+            }
+        }
+        ds4_gpu_tensor *partials_t = tensor_from(partials_rows,
+                                                  sizeof(partials_rows));
+        ds4_gpu_tensor *streams_t = tensor_from(streams_rows_init,
+                                                 sizeof(streams_rows_init));
+        require_ok(partials_t && streams_t,
+                   "Q8_0 HC write multirow allocation");
+        require_ok(ds4_gpu_qwen4_q8_0_hc_write_model(
+            streams_t, partials_t, model, model_fixture_size, a_offset,
+            x, IN, OUT, ROWS, HC_STREAMS),
+            "Q8_0 HC write multirow dispatch");
+        require_ok(ds4_gpu_tensor_read(streams_t, 0, streams_rows_actual,
+                                       sizeof(streams_rows_actual)),
+                   "Q8_0 HC write multirow readback");
+        require_array_close("Qwen Q8_0 HC write rows>1", streams_rows_actual,
+                            streams_rows, ROWS * HC_STREAMS * OUT,
+                            5e-4f, 5e-4f);
+        ds4_gpu_tensor_free(streams_t);
+        ds4_gpu_tensor_free(partials_t);
+        ds4_gpu_tensor_free(o_rows);
+    }
 
     ds4_gpu_tensor_free(stream_t);
     ds4_gpu_tensor_free(partials);
@@ -739,6 +1274,152 @@ static void test_model_q8_0_paths(void) {
     ds4_gpu_tensor_free(out);
     ds4_gpu_tensor_free(x);
 }
+
+static void test_model_q8_0_mul_mm_rows(void) {
+    /* Prefill-sized batches route through the tiled tensor-core kernel_mul_mm
+     * shared with the GLM/DeepSeek dense path.  out_dim 67 and the 33-row
+     * case exercise the bounds-checked variant.  The tiled kernel rounds
+     * dequantized weights and activations to F16 in its threadgroup tiles
+     * and accumulates F32, so the reference tolerance covers that rounding
+     * rather than demanding bit parity with the scalar dot kernels. */
+    enum { IN = 512, OUT = 67, ALIGNED_ROWS = 64, TAIL_ROWS = 33 };
+    const size_t weight_offset = 4096u;
+    const size_t weight_bytes =
+        (size_t)OUT * (IN / 32u) * sizeof(test_block_q8_0);
+    const size_t model_size = weight_offset + weight_bytes + 256u;
+    void *allocation = NULL;
+    require_ok(posix_memalign(&allocation, 4096u,
+                              align_size(model_size, 4096u)) == 0,
+               "Q8_0 mul_mm model allocation");
+    memset(allocation, 0, align_size(model_size, 4096u));
+    uint8_t *model = allocation;
+    test_block_q8_0 *weights =
+        (test_block_q8_0 *)(model + weight_offset);
+    fill_q8_0_matrix(weights, OUT, IN, 91u);
+    require_ok(ds4_gpu_set_model_map(model, model_size),
+               "Q8_0 mul_mm model registration");
+
+    const uint32_t row_cases[] = { ALIGNED_ROWS, TAIL_ROWS };
+    for (uint32_t c = 0; c < 2u; c++) {
+        const uint32_t rows = row_cases[c];
+        float *input = malloc((size_t)rows * IN * sizeof(float));
+        float *expected = malloc((size_t)rows * OUT * sizeof(float));
+        float *actual = malloc((size_t)rows * OUT * sizeof(float));
+        require_ok(input && expected && actual,
+                   "Q8_0 mul_mm host allocations");
+        for (uint32_t i = 0; i < rows * IN; i++)
+            input[i] = cosf((float)(i + 7u) * 0.011f) * 0.4f;
+        q8_0_matmul_reference(expected, weights, input, IN, OUT, rows);
+        ds4_gpu_tensor *x = tensor_from(input,
+                                        (size_t)rows * IN * sizeof(float));
+        ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(
+            (size_t)rows * OUT * sizeof(float));
+        require_ok(x && out, "Q8_0 mul_mm tensor allocation");
+        require_ok(ds4_gpu_qwen4_q8_0_matmul_model(
+                       out, model, model_size, weight_offset,
+                       x, IN, OUT, rows),
+                   "Q8_0 mul_mm dispatch");
+        require_ok(ds4_gpu_tensor_read(out, 0, actual,
+                                       (size_t)rows * OUT * sizeof(float)),
+                   "Q8_0 mul_mm readback");
+        char label[64];
+        snprintf(label, sizeof(label), "Qwen Q8_0 mul_mm rows=%u", rows);
+        require_array_close(label, actual, expected,
+                            (size_t)rows * OUT, 2e-1f, 4e-3f);
+        ds4_gpu_tensor_free(out);
+        ds4_gpu_tensor_free(x);
+        free(actual);
+        free(expected);
+        free(input);
+    }
+    free(allocation);
+}
+
+static void test_model_bf16_matmul_rows(void) {
+    /* Prefill-sized BF16 control projections (MoE router, GDN decay/beta)
+     * route through the tiled tensor-core kernel_mul_mm_bf16_f32.  The
+     * tiled kernel stages BF16 weights and F32 activations into F16
+     * threadgroup tiles and accumulates F32, so the rows>=32 reference
+     * models that operand rounding; the below-threshold case pins the
+     * scalar path's exact BF16 arithmetic.  out_dim 67 and rows 33
+     * exercise the bounds-checked variant. */
+    enum { IN = 512 };
+    const size_t weight_offset = 4096u;
+    const uint32_t out_cases[] = { 67u, 128u };
+    const uint32_t row_cases[] = { 64u, 33u, 8u };
+    for (uint32_t oc = 0; oc < 2u; oc++) {
+        const uint32_t out_dim = out_cases[oc];
+        const size_t weight_bytes = (size_t)out_dim * IN * sizeof(uint16_t);
+        const size_t model_size = weight_offset + weight_bytes + 256u;
+        void *allocation = NULL;
+        require_ok(posix_memalign(&allocation, 4096u,
+                                  align_size(model_size, 4096u)) == 0,
+                   "BF16 mul_mm model allocation");
+        memset(allocation, 0, align_size(model_size, 4096u));
+        uint8_t *model = allocation;
+        uint16_t *weights = (uint16_t *)(model + weight_offset);
+        for (uint32_t o = 0; o < out_dim; o++)
+            for (uint32_t k = 0; k < IN; k++)
+                weights[(size_t)o * IN + k] = f32_to_bf16(
+                    cosf((float)((o * IN + k) % 521u) * 0.017f) * 0.05f +
+                    sinf((float)o * 0.013f) * 0.03f);
+        require_ok(ds4_gpu_set_model_map(model, model_size),
+                   "BF16 mul_mm model registration");
+        for (uint32_t rc = 0; rc < 2u; rc++) {
+            const uint32_t rows = row_cases[rc];
+            float *input = malloc((size_t)rows * IN * sizeof(float));
+            float *expected = malloc((size_t)rows * out_dim * sizeof(float));
+            float *actual = malloc((size_t)rows * out_dim * sizeof(float));
+            require_ok(input && expected && actual,
+                       "BF16 mul_mm host allocations");
+            for (uint32_t i = 0; i < rows * IN; i++)
+                input[i] = cosf((float)(i + 7u) * 0.011f) * 0.4f;
+            for (uint32_t r = 0; r < rows; r++) {
+                for (uint32_t o = 0; o < out_dim; o++) {
+                    float sum = 0.0f;
+                    for (uint32_t k = 0; k < IN; k++) {
+                        const float weight =
+                            bf16_to_f32(weights[(size_t)o * IN + k]);
+                        if (rows >= 32u) {
+                            const _Float16 w16 = (_Float16)weight;
+                            const _Float16 x16 = (_Float16)input[r * IN + k];
+                            sum += (float)w16 * (float)x16;
+                        } else {
+                            sum += weight * input[r * IN + k];
+                        }
+                    }
+                    expected[(size_t)r * out_dim + o] = sum;
+                }
+            }
+            ds4_gpu_tensor *x = tensor_from(
+                input, (size_t)rows * IN * sizeof(float));
+            ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(
+                (size_t)rows * out_dim * sizeof(float));
+            require_ok(x && out, "BF16 mul_mm tensor allocation");
+            require_ok(ds4_gpu_qwen4_bf16_matmul_model(
+                           out, model, model_size, weight_offset,
+                           x, IN, out_dim, rows),
+                       "BF16 mul_mm dispatch");
+            require_ok(ds4_gpu_tensor_read(
+                           out, 0, actual,
+                           (size_t)rows * out_dim * sizeof(float)),
+                       "BF16 mul_mm readback");
+            char label[64];
+            snprintf(label, sizeof(label),
+                     "Qwen BF16 matmul out=%u rows=%u", out_dim, rows);
+            require_array_close(label, actual, expected,
+                                (size_t)rows * out_dim,
+                                rows >= 32u ? 1e-2f : 2e-5f, 4e-3f);
+            ds4_gpu_tensor_free(out);
+            ds4_gpu_tensor_free(x);
+            free(actual);
+            free(expected);
+            free(input);
+        }
+        free(allocation);
+    }
+}
+
 
 static void test_vision_fc2_q8_0_stride(void) {
     enum { ROWS = 2, MODEL_GUARD = 256, OUTPUT_GUARD = 64 };
@@ -986,6 +1667,274 @@ static void test_moe_q4_k(void) {
                    "restore Q8_0 model fixture registration");
 }
 
+static void test_moe_q4_0(void) {
+    enum {
+        IN = 256, FF = 64, DOWN = 256, OUT = 33,
+        EXPERTS = 12, TOP_K = 10,
+    };
+    const size_t gate_bytes = (size_t)EXPERTS * FF * (IN / 32u) *
+        sizeof(test_block_q4_0);
+    const size_t down_bytes = (size_t)EXPERTS * OUT * (DOWN / 32u) *
+        sizeof(test_block_q4_0);
+    size_t cursor = 0u;
+    const size_t gate_offset = cursor;
+    cursor = align_size(cursor + gate_bytes, 64u);
+    const size_t up_offset = cursor;
+    cursor = align_size(cursor + gate_bytes, 64u);
+    const size_t down_offset = cursor;
+    cursor = align_size(cursor + down_bytes, 4096u);
+    void *allocation = NULL;
+    require_ok(posix_memalign(&allocation, 4096u, cursor) == 0,
+               "Q4_0 MoE model allocation");
+    uint8_t *model = allocation;
+    memset(model, 0, cursor);
+    test_block_q4_0 *gate = (test_block_q4_0 *)(model + gate_offset);
+    test_block_q4_0 *up = (test_block_q4_0 *)(model + up_offset);
+    test_block_q4_0 *down = (test_block_q4_0 *)(model + down_offset);
+    fill_q4_0_matrix(gate, EXPERTS * FF, IN, 7u);
+    fill_q4_0_matrix(up, EXPERTS * FF, IN, 23u);
+    fill_q4_0_matrix(down, EXPERTS * OUT, DOWN, 41u);
+    require_ok(ds4_gpu_set_model_map(model, cursor),
+               "Q4_0 MoE model fixture registration");
+
+    float input[IN];
+    int32_t selected[TOP_K];
+    float route[TOP_K];
+    float expected_mid[TOP_K * FF];
+    float expected_out[OUT];
+    for (uint32_t i = 0; i < IN; i++)
+        input[i] = cosf((float)(i + 1u) * 0.021f) * 0.2f;
+    for (uint32_t slot = 0; slot < TOP_K; slot++) {
+        selected[slot] = (int32_t)((slot * 5u) % EXPERTS);
+        route[slot] = (float)(slot + 1u) / 55.0f;
+        const uint32_t expert = (uint32_t)selected[slot];
+        for (uint32_t output = 0; output < FF; output++) {
+            const uint32_t weight_row = expert * FF + output;
+            float g = 0.0f, u = 0.0f;
+            for (uint32_t k = 0; k < IN; k++) {
+                g = fmaf(q4_0_value(gate, IN, weight_row, k), input[k], g);
+                u = fmaf(q4_0_value(up, IN, weight_row, k), input[k], u);
+            }
+            expected_mid[slot * FF + output] =
+                (g / (1.0f + expf(-g))) * u;
+        }
+    }
+    for (uint32_t output = 0; output < OUT; output++) {
+        float total = 0.0f;
+        for (uint32_t slot = 0; slot < TOP_K; slot++) {
+            const uint32_t expert = (uint32_t)selected[slot];
+            const uint32_t weight_row = expert * OUT + output;
+            float sum = 0.0f;
+            for (uint32_t k = 0; k < FF; k++)
+                sum = fmaf(q4_0_value(down, DOWN, weight_row, k),
+                           expected_mid[slot * FF + k], sum);
+            total = fmaf(sum, route[slot], total);
+        }
+        expected_out[output] = total;
+    }
+
+    ds4_gpu_tensor *xt = tensor_from(input, sizeof(input));
+    ds4_gpu_tensor *st = tensor_from(selected, sizeof(selected));
+    ds4_gpu_tensor *rt = tensor_from(route, sizeof(route));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(sizeof(expected_mid));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(sizeof(expected_out));
+    float actual_mid[TOP_K * FF], actual_out[OUT];
+    require_ok(mid && out, "Q4_0 MoE output allocations");
+    require_ok(ds4_gpu_qwen4_moe_q4_0_model(
+        out, mid, xt, st, rt, model, cursor,
+        gate_offset, up_offset, down_offset,
+        IN, FF, OUT, EXPERTS, TOP_K, 1u),
+        "Qwen Q4_0 M=1 MoE");
+    require_ok(ds4_gpu_tensor_read(mid, 0, actual_mid, sizeof(actual_mid)) &&
+               ds4_gpu_tensor_read(out, 0, actual_out, sizeof(actual_out)),
+               "Q4_0 MoE readback");
+    require_array_close("Qwen Q4_0 M=1 MoE mid", actual_mid, expected_mid,
+                        TOP_K * FF, 4e-4f, 4e-4f);
+    require_array_close("Qwen Q4_0 M=1 MoE output", actual_out, expected_out,
+                        OUT, 5e-4f, 5e-4f);
+
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(rt);
+    ds4_gpu_tensor_free(st);
+    ds4_gpu_tensor_free(xt);
+    if (model_fixture_allocation != NULL)
+        require_ok(ds4_gpu_set_model_map(model_fixture_allocation,
+                                         model_fixture_size),
+                   "restore Q8_0 model fixture after Q4_0 MoE");
+    free(allocation);
+}
+
+static void test_moe_q4_0_mul_mm_id(void) {
+    /* The grouped tensor-core MoE path engages at DS4_QWEN4_MOE_MUL_MM_ID_MIN_ROWS
+     * rows and tiles in 512-row chunks; 600 rows covers a full tile plus a
+     * ragged tail.  The reference stays the exact scalar CPU dot product; the
+     * tiled kernels round dequantized weights and activations to F16 tiles, so
+     * the tolerance covers that rounding. */
+    enum {
+        IN = 256, FF = 64, DOWN = 256, OUT = 33,
+        EXPERTS = 12, TOP_K = 10, ROWS = 600,
+    };
+    const size_t gate_bytes = (size_t)EXPERTS * FF * (IN / 32u) *
+        sizeof(test_block_q4_0);
+    const size_t down_bytes = (size_t)EXPERTS * OUT * (DOWN / 32u) *
+        sizeof(test_block_q4_0);
+    size_t cursor = 0u;
+    const size_t gate_offset = cursor;
+    cursor = align_size(cursor + gate_bytes, 64u);
+    const size_t up_offset = cursor;
+    cursor = align_size(cursor + gate_bytes, 64u);
+    const size_t down_offset = cursor;
+    cursor = align_size(cursor + down_bytes, 4096u);
+    void *allocation = NULL;
+    require_ok(posix_memalign(&allocation, 4096u, cursor) == 0,
+               "Q4_0 MoE mul_mm_id model allocation");
+    uint8_t *model = allocation;
+    memset(model, 0, cursor);
+    test_block_q4_0 *gate = (test_block_q4_0 *)(model + gate_offset);
+    test_block_q4_0 *up = (test_block_q4_0 *)(model + up_offset);
+    test_block_q4_0 *down = (test_block_q4_0 *)(model + down_offset);
+    fill_q4_0_matrix(gate, EXPERTS * FF, IN, 7u);
+    fill_q4_0_matrix(up, EXPERTS * FF, IN, 23u);
+    fill_q4_0_matrix(down, EXPERTS * OUT, DOWN, 41u);
+    require_ok(ds4_gpu_set_model_map(model, cursor),
+               "Q4_0 MoE mul_mm_id model fixture registration");
+
+    float *input = malloc((size_t)ROWS * IN * sizeof(float));
+    int32_t *selected = malloc((size_t)ROWS * TOP_K * sizeof(int32_t));
+    float *route = malloc((size_t)ROWS * TOP_K * sizeof(float));
+    float *expected_mid = malloc((size_t)ROWS * TOP_K * FF * sizeof(float));
+    float *expected_out = malloc((size_t)ROWS * OUT * sizeof(float));
+    require_ok(input && selected && route && expected_mid && expected_out,
+               "Q4_0 MoE mul_mm_id host allocations");
+    /* (slot * 5 + row) mod 12 is injective in slot because gcd(5, 12) is 1,
+     * so every row keeps ten distinct experts as the route map requires. */
+    for (uint32_t row = 0; row < ROWS; row++) {
+        for (uint32_t i = 0; i < IN; i++)
+            input[(size_t)row * IN + i] =
+                cosf((float)(row * 31u + i + 1u) * 0.017f) * 0.2f;
+        for (uint32_t slot = 0; slot < TOP_K; slot++) {
+            selected[(size_t)row * TOP_K + slot] =
+                (int32_t)((slot * 5u + row) % EXPERTS);
+            route[(size_t)row * TOP_K + slot] =
+                (float)(slot + 1u) / 55.0f;
+        }
+    }
+    for (uint32_t row = 0; row < ROWS; row++) {
+        for (uint32_t slot = 0; slot < TOP_K; slot++) {
+            const uint32_t expert =
+                (uint32_t)selected[(size_t)row * TOP_K + slot];
+            for (uint32_t output = 0; output < FF; output++) {
+                const uint32_t weight_row = expert * FF + output;
+                float g = 0.0f, u = 0.0f;
+                for (uint32_t k = 0; k < IN; k++) {
+                    g = fmaf(q4_0_value(gate, IN, weight_row, k),
+                             input[(size_t)row * IN + k], g);
+                    u = fmaf(q4_0_value(up, IN, weight_row, k),
+                             input[(size_t)row * IN + k], u);
+                }
+                expected_mid[((size_t)row * TOP_K + slot) * FF + output] =
+                    (g / (1.0f + expf(-g))) * u;
+            }
+        }
+        for (uint32_t output = 0; output < OUT; output++) {
+            float total = 0.0f;
+            for (uint32_t slot = 0; slot < TOP_K; slot++) {
+                const uint32_t expert =
+                    (uint32_t)selected[(size_t)row * TOP_K + slot];
+                const uint32_t weight_row = expert * OUT + output;
+                float sum = 0.0f;
+                for (uint32_t k = 0; k < FF; k++)
+                    sum = fmaf(q4_0_value(down, DOWN, weight_row, k),
+                               expected_mid[
+                                   ((size_t)row * TOP_K + slot) * FF + k],
+                               sum);
+                total = fmaf(sum, route[(size_t)row * TOP_K + slot], total);
+            }
+            expected_out[(size_t)row * OUT + output] = total;
+        }
+    }
+
+    ds4_gpu_tensor *xt = tensor_from(input, (size_t)ROWS * IN * sizeof(float));
+    ds4_gpu_tensor *st = tensor_from(selected,
+                                     (size_t)ROWS * TOP_K * sizeof(int32_t));
+    ds4_gpu_tensor *rt = tensor_from(route,
+                                     (size_t)ROWS * TOP_K * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(
+        (size_t)ROWS * TOP_K * FF * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(
+        (size_t)ROWS * OUT * sizeof(float));
+    float *actual_mid = malloc((size_t)ROWS * TOP_K * FF * sizeof(float));
+    float *actual_out = malloc((size_t)ROWS * OUT * sizeof(float));
+    require_ok(mid && out && actual_mid && actual_out,
+               "Q4_0 MoE mul_mm_id tensor allocations");
+    setenv("DS4_QWEN4_MOE_MUL_MM_ID_MIN_ROWS", "512", 1);
+    setenv("DS4_QWEN4_MOE_MUL_MM_TILE_ROWS", "512", 1);
+    require_ok(ds4_gpu_qwen4_moe_q4_0_model(
+        out, mid, xt, st, rt, model, cursor,
+        gate_offset, up_offset, down_offset,
+        IN, FF, OUT, EXPERTS, TOP_K, ROWS),
+        "Qwen Q4_0 grouped MoE dispatch");
+    require_ok(ds4_gpu_tensor_read(mid, 0, actual_mid,
+                                   (size_t)ROWS * TOP_K * FF * sizeof(float)) &&
+               ds4_gpu_tensor_read(out, 0, actual_out,
+                                   (size_t)ROWS * OUT * sizeof(float)),
+               "Q4_0 MoE mul_mm_id readback");
+    require_array_close("Qwen Q4_0 grouped MoE mid", actual_mid,
+                        expected_mid, (size_t)ROWS * TOP_K * FF,
+                        2e-2f, 4e-3f);
+    require_array_close("Qwen Q4_0 grouped MoE output", actual_out,
+                        expected_out, (size_t)ROWS * OUT, 5e-2f, 8e-3f);
+
+    /* The work-tile row granularity only regroups which threadgroup computes
+     * which (token, slot) assignment row: every output element's dot
+     * products, accumulation order, and destination stay fixed, so a single
+     * 600-row tile (one full tile plus a ragged tail folded together) must
+     * be BYTE-IDENTICAL to the 512-row tiling above. */
+    float *retiled_mid = malloc((size_t)ROWS * TOP_K * FF * sizeof(float));
+    float *retiled_out = malloc((size_t)ROWS * OUT * sizeof(float));
+    require_ok(retiled_mid && retiled_out,
+               "Q4_0 MoE retile host allocations");
+    setenv("DS4_QWEN4_MOE_MUL_MM_TILE_ROWS", "600", 1);
+    require_ok(ds4_gpu_qwen4_moe_q4_0_model(
+        out, mid, xt, st, rt, model, cursor,
+        gate_offset, up_offset, down_offset,
+        IN, FF, OUT, EXPERTS, TOP_K, ROWS),
+        "Qwen Q4_0 grouped MoE single-tile dispatch");
+    require_ok(ds4_gpu_tensor_read(mid, 0, retiled_mid,
+                                   (size_t)ROWS * TOP_K * FF * sizeof(float)) &&
+               ds4_gpu_tensor_read(out, 0, retiled_out,
+                                   (size_t)ROWS * OUT * sizeof(float)),
+               "Q4_0 MoE single-tile readback");
+    require_ok(memcmp(retiled_mid, actual_mid,
+                      (size_t)ROWS * TOP_K * FF * sizeof(float)) == 0 &&
+               memcmp(retiled_out, actual_out,
+                      (size_t)ROWS * OUT * sizeof(float)) == 0,
+               "Q4_0 MoE tile-size byte identity (512 vs 600 rows)");
+    unsetenv("DS4_QWEN4_MOE_MUL_MM_TILE_ROWS");
+    unsetenv("DS4_QWEN4_MOE_MUL_MM_ID_MIN_ROWS");
+    free(retiled_out);
+    free(retiled_mid);
+
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(rt);
+    ds4_gpu_tensor_free(st);
+    ds4_gpu_tensor_free(xt);
+    free(actual_out);
+    free(actual_mid);
+    free(expected_out);
+    free(expected_mid);
+    free(route);
+    free(selected);
+    free(input);
+    if (model_fixture_allocation != NULL)
+        require_ok(ds4_gpu_set_model_map(model_fixture_allocation,
+                                         model_fixture_size),
+                   "restore Q8_0 model fixture after Q4_0 MoE mul_mm_id");
+    free(allocation);
+}
+
 static void test_moe_iq2_xxs_q2_k(void) {
     enum {
         IN = 256, FF = 640, DOWN = 768, OUT = 33,
@@ -1099,6 +2048,8 @@ static void test_moe_iq2_xxs_q2_k(void) {
     ds4_gpu_tensor *mid_m1 = ds4_gpu_tensor_alloc(TOP_K * FF * sizeof(float));
     ds4_gpu_tensor *out_m1 = ds4_gpu_tensor_alloc(OUT * sizeof(float));
     require_ok(mid_m1 && out_m1, "IQ2_XXS/Q2_K M=1 allocations");
+    require_ok(unsetenv("DS4_QWEN4_MOE_Q2_DOWN_ROWS2") == 0,
+               "enable default IQ2_XXS/Q2_K rows2 M=1 down kernel");
     require_ok(ds4_gpu_qwen4_moe_iq2_xxs_q2_k_model(
         out_m1, mid_m1, xt, st, rt, model, cursor,
         gate_offset, up_offset, down_offset,
@@ -1109,6 +2060,7 @@ static void test_moe_iq2_xxs_q2_k(void) {
                "IQ2_XXS/Q2_K M=1 readback");
     require_array_close("Qwen IQ2_XXS/Q2_K M=1", actual_out, expected_out,
                         OUT, 3e-2f, 3e-3f);
+
     ds4_gpu_tensor_free(out_m1);
     ds4_gpu_tensor_free(mid_m1);
     free(actual_out);
@@ -1125,7 +2077,8 @@ static void test_moe_iq2_xxs_q2_k(void) {
 }
 
 enum {
-    PLE_FIX_TOKENS = 5,
+    /* One final live row plus every supported MTP partial-commit slot. */
+    PLE_FIX_TOKENS = DS4_QWEN4_MTP_MAX_DRAFTS + 1,
     PLE_FIX_STREAMS = 4,
     PLE_FIX_DIM = 128,
     PLE_FIX_CHANNELS = PLE_FIX_STREAMS * PLE_FIX_DIM,
@@ -1268,7 +2221,9 @@ static void test_ple_gate_conv(void) {
     for (size_t i = 0; i < state_count; i++)
         initial_state[i] = 0.001953125f *
             (float)((int)((i * 5u + 2u) % 23u) - 11);
-    const uint8_t mask[PLE_FIX_TOKENS] = {1u, 0u, 1u, 1u, 1u};
+    uint8_t mask[PLE_FIX_TOKENS];
+    memset(mask, 1, sizeof(mask));
+    mask[1] = 0u;
     memcpy(expected_state, initial_state, state_count * sizeof(float));
     ple_reference(expected, expected_norm, expected_state,
                   hidden, key_raw, value_raw, mask, key_weight, query_weight,
@@ -1377,6 +2332,74 @@ static void test_ple_gate_conv(void) {
                "PLE split state readback");
     require_array_close("Qwen PLE split state continuity", actual_state,
                         expected_state, state_count, 2e-5f, 3e-5f);
+
+    const uint32_t capture_slots = PLE_FIX_TOKENS - 1u;
+    float *capture_seq = malloc(
+        (size_t)capture_slots * state_count * sizeof(float));
+    float *prefix_state = malloc(state_count * sizeof(float));
+    ds4_gpu_tensor *capture_state_t = tensor_from(
+        initial_state, state_count * sizeof(float));
+    ds4_gpu_tensor *capture_out_t = ds4_gpu_tensor_alloc(
+        stream_count * sizeof(float));
+    ds4_gpu_tensor *capture_norm_t = ds4_gpu_tensor_alloc(
+        stream_count * sizeof(float));
+    ds4_gpu_tensor *capture_seq_t = ds4_gpu_tensor_alloc(
+        (size_t)capture_slots * state_count * sizeof(float));
+    require_ok(capture_seq && prefix_state && capture_state_t &&
+                   capture_out_t && capture_norm_t && capture_seq_t,
+               "PLE capture allocation");
+    require_ok(ds4_gpu_qwen4_ple_gate_conv_capture_model(
+                   capture_out_t, capture_norm_t, capture_state_t,
+                   capture_seq_t, hidden_t, key_t, value_t, mask_t,
+                   model, model_fixture_size,
+                   PLE_FIX_KEY_NORM_OFFSET, PLE_FIX_QUERY_NORM_OFFSET,
+                   PLE_FIX_CONV_NORM_OFFSET, PLE_FIX_CONV_WEIGHT_OFFSET,
+                   PLE_FIX_TOKENS, PLE_FIX_STREAMS, PLE_FIX_DIM,
+                   4u, 3u, capture_slots, 1.0e-6f),
+               "PLE verifier state capture dispatch");
+    require_ok(ds4_gpu_tensor_read(
+                   capture_seq_t, 0, capture_seq,
+                   (size_t)capture_slots * state_count * sizeof(float)),
+               "PLE verifier state capture readback");
+    for (uint32_t accepted = 1u; accepted <= capture_slots; accepted++) {
+        ds4_gpu_tensor *prefix_state_t = tensor_from(
+            initial_state, state_count * sizeof(float));
+        ds4_gpu_tensor *prefix_out_t = ds4_gpu_tensor_alloc(
+            (size_t)accepted * PLE_FIX_CHANNELS * sizeof(float));
+        ds4_gpu_tensor *prefix_norm_t = ds4_gpu_tensor_alloc(
+            (size_t)accepted * PLE_FIX_CHANNELS * sizeof(float));
+        require_ok(prefix_state_t && prefix_out_t && prefix_norm_t &&
+                       ds4_gpu_qwen4_ple_gate_conv_model(
+                           prefix_out_t, prefix_norm_t, prefix_state_t,
+                           hidden_t, key_t, value_t, mask_t,
+                           model, model_fixture_size,
+                           PLE_FIX_KEY_NORM_OFFSET,
+                           PLE_FIX_QUERY_NORM_OFFSET,
+                           PLE_FIX_CONV_NORM_OFFSET,
+                           PLE_FIX_CONV_WEIGHT_OFFSET,
+                           accepted, PLE_FIX_STREAMS, PLE_FIX_DIM,
+                           4u, 3u, 1.0e-6f),
+                   "PLE accepted-prefix replay dispatch");
+        require_ok(ds4_gpu_tensor_read(
+                       prefix_state_t, 0, prefix_state,
+                       state_count * sizeof(float)),
+                   "PLE accepted-prefix state readback");
+        require_ok(memcmp(
+                       prefix_state,
+                       capture_seq + (size_t)(accepted - 1u) * state_count,
+                       state_count * sizeof(float)) == 0,
+                   "PLE captured state byte equality");
+        ds4_gpu_tensor_free(prefix_norm_t);
+        ds4_gpu_tensor_free(prefix_out_t);
+        ds4_gpu_tensor_free(prefix_state_t);
+    }
+    puts("Qwen PLE verifier capture/replay byte equality PASS");
+    ds4_gpu_tensor_free(capture_seq_t);
+    ds4_gpu_tensor_free(capture_norm_t);
+    ds4_gpu_tensor_free(capture_out_t);
+    ds4_gpu_tensor_free(capture_state_t);
+    free(prefix_state);
+    free(capture_seq);
 
     ds4_gpu_tensor_free(mask_b);
     ds4_gpu_tensor_free(value_b);
@@ -1545,7 +2568,8 @@ static void test_ple_long_tiled_schedule(void) {
 }
 
 enum {
-    GDN_FIX_TOKENS = 5,
+    /* One final live row plus every supported MTP partial-commit slot. */
+    GDN_FIX_TOKENS = DS4_QWEN4_MTP_MAX_DRAFTS + 1,
     GDN_FIX_DIM = 128,
     GDN_FIX_KH = 1,
     GDN_FIX_VH = 3,
@@ -1714,7 +2738,9 @@ static void test_gdn_prepare_and_output_norm(void) {
     float mixed[GDN_FIX_TOKENS * GDN_FIX_CONV_DIM];
     float raw_decay[GDN_FIX_TOKENS * GDN_FIX_VH];
     float raw_beta[GDN_FIX_TOKENS * GDN_FIX_VH];
-    uint8_t mask[GDN_FIX_TOKENS] = {1u, 0u, 1u, 1u, 1u};
+    uint8_t mask[GDN_FIX_TOKENS];
+    memset(mask, 1, sizeof(mask));
+    mask[1] = 0u;
     float initial_state[GDN_FIX_CONV_DIM * GDN_FIX_CONV_WIDTH];
     for (size_t i = 0; i < sizeof(mixed) / sizeof(mixed[0]); i++)
         mixed[i] = 0.0125f * (float)((int)((i * 7u + 3u) % 31u) - 15);
@@ -1800,6 +2826,78 @@ static void test_gdn_prepare_and_output_norm(void) {
                         sizeof(actual_state) / sizeof(actual_state[0]),
                         2e-6f, 2e-5f);
     ds4_gpu_tensor_free(state_t);
+
+    const uint32_t capture_slots = GDN_FIX_TOKENS - 1u;
+    const size_t conv_state_count =
+        (size_t)GDN_FIX_CONV_DIM * GDN_FIX_CONV_WIDTH;
+    float *capture_seq = malloc(
+        (size_t)capture_slots * conv_state_count * sizeof(float));
+    float prefix_state[GDN_FIX_CONV_DIM * GDN_FIX_CONV_WIDTH];
+    ds4_gpu_tensor *mixed_t = tensor_from(mixed, sizeof(mixed));
+    ds4_gpu_tensor *raw_decay_t = tensor_from(raw_decay, sizeof(raw_decay));
+    ds4_gpu_tensor *raw_beta_t = tensor_from(raw_beta, sizeof(raw_beta));
+    ds4_gpu_tensor *mask_t = tensor_from(mask, sizeof(mask));
+    ds4_gpu_tensor *capture_state_t = tensor_from(
+        initial_state, sizeof(initial_state));
+    ds4_gpu_tensor *capture_seq_t = ds4_gpu_tensor_alloc(
+        (size_t)capture_slots * sizeof(initial_state));
+    ds4_gpu_tensor *capture_q_t = ds4_gpu_tensor_alloc(sizeof(actual_q));
+    ds4_gpu_tensor *capture_k_t = ds4_gpu_tensor_alloc(sizeof(actual_k));
+    ds4_gpu_tensor *capture_v_t = ds4_gpu_tensor_alloc(sizeof(actual_v));
+    ds4_gpu_tensor *capture_decay_t =
+        ds4_gpu_tensor_alloc(sizeof(actual_decay));
+    ds4_gpu_tensor *capture_beta_t =
+        ds4_gpu_tensor_alloc(sizeof(actual_beta));
+    require_ok(capture_seq && mixed_t && raw_decay_t && raw_beta_t && mask_t &&
+                   capture_state_t && capture_seq_t && capture_q_t &&
+                   capture_k_t && capture_v_t && capture_decay_t &&
+                   capture_beta_t,
+               "GDN convolution capture allocation");
+    require_ok(ds4_gpu_qwen4_gdn_prepare_capture_model(
+                   capture_q_t, capture_k_t, capture_v_t,
+                   capture_decay_t, capture_beta_t, capture_state_t,
+                   capture_seq_t, mixed_t, raw_decay_t, raw_beta_t, mask_t,
+                   model, model_size, GDN_FIX_CONV_OFFSET,
+                   GDN_FIX_A_LOG_OFFSET, GDN_FIX_DT_BIAS_OFFSET,
+                   GDN_FIX_TOKENS, GDN_FIX_KH, GDN_FIX_VH, GDN_FIX_DIM,
+                   GDN_FIX_CONV_WIDTH, capture_slots),
+               "GDN convolution verifier capture dispatch");
+    require_ok(ds4_gpu_tensor_read(
+                   capture_seq_t, 0, capture_seq,
+                   (size_t)capture_slots * sizeof(initial_state)),
+               "GDN convolution verifier capture readback");
+    for (uint32_t accepted = 1u; accepted <= capture_slots; accepted++) {
+        ds4_gpu_tensor *prefix_state_t = tensor_from(
+            initial_state, sizeof(initial_state));
+        run_gdn_prepare_fixture(
+            model, model_size, accepted, mixed, raw_decay, raw_beta, mask,
+            prefix_state_t, actual_q, actual_k, actual_v,
+            actual_decay, actual_beta);
+        require_ok(ds4_gpu_tensor_read(
+                       prefix_state_t, 0, prefix_state,
+                       sizeof(prefix_state)),
+                   "GDN convolution accepted-prefix state readback");
+        require_ok(memcmp(
+                       prefix_state,
+                       capture_seq +
+                           (size_t)(accepted - 1u) * conv_state_count,
+                       sizeof(prefix_state)) == 0,
+                   "GDN convolution captured state byte equality");
+        ds4_gpu_tensor_free(prefix_state_t);
+    }
+    puts("Qwen GDN convolution capture/replay byte equality PASS");
+    ds4_gpu_tensor_free(capture_beta_t);
+    ds4_gpu_tensor_free(capture_decay_t);
+    ds4_gpu_tensor_free(capture_v_t);
+    ds4_gpu_tensor_free(capture_k_t);
+    ds4_gpu_tensor_free(capture_q_t);
+    ds4_gpu_tensor_free(capture_seq_t);
+    ds4_gpu_tensor_free(capture_state_t);
+    ds4_gpu_tensor_free(mask_t);
+    ds4_gpu_tensor_free(raw_beta_t);
+    ds4_gpu_tensor_free(raw_decay_t);
+    ds4_gpu_tensor_free(mixed_t);
+    free(capture_seq);
 
     float core[GDN_FIX_TOKENS * GDN_FIX_VALUE_DIM];
     float z[GDN_FIX_TOKENS * GDN_FIX_VALUE_DIM];
@@ -2040,6 +3138,480 @@ static void run_gdn(uint32_t rows, uint32_t tokens,
     ds4_gpu_tensor_free(vt);
     ds4_gpu_tensor_free(kt);
     ds4_gpu_tensor_free(qt);
+}
+
+static void test_gdn_bf16_state_decode(void) {
+    enum { TOKENS = 1, DIM = 128, KH = 1, VH = 3 };
+    const size_t qk_count = (size_t)TOKENS * KH * DIM;
+    const size_t value_count = (size_t)TOKENS * VH * DIM;
+    const size_t gate_count = (size_t)TOKENS * VH;
+    const size_t state_count = (size_t)VH * DIM * DIM;
+    float *q = malloc(qk_count * sizeof(float));
+    float *k = malloc(qk_count * sizeof(float));
+    float *v = malloc(value_count * sizeof(float));
+    float *decay = malloc(gate_count * sizeof(float));
+    float *beta = malloc(gate_count * sizeof(float));
+    uint16_t *initial_bf16 = malloc(state_count * sizeof(uint16_t));
+    float *initial_f32 = malloc(state_count * sizeof(float));
+    float *float_out = malloc(value_count * sizeof(float));
+    float *float_state = malloc(state_count * sizeof(float));
+    float *bf16_out = malloc(value_count * sizeof(float));
+    uint16_t *bf16_state = malloc(state_count * sizeof(uint16_t));
+    require_ok(q && k && v && decay && beta && initial_bf16 && initial_f32 &&
+                   float_out && float_state && bf16_out && bf16_state,
+               "GDN BF16-state fixture allocation");
+    for (size_t i = 0; i < qk_count; i++) {
+        q[i] = 0.001f * (float)((int)(i % 31u) - 15);
+        k[i] = 0.0015f * (float)((int)(i % 29u) - 14);
+    }
+    for (size_t i = 0; i < value_count; i++)
+        v[i] = 0.01f * (float)((int)(i % 17u) - 8);
+    for (size_t i = 0; i < gate_count; i++) {
+        decay[i] = 0.995f - 0.0002f * (float)i;
+        beta[i] = 0.04f + 0.003f * (float)i;
+    }
+    for (size_t i = 0; i < state_count; i++) {
+        initial_bf16[i] = f32_to_bf16(
+            0.0002f * (float)((int)(i % 23u) - 11));
+        initial_f32[i] = bf16_to_f32(initial_bf16[i]);
+    }
+    const uint8_t mask[TOKENS] = {1u};
+    run_gdn(4u, TOKENS, q, k, v, decay, beta, mask, initial_f32,
+            float_out, float_state);
+
+    ds4_gpu_tensor *qt = tensor_from(q, qk_count * sizeof(float));
+    ds4_gpu_tensor *kt = tensor_from(k, qk_count * sizeof(float));
+    ds4_gpu_tensor *vt = tensor_from(v, value_count * sizeof(float));
+    ds4_gpu_tensor *dt = tensor_from(decay, gate_count * sizeof(float));
+    ds4_gpu_tensor *bt = tensor_from(beta, gate_count * sizeof(float));
+    ds4_gpu_tensor *mt = tensor_from(mask, sizeof(mask));
+    ds4_gpu_tensor *st = tensor_from(
+        initial_bf16, state_count * sizeof(uint16_t));
+    ds4_gpu_tensor *ot = ds4_gpu_tensor_alloc(
+        value_count * sizeof(float));
+    require_ok(qt && kt && vt && dt && bt && mt && st && ot,
+               "GDN BF16-state device allocation");
+    require_ok(ds4_gpu_qwen4_gdn_prefill_bf16_state(
+                   ot, st, qt, kt, vt, dt, bt, mt, TOKENS, KH, VH, DIM, 4u),
+               "GDN BF16-state dispatch");
+    require_ok(ds4_gpu_tensor_read(
+                   ot, 0, bf16_out, value_count * sizeof(float)) &&
+                   ds4_gpu_tensor_read(
+                       st, 0, bf16_state,
+                       state_count * sizeof(uint16_t)),
+               "GDN BF16-state readback");
+    require_ok(memcmp(float_out, bf16_out,
+                      value_count * sizeof(float)) == 0,
+               "GDN BF16-state FP32 output exactness");
+    for (size_t i = 0; i < state_count; i++) {
+        require_ok(bf16_state[i] == f32_to_bf16(float_state[i]),
+                   "GDN BF16-state boundary rounding");
+    }
+    puts("Qwen GDN BF16-state decode output/rounding exact PASS");
+
+    ds4_gpu_tensor_free(ot);
+    ds4_gpu_tensor_free(st);
+    ds4_gpu_tensor_free(mt);
+    ds4_gpu_tensor_free(bt);
+    ds4_gpu_tensor_free(dt);
+    ds4_gpu_tensor_free(vt);
+    ds4_gpu_tensor_free(kt);
+    ds4_gpu_tensor_free(qt);
+    free(bf16_state);
+    free(bf16_out);
+    free(float_state);
+    free(float_out);
+    free(initial_f32);
+    free(initial_bf16);
+    free(beta);
+    free(decay);
+    free(v);
+    free(k);
+    free(q);
+}
+
+static void test_gdn_bf16_capture_exact(void) {
+    enum { TOKENS = 5, DIM = 128, KH = 1, VH = 3, SLOTS = TOKENS - 1 };
+    const size_t qk_count = (size_t)TOKENS * KH * DIM;
+    const size_t value_count = (size_t)TOKENS * VH * DIM;
+    const size_t gate_count = (size_t)TOKENS * VH;
+    const size_t state_count = (size_t)VH * DIM * DIM;
+    float *q = malloc(qk_count * sizeof(float));
+    float *k = malloc(qk_count * sizeof(float));
+    float *v = malloc(value_count * sizeof(float));
+    float *decay = malloc(gate_count * sizeof(float));
+    float *beta = malloc(gate_count * sizeof(float));
+    uint16_t *initial = malloc(state_count * sizeof(uint16_t));
+    uint16_t *capture = malloc(
+        (size_t)SLOTS * state_count * sizeof(uint16_t));
+    uint16_t *prefix_state = malloc(state_count * sizeof(uint16_t));
+    require_ok(q && k && v && decay && beta && initial && capture &&
+                   prefix_state,
+               "GDN BF16 capture host allocation");
+    for (size_t i = 0; i < qk_count; i++) {
+        q[i] = 0.0017f * (float)((int)(i % 31u) - 15);
+        k[i] = 0.0013f * (float)((int)(i % 29u) - 14);
+    }
+    for (size_t i = 0; i < value_count; i++)
+        v[i] = 0.009f * (float)((int)(i % 19u) - 9);
+    for (size_t i = 0; i < gate_count; i++) {
+        decay[i] = 0.994f - 0.00015f * (float)(i % VH);
+        beta[i] = 0.035f + 0.004f * (float)(i % 5u);
+    }
+    for (size_t i = 0; i < state_count; i++)
+        initial[i] = f32_to_bf16(
+            0.00022f * (float)((int)(i % 23u) - 11));
+
+    ds4_gpu_tensor *qt = tensor_from(q, qk_count * sizeof(float));
+    ds4_gpu_tensor *kt = tensor_from(k, qk_count * sizeof(float));
+    ds4_gpu_tensor *vt = tensor_from(v, value_count * sizeof(float));
+    ds4_gpu_tensor *dt = tensor_from(decay, gate_count * sizeof(float));
+    ds4_gpu_tensor *bt = tensor_from(beta, gate_count * sizeof(float));
+    ds4_gpu_tensor *st = tensor_from(
+        initial, state_count * sizeof(uint16_t));
+    ds4_gpu_tensor *seq = ds4_gpu_tensor_alloc(
+        (size_t)SLOTS * state_count * sizeof(uint16_t));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(value_count * sizeof(float));
+    require_ok(qt && kt && vt && dt && bt && st && seq && out,
+               "GDN BF16 capture device allocation");
+    require_ok(ds4_gpu_qwen4_gdn_prefill_capture_bf16_state(
+                   out, st, seq, qt, kt, vt, dt, bt, NULL,
+                   TOKENS, KH, VH, DIM, 4u, SLOTS),
+               "GDN BF16 capture dispatch");
+    require_ok(ds4_gpu_tensor_read(
+                   seq, 0, capture,
+                   (size_t)SLOTS * state_count * sizeof(uint16_t)),
+               "GDN BF16 capture readback");
+    for (uint32_t accepted = 1u; accepted <= SLOTS; accepted++) {
+        ds4_gpu_tensor *prefix_st = tensor_from(
+            initial, state_count * sizeof(uint16_t));
+        ds4_gpu_tensor *prefix_out = ds4_gpu_tensor_alloc(
+            (size_t)accepted * VH * DIM * sizeof(float));
+        require_ok(prefix_st && prefix_out,
+                   "GDN BF16 captured-prefix allocation");
+        require_ok(ds4_gpu_qwen4_gdn_prefill_bf16_state(
+                       prefix_out, prefix_st, qt, kt, vt, dt, bt, NULL,
+                       accepted, KH, VH, DIM, 4u),
+                   "GDN BF16 captured-prefix dispatch");
+        require_ok(ds4_gpu_tensor_read(
+                       prefix_st, 0, prefix_state,
+                       state_count * sizeof(uint16_t)),
+                   "GDN BF16 captured-prefix readback");
+        require_ok(memcmp(
+                       prefix_state,
+                       capture + (size_t)(accepted - 1u) * state_count,
+                       state_count * sizeof(uint16_t)) == 0,
+                   "GDN BF16 captured state byte equality");
+        ds4_gpu_tensor_free(prefix_out);
+        ds4_gpu_tensor_free(prefix_st);
+    }
+    puts("Qwen GDN BF16 recurrent capture/replay byte equality PASS");
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(seq);
+    ds4_gpu_tensor_free(st);
+    ds4_gpu_tensor_free(bt);
+    ds4_gpu_tensor_free(dt);
+    ds4_gpu_tensor_free(vt);
+    ds4_gpu_tensor_free(kt);
+    ds4_gpu_tensor_free(qt);
+    free(prefix_state);
+    free(capture);
+    free(initial);
+    free(beta);
+    free(decay);
+    free(v);
+    free(k);
+    free(q);
+}
+
+static void test_gdn_fused_bf16_state_decode(void) {
+    enum { TOKENS = 1, DIM = 128, KH = 1, VH = 3, CONV_WIDTH = 4 };
+    enum {
+        KEY_DIM = KH * DIM,
+        VALUE_DIM = VH * DIM,
+        CONV_DIM = 2 * KEY_DIM + VALUE_DIM,
+    };
+    const size_t state_count = (size_t)VH * DIM * DIM;
+    float mixed[CONV_DIM];
+    float raw_decay[VH];
+    float raw_beta[VH];
+    float raw_gate[VALUE_DIM];
+    float initial_conv[CONV_DIM * CONV_WIDTH];
+    uint16_t *initial_state = malloc(state_count * sizeof(uint16_t));
+    uint16_t *expected_state = malloc(state_count * sizeof(uint16_t));
+    uint16_t *fused_state = malloc(state_count * sizeof(uint16_t));
+    float expected_out[VALUE_DIM];
+    float fused_out[VALUE_DIM];
+    float expected_normalized[VALUE_DIM];
+    float full_fused_out[VALUE_DIM];
+    float expected_conv[CONV_DIM * CONV_WIDTH];
+    float fused_conv[CONV_DIM * CONV_WIDTH];
+    require_ok(initial_state && expected_state && fused_state,
+               "fused GDN BF16-state host allocation");
+    for (size_t i = 0; i < CONV_DIM; i++)
+        mixed[i] = 0.0125f * (float)((int)((i * 11u + 5u) % 37u) - 18);
+    for (size_t i = 0; i < VH; i++) {
+        raw_decay[i] = -0.12f + 0.09f * (float)i;
+        raw_beta[i] = 0.17f - 0.08f * (float)i;
+    }
+    for (size_t i = 0; i < VALUE_DIM; i++)
+        raw_gate[i] = 0.025f * (float)((int)(i % 23u) - 11);
+    for (size_t i = 0; i < CONV_DIM * CONV_WIDTH; i++)
+        initial_conv[i] =
+            0.004f * (float)((int)((i * 3u + 1u) % 19u) - 9);
+    for (size_t i = 0; i < state_count; i++)
+        initial_state[i] = f32_to_bf16(
+            0.0003f * (float)((int)((i * 5u + 2u) % 29u) - 14));
+
+    ds4_gpu_tensor *mixed_t = tensor_from(mixed, sizeof(mixed));
+    ds4_gpu_tensor *raw_decay_t = tensor_from(raw_decay, sizeof(raw_decay));
+    ds4_gpu_tensor *raw_beta_t = tensor_from(raw_beta, sizeof(raw_beta));
+    ds4_gpu_tensor *raw_gate_t = tensor_from(raw_gate, sizeof(raw_gate));
+    ds4_gpu_tensor *expected_conv_t = tensor_from(
+        initial_conv, sizeof(initial_conv));
+    ds4_gpu_tensor *expected_state_t = tensor_from(
+        initial_state, state_count * sizeof(uint16_t));
+    ds4_gpu_tensor *expected_q_t = ds4_gpu_tensor_alloc(
+        KEY_DIM * sizeof(float));
+    ds4_gpu_tensor *expected_k_t = ds4_gpu_tensor_alloc(
+        KEY_DIM * sizeof(float));
+    ds4_gpu_tensor *expected_v_t = ds4_gpu_tensor_alloc(
+        VALUE_DIM * sizeof(float));
+    ds4_gpu_tensor *expected_decay_t = ds4_gpu_tensor_alloc(
+        VH * sizeof(float));
+    ds4_gpu_tensor *expected_beta_t = ds4_gpu_tensor_alloc(
+        VH * sizeof(float));
+    ds4_gpu_tensor *expected_out_t = ds4_gpu_tensor_alloc(
+        VALUE_DIM * sizeof(float));
+    require_ok(mixed_t && raw_decay_t && raw_beta_t && raw_gate_t &&
+                   expected_conv_t &&
+                   expected_state_t && expected_q_t && expected_k_t &&
+                   expected_v_t && expected_decay_t && expected_beta_t &&
+                   expected_out_t,
+               "reference fused GDN BF16-state device allocation");
+    require_ok(ds4_gpu_qwen4_gdn_prepare_model(
+                   expected_q_t, expected_k_t, expected_v_t,
+                   expected_decay_t, expected_beta_t, expected_conv_t,
+                   mixed_t, raw_decay_t, raw_beta_t, NULL,
+                   model_fixture_allocation, model_fixture_size,
+                   GDN_FIX_CONV_OFFSET, GDN_FIX_A_LOG_OFFSET,
+                   GDN_FIX_DT_BIAS_OFFSET, TOKENS, KH, VH, DIM, CONV_WIDTH),
+               "reference fused GDN preparation dispatch");
+    require_ok(ds4_gpu_qwen4_gdn_prefill_bf16_state(
+                   expected_out_t, expected_state_t,
+                   expected_q_t, expected_k_t, expected_v_t,
+                   expected_decay_t, expected_beta_t, NULL,
+                   TOKENS, KH, VH, DIM, 4u),
+               "reference fused GDN recurrence dispatch");
+    require_ok(ds4_gpu_tensor_read(
+                   expected_out_t, 0, expected_out, sizeof(expected_out)) &&
+                   ds4_gpu_tensor_read(
+                       expected_state_t, 0, expected_state,
+                       state_count * sizeof(uint16_t)) &&
+                   ds4_gpu_tensor_read(
+                       expected_conv_t, 0, expected_conv,
+                       sizeof(expected_conv)),
+               "reference fused GDN readback");
+
+    ds4_gpu_tensor *fused_conv_t = tensor_from(
+        initial_conv, sizeof(initial_conv));
+    ds4_gpu_tensor *fused_state_t = tensor_from(
+        initial_state, state_count * sizeof(uint16_t));
+    ds4_gpu_tensor *fused_q_t = ds4_gpu_tensor_alloc(KEY_DIM * sizeof(float));
+    ds4_gpu_tensor *fused_k_t = ds4_gpu_tensor_alloc(KEY_DIM * sizeof(float));
+    ds4_gpu_tensor *fused_v_t = ds4_gpu_tensor_alloc(VALUE_DIM * sizeof(float));
+    ds4_gpu_tensor *fused_out_t = ds4_gpu_tensor_alloc(
+        VALUE_DIM * sizeof(float));
+    require_ok(fused_conv_t && fused_state_t && fused_q_t && fused_k_t &&
+                   fused_v_t && fused_out_t,
+               "fused GDN BF16-state device allocation");
+    require_ok(ds4_gpu_qwen4_gdn_decode_bf16_state_model(
+                   fused_out_t, fused_state_t,
+                   fused_q_t, fused_k_t, fused_v_t, fused_conv_t,
+                   mixed_t, raw_decay_t, raw_beta_t,
+                   model_fixture_allocation, model_fixture_size,
+                   GDN_FIX_CONV_OFFSET, GDN_FIX_A_LOG_OFFSET,
+                   GDN_FIX_DT_BIAS_OFFSET, KH, VH, DIM, CONV_WIDTH),
+               "fused GDN BF16-state dispatch");
+    require_ok(ds4_gpu_tensor_read(
+                   fused_out_t, 0, fused_out, sizeof(fused_out)) &&
+                   ds4_gpu_tensor_read(
+                       fused_state_t, 0, fused_state,
+                       state_count * sizeof(uint16_t)) &&
+                   ds4_gpu_tensor_read(
+                       fused_conv_t, 0, fused_conv, sizeof(fused_conv)),
+               "fused GDN BF16-state readback");
+    require_array_close("Qwen fused GDN BF16-state output", fused_out,
+                        expected_out, VALUE_DIM, 2e-6f, 2e-5f);
+    require_ok(memcmp(fused_state, expected_state,
+                      state_count * sizeof(uint16_t)) == 0,
+               "fused GDN BF16-state boundary equality");
+    require_ok(memcmp(fused_conv, expected_conv, sizeof(fused_conv)) == 0,
+               "fused GDN convolution state equality");
+    puts("Qwen fused GDN BF16-state decode parity PASS");
+
+    ds4_gpu_tensor *expected_normalized_t = ds4_gpu_tensor_alloc(
+        VALUE_DIM * sizeof(float));
+    require_ok(expected_normalized_t &&
+                   ds4_gpu_qwen4_gdn_output_norm_model(
+                       expected_normalized_t, expected_out_t, raw_gate_t,
+                       model_fixture_allocation, model_fixture_size,
+                       GDN_FIX_NORM_OFFSET, TOKENS, VH, DIM, 1.0e-6f),
+               "reference full-fusion GDN output norm");
+    require_ok(ds4_gpu_tensor_read(
+                   expected_normalized_t, 0, expected_normalized,
+                   sizeof(expected_normalized)),
+               "reference full-fusion GDN output readback");
+
+    ds4_gpu_tensor *full_conv_t = tensor_from(
+        initial_conv, sizeof(initial_conv));
+    ds4_gpu_tensor *full_state_t = tensor_from(
+        initial_state, state_count * sizeof(uint16_t));
+    ds4_gpu_tensor *full_q_t = ds4_gpu_tensor_alloc(KEY_DIM * sizeof(float));
+    ds4_gpu_tensor *full_k_t = ds4_gpu_tensor_alloc(KEY_DIM * sizeof(float));
+    ds4_gpu_tensor *full_v_t = ds4_gpu_tensor_alloc(VALUE_DIM * sizeof(float));
+    ds4_gpu_tensor *full_out_t = ds4_gpu_tensor_alloc(
+        VALUE_DIM * sizeof(float));
+    require_ok(full_conv_t && full_state_t && full_q_t && full_k_t &&
+                   full_v_t && full_out_t,
+               "fully fused GDN BF16-state device allocation");
+    require_ok(ds4_gpu_qwen4_gdn_decode_output_bf16_state_model(
+                   full_out_t, full_state_t,
+                   full_q_t, full_k_t, full_v_t, full_conv_t,
+                   mixed_t, raw_decay_t, raw_beta_t, raw_gate_t,
+                   model_fixture_allocation, model_fixture_size,
+                   GDN_FIX_CONV_OFFSET, GDN_FIX_A_LOG_OFFSET,
+                   GDN_FIX_DT_BIAS_OFFSET, GDN_FIX_NORM_OFFSET,
+                   KH, VH, DIM, CONV_WIDTH),
+               "fully fused GDN BF16-state dispatch");
+    require_ok(ds4_gpu_tensor_read(
+                   full_out_t, 0, full_fused_out, sizeof(full_fused_out)) &&
+                   ds4_gpu_tensor_read(
+                       full_state_t, 0, fused_state,
+                       state_count * sizeof(uint16_t)) &&
+                   ds4_gpu_tensor_read(
+                       full_conv_t, 0, fused_conv, sizeof(fused_conv)),
+               "fully fused GDN BF16-state readback");
+    require_array_close("Qwen fully fused GDN output", full_fused_out,
+                        expected_normalized, VALUE_DIM, 2e-6f, 2e-5f);
+    require_ok(memcmp(fused_state, expected_state,
+                      state_count * sizeof(uint16_t)) == 0,
+               "fully fused GDN BF16-state boundary equality");
+    require_ok(memcmp(fused_conv, expected_conv, sizeof(fused_conv)) == 0,
+               "fully fused GDN convolution state equality");
+    puts("Qwen fully fused GDN BF16-state decode parity PASS");
+
+    ds4_gpu_tensor_free(full_out_t);
+    ds4_gpu_tensor_free(full_v_t);
+    ds4_gpu_tensor_free(full_k_t);
+    ds4_gpu_tensor_free(full_q_t);
+    ds4_gpu_tensor_free(full_state_t);
+    ds4_gpu_tensor_free(full_conv_t);
+    ds4_gpu_tensor_free(expected_normalized_t);
+
+    ds4_gpu_tensor_free(fused_out_t);
+    ds4_gpu_tensor_free(fused_v_t);
+    ds4_gpu_tensor_free(fused_k_t);
+    ds4_gpu_tensor_free(fused_q_t);
+    ds4_gpu_tensor_free(fused_state_t);
+    ds4_gpu_tensor_free(fused_conv_t);
+    ds4_gpu_tensor_free(expected_out_t);
+    ds4_gpu_tensor_free(expected_beta_t);
+    ds4_gpu_tensor_free(expected_decay_t);
+    ds4_gpu_tensor_free(expected_v_t);
+    ds4_gpu_tensor_free(expected_k_t);
+    ds4_gpu_tensor_free(expected_q_t);
+    ds4_gpu_tensor_free(expected_state_t);
+    ds4_gpu_tensor_free(expected_conv_t);
+    ds4_gpu_tensor_free(raw_beta_t);
+    ds4_gpu_tensor_free(raw_decay_t);
+    ds4_gpu_tensor_free(mixed_t);
+    ds4_gpu_tensor_free(raw_gate_t);
+    free(fused_state);
+    free(expected_state);
+    free(initial_state);
+}
+
+static void test_gdn_capture_exact(void) {
+    enum { TOKENS = 5, DIM = 128, KH = 1, VH = 3, SLOTS = TOKENS - 1 };
+    const size_t qk_count = (size_t)TOKENS * KH * DIM;
+    const size_t value_count = (size_t)TOKENS * VH * DIM;
+    const size_t gate_count = (size_t)TOKENS * VH;
+    const size_t state_count = (size_t)VH * DIM * DIM;
+    float *q = malloc(qk_count * sizeof(float));
+    float *k = malloc(qk_count * sizeof(float));
+    float *v = malloc(value_count * sizeof(float));
+    float *decay = malloc(gate_count * sizeof(float));
+    float *beta = malloc(gate_count * sizeof(float));
+    uint8_t mask[TOKENS] = {1u, 0u, 1u, 1u, 1u};
+    float *initial = malloc(state_count * sizeof(float));
+    float *capture = malloc((size_t)SLOTS * state_count * sizeof(float));
+    float *prefix_state = malloc(state_count * sizeof(float));
+    float *prefix_out = malloc(value_count * sizeof(float));
+    require_ok(q && k && v && decay && beta && initial && capture &&
+                   prefix_state && prefix_out,
+               "GDN recurrence capture host allocation");
+    for (size_t i = 0; i < qk_count; i++) {
+        q[i] = 0.002f * (float)((int)(i % 29u) - 14);
+        k[i] = 0.0015f * (float)((int)(i % 31u) - 15);
+    }
+    for (size_t i = 0; i < value_count; i++)
+        v[i] = 0.01f * (float)((int)(i % 19u) - 9);
+    for (size_t i = 0; i < gate_count; i++) {
+        decay[i] = 0.996f - 0.0002f * (float)(i % VH);
+        beta[i] = 0.04f + 0.005f * (float)(i % 5u);
+    }
+    for (size_t i = 0; i < state_count; i++)
+        initial[i] = 0.00025f * (float)((int)(i % 17u) - 8);
+
+    ds4_gpu_tensor *qt = tensor_from(q, qk_count * sizeof(float));
+    ds4_gpu_tensor *kt = tensor_from(k, qk_count * sizeof(float));
+    ds4_gpu_tensor *vt = tensor_from(v, value_count * sizeof(float));
+    ds4_gpu_tensor *dt = tensor_from(decay, gate_count * sizeof(float));
+    ds4_gpu_tensor *bt = tensor_from(beta, gate_count * sizeof(float));
+    ds4_gpu_tensor *mt = tensor_from(mask, sizeof(mask));
+    ds4_gpu_tensor *st = tensor_from(initial, state_count * sizeof(float));
+    ds4_gpu_tensor *seq = ds4_gpu_tensor_alloc(
+        (size_t)SLOTS * state_count * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(value_count * sizeof(float));
+    require_ok(qt && kt && vt && dt && bt && mt && st && seq && out,
+               "GDN recurrence capture device allocation");
+    require_ok(ds4_gpu_qwen4_gdn_prefill_capture(
+                   out, st, seq, qt, kt, vt, dt, bt, mt,
+                   TOKENS, KH, VH, DIM, 4u, SLOTS),
+               "GDN recurrence verifier capture dispatch");
+    require_ok(ds4_gpu_tensor_read(
+                   seq, 0, capture,
+                   (size_t)SLOTS * state_count * sizeof(float)),
+               "GDN recurrence verifier capture readback");
+    for (uint32_t accepted = 1u; accepted <= SLOTS; accepted++) {
+        run_gdn(4u, accepted, q, k, v, decay, beta, mask, initial,
+                prefix_out, prefix_state);
+        require_ok(memcmp(
+                       prefix_state,
+                       capture + (size_t)(accepted - 1u) * state_count,
+                       state_count * sizeof(float)) == 0,
+                   "GDN recurrent captured state byte equality");
+    }
+    puts("Qwen GDN recurrent capture/replay byte equality PASS");
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(seq);
+    ds4_gpu_tensor_free(st);
+    ds4_gpu_tensor_free(mt);
+    ds4_gpu_tensor_free(bt);
+    ds4_gpu_tensor_free(dt);
+    ds4_gpu_tensor_free(vt);
+    ds4_gpu_tensor_free(kt);
+    ds4_gpu_tensor_free(qt);
+    free(prefix_out);
+    free(prefix_state);
+    free(capture);
+    free(initial);
+    free(beta);
+    free(decay);
+    free(v);
+    free(k);
+    free(q);
 }
 
 static void test_gdn_length(uint32_t tokens) {
@@ -2676,6 +4248,280 @@ static void test_qsa_prepare(void) {
     free(index_raw); free(value_raw); free(key_raw); free(q_raw);
 }
 
+enum {
+    QSA_BOUNDARY_CACHE_CAP = 12,
+    QSA_BOUNDARY_HEAD_DIM = 256,
+    QSA_BOUNDARY_INDEX_DIM = 128,
+    QSA_BOUNDARY_RATIO = 4,
+    QSA_BOUNDARY_ROPE_DIM = 64,
+    QSA_BOUNDARY_Q_NORM_OFFSET = 81000,
+    QSA_BOUNDARY_K_NORM_OFFSET = 81600,
+    QSA_BOUNDARY_IQ_NORM_OFFSET = 82200,
+    QSA_BOUNDARY_IK_NORM_OFFSET = 82600,
+};
+
+typedef struct {
+    ds4_gpu_tensor *key;
+    ds4_gpu_tensor *value;
+    ds4_gpu_tensor *raw_index;
+    ds4_gpu_tensor *pooled_index;
+} qsa_boundary_cache;
+
+static void qsa_boundary_dispatch(
+        qsa_boundary_cache *cache,
+        ds4_gpu_tensor *q,
+        ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *index_q,
+        const ds4_gpu_tensor *q_gate_raw,
+        const ds4_gpu_tensor *key_raw,
+        const ds4_gpu_tensor *value_raw,
+        const ds4_gpu_tensor *index_qk_raw,
+        uint32_t cache_pos,
+        uint32_t rows) {
+    require_ok(ds4_gpu_qwen4_qsa_prepare_model(
+                   q, gate, index_q, cache->key, cache->value,
+                   cache->raw_index, cache->pooled_index,
+                   q_gate_raw, key_raw, value_raw, index_qk_raw,
+                   model_fixture_allocation, model_fixture_size,
+                   QSA_BOUNDARY_Q_NORM_OFFSET,
+                   QSA_BOUNDARY_K_NORM_OFFSET,
+                   QSA_BOUNDARY_IQ_NORM_OFFSET,
+                   QSA_BOUNDARY_IK_NORM_OFFSET,
+                   NULL, 0u, cache_pos, rows, QSA_BOUNDARY_CACHE_CAP,
+                   1u, 1u, QSA_BOUNDARY_HEAD_DIM, 1u,
+                   QSA_BOUNDARY_INDEX_DIM, QSA_BOUNDARY_RATIO,
+                   QSA_BOUNDARY_ROPE_DIM, 10000000.0f, 1.0e-6f),
+               "QSA partial-commit boundary dispatch");
+}
+
+static void test_qsa_partial_commit_pool_boundary(void) {
+    enum { VERIFY_ROWS = 4, FOLLOW_ROWS = 1, FUTURE_ROWS = 4 };
+    uint16_t *model = model_fixture_allocation;
+    require_ok(model_fixture_size >
+                   QSA_BOUNDARY_IK_NORM_OFFSET +
+                       QSA_BOUNDARY_INDEX_DIM * sizeof(uint16_t),
+               "QSA boundary model fixture range");
+    for (uint32_t dim = 0; dim < QSA_BOUNDARY_HEAD_DIM; dim++) {
+        model[QSA_BOUNDARY_Q_NORM_OFFSET / sizeof(uint16_t) + dim] =
+            f32_to_bf16(0.75f + 0.001f * (float)(dim % 43u));
+        model[QSA_BOUNDARY_K_NORM_OFFSET / sizeof(uint16_t) + dim] =
+            f32_to_bf16(0.85f + 0.001f * (float)(dim % 37u));
+    }
+    for (uint32_t dim = 0; dim < QSA_BOUNDARY_INDEX_DIM; dim++) {
+        model[QSA_BOUNDARY_IQ_NORM_OFFSET / sizeof(uint16_t) + dim] =
+            f32_to_bf16(0.9f + 0.001f * (float)(dim % 31u));
+        model[QSA_BOUNDARY_IK_NORM_OFFSET / sizeof(uint16_t) + dim] =
+            f32_to_bf16(0.8f + 0.001f * (float)(dim % 29u));
+    }
+
+    const size_t q_stride = 2u * QSA_BOUNDARY_HEAD_DIM;
+    const size_t kv_stride = QSA_BOUNDARY_HEAD_DIM;
+    const size_t index_stride = 2u * QSA_BOUNDARY_INDEX_DIM;
+    float *verify_q = malloc(VERIFY_ROWS * q_stride * sizeof(float));
+    float *verify_k = malloc(VERIFY_ROWS * kv_stride * sizeof(float));
+    float *verify_v = malloc(VERIFY_ROWS * kv_stride * sizeof(float));
+    float *verify_i = malloc(VERIFY_ROWS * index_stride * sizeof(float));
+    float *follow_q = malloc(FOLLOW_ROWS * q_stride * sizeof(float));
+    float *follow_k = malloc(FOLLOW_ROWS * kv_stride * sizeof(float));
+    float *follow_v = malloc(FOLLOW_ROWS * kv_stride * sizeof(float));
+    float *follow_i = malloc(FOLLOW_ROWS * index_stride * sizeof(float));
+    float *future_q = malloc(FUTURE_ROWS * q_stride * sizeof(float));
+    float *future_k = malloc(FUTURE_ROWS * kv_stride * sizeof(float));
+    float *future_v = malloc(FUTURE_ROWS * kv_stride * sizeof(float));
+    float *future_i = malloc(FUTURE_ROWS * index_stride * sizeof(float));
+    require_ok(verify_q && verify_k && verify_v && verify_i && follow_q &&
+                   follow_k && follow_v && follow_i && future_q && future_k &&
+                   future_v && future_i,
+               "QSA boundary host inputs");
+#define FILL_QSA_BOUNDARY(values, count, mul, add, mod, scale) do {            \
+    for (size_t fill_i = 0; fill_i < (count); fill_i++)                       \
+        (values)[fill_i] = (scale) *                                          \
+            (float)((int)((fill_i * (mul) + (add)) % (mod)) -                \
+                    (int)((mod) / 2u));                                       \
+} while (0)
+    FILL_QSA_BOUNDARY(verify_q, VERIFY_ROWS * q_stride,
+                      5u, 7u, 47u, 0.009f);
+    FILL_QSA_BOUNDARY(verify_k, VERIFY_ROWS * kv_stride,
+                      7u, 2u, 41u, 0.011f);
+    FILL_QSA_BOUNDARY(verify_v, VERIFY_ROWS * kv_stride,
+                      11u, 3u, 43u, 0.013f);
+    FILL_QSA_BOUNDARY(verify_i, VERIFY_ROWS * index_stride,
+                      13u, 5u, 53u, 0.008f);
+    FILL_QSA_BOUNDARY(follow_q, FOLLOW_ROWS * q_stride,
+                      17u, 11u, 59u, 0.007f);
+    FILL_QSA_BOUNDARY(follow_k, FOLLOW_ROWS * kv_stride,
+                      19u, 13u, 61u, 0.006f);
+    FILL_QSA_BOUNDARY(follow_v, FOLLOW_ROWS * kv_stride,
+                      23u, 17u, 67u, 0.005f);
+    FILL_QSA_BOUNDARY(follow_i, FOLLOW_ROWS * index_stride,
+                      29u, 19u, 71u, 0.004f);
+    FILL_QSA_BOUNDARY(future_q, FUTURE_ROWS * q_stride,
+                      31u, 23u, 73u, 0.003f);
+    FILL_QSA_BOUNDARY(future_k, FUTURE_ROWS * kv_stride,
+                      37u, 29u, 79u, 0.0035f);
+    FILL_QSA_BOUNDARY(future_v, FUTURE_ROWS * kv_stride,
+                      41u, 31u, 83u, 0.0025f);
+    FILL_QSA_BOUNDARY(future_i, FUTURE_ROWS * index_stride,
+                      43u, 37u, 89u, 0.002f);
+#undef FILL_QSA_BOUNDARY
+
+    /* The first verifier row is the one accepted by both branches. */
+    ds4_gpu_tensor *verify_q_t = tensor_from(
+        verify_q, VERIFY_ROWS * q_stride * sizeof(float));
+    ds4_gpu_tensor *verify_k_t = tensor_from(
+        verify_k, VERIFY_ROWS * kv_stride * sizeof(float));
+    ds4_gpu_tensor *verify_v_t = tensor_from(
+        verify_v, VERIFY_ROWS * kv_stride * sizeof(float));
+    ds4_gpu_tensor *verify_i_t = tensor_from(
+        verify_i, VERIFY_ROWS * index_stride * sizeof(float));
+    ds4_gpu_tensor *follow_q_t = tensor_from(
+        follow_q, FOLLOW_ROWS * q_stride * sizeof(float));
+    ds4_gpu_tensor *follow_k_t = tensor_from(
+        follow_k, FOLLOW_ROWS * kv_stride * sizeof(float));
+    ds4_gpu_tensor *follow_v_t = tensor_from(
+        follow_v, FOLLOW_ROWS * kv_stride * sizeof(float));
+    ds4_gpu_tensor *follow_i_t = tensor_from(
+        follow_i, FOLLOW_ROWS * index_stride * sizeof(float));
+    ds4_gpu_tensor *future_q_t = tensor_from(
+        future_q, FUTURE_ROWS * q_stride * sizeof(float));
+    ds4_gpu_tensor *future_k_t = tensor_from(
+        future_k, FUTURE_ROWS * kv_stride * sizeof(float));
+    ds4_gpu_tensor *future_v_t = tensor_from(
+        future_v, FUTURE_ROWS * kv_stride * sizeof(float));
+    ds4_gpu_tensor *future_i_t = tensor_from(
+        future_i, FUTURE_ROWS * index_stride * sizeof(float));
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(
+        VERIFY_ROWS * QSA_BOUNDARY_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(
+        VERIFY_ROWS * QSA_BOUNDARY_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *index_q = ds4_gpu_tensor_alloc(
+        VERIFY_ROWS * QSA_BOUNDARY_INDEX_DIM * sizeof(float));
+    require_ok(verify_q_t && verify_k_t && verify_v_t && verify_i_t &&
+                   follow_q_t && follow_k_t && follow_v_t && follow_i_t &&
+                   future_q_t && future_k_t && future_v_t && future_i_t &&
+                   q && gate && index_q,
+               "QSA boundary device inputs");
+
+    const size_t kv_count =
+        (size_t)QSA_BOUNDARY_CACHE_CAP * QSA_BOUNDARY_HEAD_DIM;
+    const size_t raw_count =
+        (size_t)QSA_BOUNDARY_CACHE_CAP * QSA_BOUNDARY_INDEX_DIM;
+    const size_t pooled_count =
+        (size_t)(QSA_BOUNDARY_CACHE_CAP / QSA_BOUNDARY_RATIO) *
+        QSA_BOUNDARY_INDEX_DIM;
+    uint16_t *key_initial = malloc(kv_count * sizeof(uint16_t));
+    uint16_t *value_initial = malloc(kv_count * sizeof(uint16_t));
+    uint16_t *raw_initial = malloc(raw_count * sizeof(uint16_t));
+    uint16_t *pooled_initial = malloc(pooled_count * sizeof(uint16_t));
+    uint16_t *actual = malloc((2u * kv_count + raw_count + pooled_count) *
+                              sizeof(uint16_t));
+    uint16_t *reference = malloc(
+        (2u * kv_count + raw_count + pooled_count) * sizeof(uint16_t));
+    require_ok(key_initial && value_initial && raw_initial && pooled_initial &&
+                   actual && reference,
+               "QSA boundary host caches");
+    for (size_t i = 0; i < kv_count; i++) {
+        key_initial[i] = f32_to_bf16(
+            0.001f * (float)((int)(i % 17u) - 8));
+        value_initial[i] = f32_to_bf16(
+            0.0015f * (float)((int)(i % 19u) - 9));
+    }
+    for (size_t i = 0; i < raw_count; i++)
+        raw_initial[i] = f32_to_bf16(
+            0.002f * (float)((int)((i * 3u) % 23u) - 11));
+    for (size_t i = 0; i < pooled_count; i++)
+        pooled_initial[i] = f32_to_bf16(
+            0.003f * (float)((int)((i * 5u) % 29u) - 14));
+
+    qsa_boundary_cache speculative = {
+        tensor_from(key_initial, kv_count * sizeof(uint16_t)),
+        tensor_from(value_initial, kv_count * sizeof(uint16_t)),
+        tensor_from(raw_initial, raw_count * sizeof(uint16_t)),
+        tensor_from(pooled_initial, pooled_count * sizeof(uint16_t)),
+    };
+    qsa_boundary_cache replay = {
+        tensor_from(key_initial, kv_count * sizeof(uint16_t)),
+        tensor_from(value_initial, kv_count * sizeof(uint16_t)),
+        tensor_from(raw_initial, raw_count * sizeof(uint16_t)),
+        tensor_from(pooled_initial, pooled_count * sizeof(uint16_t)),
+    };
+    require_ok(speculative.key && speculative.value && speculative.raw_index &&
+                   speculative.pooled_index && replay.key && replay.value &&
+                   replay.raw_index && replay.pooled_index,
+               "QSA boundary device caches");
+
+    /* At logical position 2, the speculative branch writes positions 2..5,
+     * while the replay branch writes only accepted position 2.  Position 3
+     * then crosses the ratio-4 boundary, and positions 4..7 overwrite the
+     * rejected physical suffix and complete the next pooled row. */
+    qsa_boundary_dispatch(&speculative, q, gate, index_q,
+                          verify_q_t, verify_k_t, verify_v_t, verify_i_t,
+                          2u, VERIFY_ROWS);
+    qsa_boundary_dispatch(&replay, q, gate, index_q,
+                          verify_q_t, verify_k_t, verify_v_t, verify_i_t,
+                          2u, 1u);
+    qsa_boundary_dispatch(&speculative, q, gate, index_q,
+                          follow_q_t, follow_k_t, follow_v_t, follow_i_t,
+                          3u, FOLLOW_ROWS);
+    qsa_boundary_dispatch(&replay, q, gate, index_q,
+                          follow_q_t, follow_k_t, follow_v_t, follow_i_t,
+                          3u, FOLLOW_ROWS);
+    qsa_boundary_dispatch(&speculative, q, gate, index_q,
+                          future_q_t, future_k_t, future_v_t, future_i_t,
+                          4u, FUTURE_ROWS);
+    qsa_boundary_dispatch(&replay, q, gate, index_q,
+                          future_q_t, future_k_t, future_v_t, future_i_t,
+                          4u, FUTURE_ROWS);
+
+    size_t at = 0u;
+#define READ_QSA_BOUNDARY_PAIR(field, count, label) do {                       \
+    require_ok(ds4_gpu_tensor_read(speculative.field, 0u, actual + at,        \
+                                   (count) * sizeof(uint16_t)), label);        \
+    require_ok(ds4_gpu_tensor_read(replay.field, 0u, reference + at,          \
+                                   (count) * sizeof(uint16_t)), label);        \
+    at += (count);                                                            \
+} while (0)
+    READ_QSA_BOUNDARY_PAIR(key, kv_count, "QSA boundary key readback");
+    READ_QSA_BOUNDARY_PAIR(value, kv_count, "QSA boundary value readback");
+    READ_QSA_BOUNDARY_PAIR(raw_index, raw_count,
+                           "QSA boundary raw-index readback");
+    READ_QSA_BOUNDARY_PAIR(pooled_index, pooled_count,
+                           "QSA boundary pooled-index readback");
+#undef READ_QSA_BOUNDARY_PAIR
+    require_ok(!memcmp(actual, reference, at * sizeof(uint16_t)),
+               "QSA rejected suffix is overwritten and pooled rows recompute");
+    puts("Qwen QSA ratio-4 partial-commit boundary PASS");
+
+    ds4_gpu_tensor_free(replay.pooled_index);
+    ds4_gpu_tensor_free(replay.raw_index);
+    ds4_gpu_tensor_free(replay.value);
+    ds4_gpu_tensor_free(replay.key);
+    ds4_gpu_tensor_free(speculative.pooled_index);
+    ds4_gpu_tensor_free(speculative.raw_index);
+    ds4_gpu_tensor_free(speculative.value);
+    ds4_gpu_tensor_free(speculative.key);
+    free(reference); free(actual); free(pooled_initial); free(raw_initial);
+    free(value_initial); free(key_initial);
+    ds4_gpu_tensor_free(index_q);
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(future_i_t);
+    ds4_gpu_tensor_free(future_v_t);
+    ds4_gpu_tensor_free(future_k_t);
+    ds4_gpu_tensor_free(future_q_t);
+    ds4_gpu_tensor_free(follow_i_t);
+    ds4_gpu_tensor_free(follow_v_t);
+    ds4_gpu_tensor_free(follow_k_t);
+    ds4_gpu_tensor_free(follow_q_t);
+    ds4_gpu_tensor_free(verify_i_t);
+    ds4_gpu_tensor_free(verify_v_t);
+    ds4_gpu_tensor_free(verify_k_t);
+    ds4_gpu_tensor_free(verify_q_t);
+    free(future_i); free(future_v); free(future_k); free(future_q);
+    free(follow_i); free(follow_v); free(follow_k); free(follow_q);
+    free(verify_i); free(verify_v); free(verify_k); free(verify_q);
+}
+
 static void test_qsa_sparse_attention(void) {
     enum {
         QUERIES = 3,
@@ -3038,6 +4884,445 @@ static void test_qsa_probability_cache_exact(void) {
     free(q);
 }
 
+/* GQA tile-sharing matrix-core attention: F16 operands with F32 accumulation
+ * follow the batched-kernel parity policy, so this fixture checks the MMA
+ * kernel against the CPU reference at rounding-scale tolerances (rather than
+ * the scalar kernel's 3e-6) and additionally cross-checks against the scalar
+ * kernel at the same scale. */
+static void test_qsa_attention_gqa_mma(void) {
+    enum {
+        QUERIES = 40,
+        CACHE_CAP = 2051,
+        Q_HEADS = 24,
+        KV_HEADS = 2,
+        DIM = 256,
+        TOP_K = 512,
+        RATIO = 4,
+    };
+    const size_t query_count = (size_t)QUERIES * Q_HEADS * DIM;
+    const size_t cache_count = (size_t)CACHE_CAP * KV_HEADS * DIM;
+    const size_t selected_count = (size_t)QUERIES * TOP_K;
+    float *q = malloc(query_count * sizeof(*q));
+    float *gate = malloc(query_count * sizeof(*gate));
+    uint16_t *key = malloc(cache_count * sizeof(*key));
+    uint16_t *value = malloc(cache_count * sizeof(*value));
+    uint32_t *selected = malloc(selected_count * sizeof(*selected));
+    uint32_t *counts = malloc((size_t)QUERIES * sizeof(*counts));
+    uint32_t *visible = malloc((size_t)QUERIES * sizeof(*visible));
+    float *expected = malloc(query_count * sizeof(*expected));
+    float *actual = malloc(query_count * sizeof(*actual));
+    float *scalar = malloc(query_count * sizeof(*scalar));
+    require_ok(q && gate && key && value && selected && counts && visible &&
+                   expected && actual && scalar,
+               "QSA GQA MMA host allocation");
+
+    for (size_t i = 0; i < query_count; i++) {
+        q[i] = 0.0025f *
+            (float)((int)((i * 29u + i / DIM * 7u + 11u) % 97u) - 48);
+        gate[i] = 0.03125f *
+            (float)((int)((i * 13u + i / DIM * 5u + 3u) % 33u) - 16);
+    }
+    for (size_t i = 0; i < cache_count; i++) {
+        key[i] = f32_to_bf16(
+            0.00175f * (float)((int)((i * 31u + 5u) % 113u) - 56));
+        value[i] = f32_to_bf16(
+            0.00225f * (float)((int)((i * 19u + 9u) % 109u) - 54));
+    }
+    for (uint32_t query = 0; query < QUERIES; query++) {
+        for (uint32_t rank = 0; rank < TOP_K; rank++)
+            selected[(size_t)query * TOP_K + rank] =
+                (query * 131u + rank * 37u + 19u) % 512u;
+    }
+    /* Boundary cases first, then deterministic mixed profiles. */
+    visible[0] = 7u;    counts[0] = 1u;
+    visible[1] = 2047u; counts[1] = 511u;
+    visible[2] = 2051u; counts[2] = 512u;
+    visible[3] = 3u;    counts[3] = 0u;   /* tail-only selection */
+    visible[4] = 2u;    counts[4] = 0u;
+    visible[5] = 0u;    counts[5] = 0u;   /* zero selection */
+    for (uint32_t query = 6; query < QUERIES; query++) {
+        visible[query] = 17u + (query * 173u) % 2051u;
+        counts[query] = (query * 61u + 7u) % (TOP_K + 1u);
+    }
+
+    /* CPU reference: identical semantics to the scalar-kernel fixture. */
+    for (uint32_t query = 0; query < QUERIES; query++) {
+        const uint32_t complete = visible[query] / RATIO;
+        const uint32_t blocks =
+            counts[query] < complete ? counts[query] : complete;
+        if (blocks > TOP_K) exit(1);
+        uint32_t tokens[TOP_K * RATIO + RATIO - 1u];
+        uint32_t token_count = 0;
+        for (uint32_t rank = 0; rank < blocks; rank++)
+            for (uint32_t item = 0; item < RATIO; item++) {
+                const uint32_t token =
+                    selected[(size_t)query * TOP_K + rank] * RATIO + item;
+                if (token < visible[query]) tokens[token_count++] = token;
+            }
+        for (uint32_t token = complete * RATIO;
+             token < visible[query];
+             token++) tokens[token_count++] = token;
+
+        for (uint32_t head = 0; head < Q_HEADS; head++) {
+            const uint32_t kv_head = head / (Q_HEADS / KV_HEADS);
+            float *scores = malloc(token_count * sizeof(*scores));
+            require_ok(scores != NULL, "QSA GQA MMA reference scores");
+            float maximum = -INFINITY;
+            for (uint32_t rank = 0; rank < token_count; rank++) {
+                float dot = 0.0f;
+                const size_t qbase = ((size_t)query * Q_HEADS + head) * DIM;
+                const size_t kbase =
+                    ((size_t)tokens[rank] * KV_HEADS + kv_head) * DIM;
+                for (uint32_t dim = 0; dim < DIM; dim++)
+                    dot = fmaf(q[qbase + dim], bf16_to_f32(key[kbase + dim]),
+                               dot);
+                scores[rank] = dot / sqrtf((float)DIM);
+                if (scores[rank] > maximum) maximum = scores[rank];
+            }
+            float sum = 0.0f;
+            for (uint32_t rank = 0; rank < token_count; rank++)
+                sum += expf(scores[rank] - maximum);
+            const size_t out_base = ((size_t)query * Q_HEADS + head) * DIM;
+            for (uint32_t dim = 0; dim < DIM; dim++) {
+                float result = 0.0f;
+                for (uint32_t rank = 0; rank < token_count; rank++) {
+                    const size_t vbase =
+                        ((size_t)tokens[rank] * KV_HEADS + kv_head) * DIM;
+                    result = fmaf(expf(scores[rank] - maximum) / sum,
+                                  bf16_to_f32(value[vbase + dim]), result);
+                }
+                expected[out_base + dim] =
+                    result / (1.0f + expf(-gate[out_base + dim]));
+            }
+            free(scores);
+        }
+    }
+
+    ds4_gpu_tensor *q_t = tensor_from(q, query_count * sizeof(*q));
+    ds4_gpu_tensor *gate_t = tensor_from(gate, query_count * sizeof(*gate));
+    ds4_gpu_tensor *key_t = tensor_from(key, cache_count * sizeof(*key));
+    ds4_gpu_tensor *value_t =
+        tensor_from(value, cache_count * sizeof(*value));
+    ds4_gpu_tensor *selected_t =
+        tensor_from(selected, selected_count * sizeof(*selected));
+    ds4_gpu_tensor *counts_t =
+        tensor_from(counts, (size_t)QUERIES * sizeof(*counts));
+    ds4_gpu_tensor *visible_t =
+        tensor_from(visible, (size_t)QUERIES * sizeof(*visible));
+    ds4_gpu_tensor *actual_t =
+        ds4_gpu_tensor_alloc(query_count * sizeof(*actual));
+    ds4_gpu_tensor *scalar_t =
+        ds4_gpu_tensor_alloc(query_count * sizeof(*scalar));
+    require_ok(actual_t && scalar_t, "QSA GQA MMA output allocation");
+
+    const char *prior_raw = getenv("DS4_QWEN4_QSA_GQA_MMA");
+    char *prior = prior_raw ? strdup(prior_raw) : NULL;
+    require_ok(!prior_raw || prior, "QSA GQA MMA environment copy");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_MMA", "1", 1) == 0,
+               "QSA GQA MMA enable");
+    require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                   actual_t, q_t, gate_t, key_t, value_t, selected_t,
+                   counts_t, visible_t, QUERIES, CACHE_CAP, Q_HEADS,
+                   KV_HEADS, DIM, TOP_K, RATIO),
+               "QSA GQA MMA dispatch");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_MMA", "0", 1) == 0,
+               "QSA GQA MMA scalar fallback");
+    require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                   scalar_t, q_t, gate_t, key_t, value_t, selected_t,
+                   counts_t, visible_t, QUERIES, CACHE_CAP, Q_HEADS,
+                   KV_HEADS, DIM, TOP_K, RATIO),
+               "QSA GQA MMA scalar dispatch");
+    require_ok(prior
+                   ? setenv("DS4_QWEN4_QSA_GQA_MMA", prior, 1) == 0
+                   : unsetenv("DS4_QWEN4_QSA_GQA_MMA") == 0,
+               "QSA GQA MMA environment restore");
+    require_ok(ds4_gpu_tensor_read(actual_t, 0, actual,
+                                   query_count * sizeof(*actual)) &&
+                   ds4_gpu_tensor_read(scalar_t, 0, scalar,
+                                       query_count * sizeof(*scalar)),
+               "QSA GQA MMA readback");
+    require_array_close("Qwen QSA GQA MMA attention vs scalar kernel",
+                        actual, scalar, query_count, 2e-3f, 2e-2f);
+    require_array_close("Qwen QSA GQA MMA attention vs CPU reference",
+                        actual, expected, query_count, 2e-3f, 2e-2f);
+
+    /* Production-magnitude pass: the tiny-magnitude inputs above keep the
+     * softmax nearly uniform, which hid a real bug for sessions (a store
+     * clobber produced exactly-uniform weights and still passed these
+     * tolerances).  Scale q/k/v so the gathered score spread reaches the
+     * +-20 class the full model produces; the tolerance admits F16
+     * operand drift at that spread but not a wrong-mixture output. */
+    for (size_t i = 0; i < query_count; i++) {
+        q[i] *= 12.0f;
+        gate[i] *= 12.0f;
+    }
+    for (size_t i = 0; i < cache_count; i++) {
+        const float kf = bf16_to_f32(key[i]);
+        key[i] = f32_to_bf16(kf * 12.0f);
+        const float vf = bf16_to_f32(value[i]);
+        value[i] = f32_to_bf16(vf * 12.0f);
+    }
+    for (uint32_t query = 0; query < QUERIES; query++) {
+        const uint32_t complete = visible[query] / RATIO;
+        const uint32_t blocks =
+            counts[query] < complete ? counts[query] : complete;
+        if (blocks > TOP_K) exit(1);
+        uint32_t tokens[TOP_K * RATIO + RATIO - 1u];
+        uint32_t token_count = 0;
+        for (uint32_t rank = 0; rank < blocks; rank++)
+            for (uint32_t item = 0; item < RATIO; item++) {
+                const uint32_t token =
+                    selected[(size_t)query * TOP_K + rank] * RATIO + item;
+                if (token < visible[query]) tokens[token_count++] = token;
+            }
+        for (uint32_t token = complete * RATIO;
+             token < visible[query];
+             token++) tokens[token_count++] = token;
+
+        for (uint32_t head = 0; head < Q_HEADS; head++) {
+            const uint32_t kv_head = head / (Q_HEADS / KV_HEADS);
+            float *scores = malloc(token_count * sizeof(*scores));
+            require_ok(scores != NULL,
+                       "QSA GQA MMA reference scores (scaled)");
+            float maximum = -INFINITY;
+            for (uint32_t rank = 0; rank < token_count; rank++) {
+                float dot = 0.0f;
+                const size_t qbase = ((size_t)query * Q_HEADS + head) * DIM;
+                const size_t kbase =
+                    ((size_t)tokens[rank] * KV_HEADS + kv_head) * DIM;
+                for (uint32_t dim = 0; dim < DIM; dim++)
+                    dot = fmaf(q[qbase + dim], bf16_to_f32(key[kbase + dim]),
+                               dot);
+                scores[rank] = dot / sqrtf((float)DIM);
+                if (scores[rank] > maximum) maximum = scores[rank];
+            }
+            float sum = 0.0f;
+            for (uint32_t rank = 0; rank < token_count; rank++)
+                sum += expf(scores[rank] - maximum);
+            const size_t out_base = ((size_t)query * Q_HEADS + head) * DIM;
+            for (uint32_t dim = 0; dim < DIM; dim++) {
+                float result = 0.0f;
+                for (uint32_t rank = 0; rank < token_count; rank++) {
+                    const size_t vbase =
+                        ((size_t)tokens[rank] * KV_HEADS + kv_head) * DIM;
+                    result = fmaf(expf(scores[rank] - maximum) / sum,
+                                  bf16_to_f32(value[vbase + dim]), result);
+                }
+                expected[out_base + dim] =
+                    result / (1.0f + expf(-gate[out_base + dim]));
+            }
+            free(scores);
+        }
+    }
+    ds4_gpu_tensor_free(q_t);
+    ds4_gpu_tensor_free(gate_t);
+    ds4_gpu_tensor_free(key_t);
+    ds4_gpu_tensor_free(value_t);
+    q_t = tensor_from(q, query_count * sizeof(*q));
+    gate_t = tensor_from(gate, query_count * sizeof(*gate));
+    key_t = tensor_from(key, cache_count * sizeof(*key));
+    value_t = tensor_from(value, cache_count * sizeof(*value));
+    require_ok(q_t && gate_t && key_t && value_t,
+               "QSA GQA MMA scaled upload");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_MMA", "1", 1) == 0,
+               "QSA GQA MMA enable (scaled)");
+    require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                   actual_t, q_t, gate_t, key_t, value_t, selected_t,
+                   counts_t, visible_t, QUERIES, CACHE_CAP, Q_HEADS,
+                   KV_HEADS, DIM, TOP_K, RATIO),
+               "QSA GQA MMA dispatch (scaled)");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_MMA", "0", 1) == 0,
+               "QSA GQA MMA scalar fallback (scaled)");
+    require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                   scalar_t, q_t, gate_t, key_t, value_t, selected_t,
+                   counts_t, visible_t, QUERIES, CACHE_CAP, Q_HEADS,
+                   KV_HEADS, DIM, TOP_K, RATIO),
+               "QSA GQA MMA scalar dispatch (scaled)");
+    require_ok(prior
+                   ? setenv("DS4_QWEN4_QSA_GQA_MMA", prior, 1) == 0
+                   : unsetenv("DS4_QWEN4_QSA_GQA_MMA") == 0,
+               "QSA GQA MMA environment restore (scaled)");
+    require_ok(ds4_gpu_tensor_read(actual_t, 0, actual,
+                                   query_count * sizeof(*actual)) &&
+                   ds4_gpu_tensor_read(scalar_t, 0, scalar,
+                                       query_count * sizeof(*scalar)),
+               "QSA GQA MMA readback (scaled)");
+    require_array_close("Qwen QSA GQA MMA production magnitudes vs scalar",
+                        actual, scalar, query_count, 5e-2f, 2e-1f);
+    require_array_close(
+        "Qwen QSA GQA MMA production magnitudes vs CPU reference",
+        actual, expected, query_count, 5e-2f, 2e-1f);
+    float *plain_prod = malloc(query_count * sizeof(*plain_prod));
+    require_ok(plain_prod != NULL, "QSA GQA MMA plain capture");
+    memcpy(plain_prod, actual, query_count * sizeof(*plain_prod));
+
+    /* Q-split instantiation on the same production-magnitude data: the
+     * hi/lo F16 Q pair restores F32-class operand precision, so it must
+     * sit far inside the plain variant's drift. */
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_MMA_QSPLIT", "1", 1) == 0,
+               "QSA GQA MMA Q-split enable");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_MMA", "1", 1) == 0,
+               "QSA GQA MMA enable (qsplit)");
+    require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                   actual_t, q_t, gate_t, key_t, value_t, selected_t,
+                   counts_t, visible_t, QUERIES, CACHE_CAP, Q_HEADS,
+                   KV_HEADS, DIM, TOP_K, RATIO),
+               "QSA GQA MMA qsplit dispatch");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_MMA_QSPLIT", "0", 1) == 0,
+               "QSA GQA MMA Q-split disable");
+    require_ok(prior
+                   ? setenv("DS4_QWEN4_QSA_GQA_MMA", prior, 1) == 0
+                   : unsetenv("DS4_QWEN4_QSA_GQA_MMA") == 0,
+               "QSA GQA MMA environment restore (qsplit)");
+    require_ok(ds4_gpu_tensor_read(actual_t, 0, actual,
+                                   query_count * sizeof(*actual)),
+               "QSA GQA MMA readback (qsplit)");
+    /* Per-element maxima at these magnitudes are dominated by near-tie
+     * dominant-token flips that single-ulp score differences decide for
+     * ANY implementation, and the MEAN drift is dominated by the F16
+     * P-tile rounding plus MMA accumulation order — restoring Q to ~22
+     * mantissa bits (Q-split) leaves the mean unchanged (measured:
+     * 2.630e-4 Q-split vs 2.644e-4 plain), so the bound below is a
+     * family check on both variants, not a Q-split improvement claim. */
+    {
+        double split_mean = 0.0;
+        double plain_mean = 0.0;
+        for (size_t i = 0; i < query_count; i++) {
+            split_mean += fabs((double)actual[i] - (double)scalar[i]);
+            plain_mean += fabs((double)plain_prod[i] - (double)scalar[i]);
+        }
+        split_mean /= (double)query_count;
+        plain_mean /= (double)query_count;
+        printf("Qwen QSA GQA MMA Q-split drift mean=%.3e (plain %.3e)\n",
+               split_mean, plain_mean);
+        require_ok(split_mean < 1e-3 && plain_mean < 1e-3,
+                   "QSA GQA MMA mean drift out of family");
+    }
+    require_array_close("Qwen QSA GQA MMA Q-split vs scalar",
+                        actual, scalar, query_count, 5e-2f, 2e-1f);
+    require_array_close("Qwen QSA GQA MMA Q-split vs CPU reference",
+                        actual, expected, query_count, 5e-2f, 2e-1f);
+
+    /* And back at the original tiny magnitudes, where the softmax is
+     * nearly uniform and near-tie flips cannot mask a structural break:
+     * the Q-split path must match the scalar kernel as tightly as the
+     * plain path does (the production-magnitude case above cannot use a
+     * tight per-element bound because single-ulp score differences flip
+     * near-tied dominant tokens). */
+    for (size_t i = 0; i < query_count; i++) {
+        q[i] /= 12.0f;
+        gate[i] /= 12.0f;
+    }
+    for (size_t i = 0; i < cache_count; i++) {
+        const float kf = bf16_to_f32(key[i]);
+        key[i] = f32_to_bf16(kf / 12.0f);
+        const float vf = bf16_to_f32(value[i]);
+        value[i] = f32_to_bf16(vf / 12.0f);
+    }
+    for (uint32_t query = 0; query < QUERIES; query++) {
+        const uint32_t complete = visible[query] / RATIO;
+        const uint32_t blocks =
+            counts[query] < complete ? counts[query] : complete;
+        uint32_t tokens[TOP_K * RATIO + RATIO - 1u];
+        uint32_t token_count = 0;
+        for (uint32_t rank = 0; rank < blocks; rank++)
+            for (uint32_t item = 0; item < RATIO; item++) {
+                const uint32_t token =
+                    selected[(size_t)query * TOP_K + rank] * RATIO + item;
+                if (token < visible[query]) tokens[token_count++] = token;
+            }
+        for (uint32_t token = complete * RATIO;
+             token < visible[query];
+             token++) tokens[token_count++] = token;
+        for (uint32_t head = 0; head < Q_HEADS; head++) {
+            const uint32_t kv_head = head / (Q_HEADS / KV_HEADS);
+            float *scores = malloc(token_count * sizeof(*scores));
+            require_ok(scores != NULL,
+                       "QSA GQA MMA reference scores (unscaled)");
+            float maximum = -INFINITY;
+            for (uint32_t rank = 0; rank < token_count; rank++) {
+                float dot = 0.0f;
+                const size_t qbase = ((size_t)query * Q_HEADS + head) * DIM;
+                const size_t kbase =
+                    ((size_t)tokens[rank] * KV_HEADS + kv_head) * DIM;
+                for (uint32_t dim = 0; dim < DIM; dim++)
+                    dot = fmaf(q[qbase + dim], bf16_to_f32(key[kbase + dim]),
+                               dot);
+                scores[rank] = dot / sqrtf((float)DIM);
+                if (scores[rank] > maximum) maximum = scores[rank];
+            }
+            float sum = 0.0f;
+            for (uint32_t rank = 0; rank < token_count; rank++)
+                sum += expf(scores[rank] - maximum);
+            const size_t out_base = ((size_t)query * Q_HEADS + head) * DIM;
+            for (uint32_t dim = 0; dim < DIM; dim++) {
+                float result = 0.0f;
+                for (uint32_t rank = 0; rank < token_count; rank++) {
+                    const size_t vbase =
+                        ((size_t)tokens[rank] * KV_HEADS + kv_head) * DIM;
+                    result = fmaf(expf(scores[rank] - maximum) / sum,
+                                  bf16_to_f32(value[vbase + dim]), result);
+                }
+                expected[out_base + dim] =
+                    result / (1.0f + expf(-gate[out_base + dim]));
+            }
+            free(scores);
+        }
+    }
+    ds4_gpu_tensor_free(q_t);
+    ds4_gpu_tensor_free(gate_t);
+    ds4_gpu_tensor_free(key_t);
+    ds4_gpu_tensor_free(value_t);
+    q_t = tensor_from(q, query_count * sizeof(*q));
+    gate_t = tensor_from(gate, query_count * sizeof(*gate));
+    key_t = tensor_from(key, cache_count * sizeof(*key));
+    value_t = tensor_from(value, cache_count * sizeof(*value));
+    require_ok(q_t && gate_t && key_t && value_t,
+               "QSA GQA MMA unscaled upload");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_MMA_QSPLIT", "1", 1) == 0,
+               "QSA GQA MMA Q-split enable (unscaled)");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_MMA", "1", 1) == 0,
+               "QSA GQA MMA enable (unscaled)");
+    require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                   actual_t, q_t, gate_t, key_t, value_t, selected_t,
+                   counts_t, visible_t, QUERIES, CACHE_CAP, Q_HEADS,
+                   KV_HEADS, DIM, TOP_K, RATIO),
+               "QSA GQA MMA qsplit dispatch (unscaled)");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_MMA_QSPLIT", "0", 1) == 0,
+               "QSA GQA MMA Q-split disable (unscaled)");
+    require_ok(prior
+                   ? setenv("DS4_QWEN4_QSA_GQA_MMA", prior, 1) == 0
+                   : unsetenv("DS4_QWEN4_QSA_GQA_MMA") == 0,
+               "QSA GQA MMA environment restore (unscaled)");
+    require_ok(ds4_gpu_tensor_read(actual_t, 0, actual,
+                                   query_count * sizeof(*actual)),
+               "QSA GQA MMA readback (unscaled)");
+    require_array_close("Qwen QSA GQA MMA Q-split unscaled vs CPU",
+                        actual, expected, query_count, 2e-3f, 2e-2f);
+    free(prior);
+    free(plain_prod);
+
+    ds4_gpu_tensor_free(scalar_t);
+    ds4_gpu_tensor_free(actual_t);
+    ds4_gpu_tensor_free(visible_t);
+    ds4_gpu_tensor_free(counts_t);
+    ds4_gpu_tensor_free(selected_t);
+    ds4_gpu_tensor_free(value_t);
+    ds4_gpu_tensor_free(key_t);
+    ds4_gpu_tensor_free(gate_t);
+    ds4_gpu_tensor_free(q_t);
+    free(scalar);
+    free(actual);
+    free(expected);
+    free(visible);
+    free(counts);
+    free(selected);
+    free(value);
+    free(key);
+    free(gate);
+    free(q);
+}
+
 static void test_qsa_streaming_topk(void) {
     enum {
         QUERIES = 5,
@@ -3173,6 +5458,10 @@ static void test_qsa_streaming_topk(void) {
     }
     puts("Qwen 512-query-microtile streaming QSA ordered top-k PASS");
 
+    /* The batched scorer is the default; the BF16 baselines below capture
+     * the original grid's outputs with the restage disabled. */
+    require_ok(setenv("DS4_QWEN4_QSA_SCORE_BATCHED", "0", 1) == 0,
+               "streaming BF16 baseline scorer env");
     require_ok(ds4_gpu_qwen4_qsa_stream_topk_bf16(
                    score_t, index_t, count_t, tile_t, qt, kt_bf16, vt,
                    QUERIES, BLOCKS, HEADS, DIM, TOP_K, BLOCK_TILE),
@@ -3208,6 +5497,51 @@ static void test_qsa_streaming_topk(void) {
                           (size_t)QUERIES * TOP_K * sizeof(uint32_t)) == 0 &&
                    memcmp(padded_counts, counts, sizeof(counts)) == 0,
                "streaming BF16 QSA masked-capacity invariance");
+
+    /* The batched long-context scorer restage must keep every ordered
+     * score, index, and count byte-identical to the original grid; the
+     * BF16 scalar outputs captured above are the baseline, and the env is
+     * honored per dispatch call.  The truncated-capacity rerun exercises
+     * the batched grid's partial 32-block tail guards. */
+    require_ok(setenv("DS4_QWEN4_QSA_SCORE_BATCHED", "1", 1) == 0,
+               "streaming BF16 batched env");
+    require_ok(ds4_gpu_qwen4_qsa_stream_topk_bf16(
+                   score_t, index_t, count_t, tile_t, qt, kt_bf16, vt,
+                   QUERIES, BLOCKS, HEADS, DIM, TOP_K, BLOCK_TILE),
+               "streaming BF16 batched dispatch");
+    require_ok(ds4_gpu_tensor_read(score_t, 0, scores,
+                                   (size_t)QUERIES * TOP_K * sizeof(float)) &&
+                   ds4_gpu_tensor_read(
+                       index_t, 0, indices,
+                       (size_t)QUERIES * TOP_K * sizeof(uint32_t)) &&
+                   ds4_gpu_tensor_read(count_t, 0, counts, sizeof(counts)),
+               "streaming BF16 batched readback");
+    require_ok(memcmp(padded_scores, scores,
+                      (size_t)QUERIES * TOP_K * sizeof(float)) == 0 &&
+                   memcmp(padded_indices, indices,
+                          (size_t)QUERIES * TOP_K * sizeof(uint32_t)) == 0 &&
+                   memcmp(padded_counts, counts, sizeof(counts)) == 0,
+               "streaming BF16 batched scorer byte identity");
+    require_ok(ds4_gpu_qwen4_qsa_stream_topk_bf16(
+                   score_t, index_t, count_t, tile_t, qt, kt_bf16, vt,
+                   QUERIES, VISIBLE_BLOCKS, HEADS, DIM, TOP_K, BLOCK_TILE),
+               "streaming BF16 batched truncated dispatch");
+    require_ok(ds4_gpu_tensor_read(score_t, 0, scores,
+                                   (size_t)QUERIES * TOP_K * sizeof(float)) &&
+                   ds4_gpu_tensor_read(
+                       index_t, 0, indices,
+                       (size_t)QUERIES * TOP_K * sizeof(uint32_t)) &&
+                   ds4_gpu_tensor_read(count_t, 0, counts, sizeof(counts)),
+               "streaming BF16 batched truncated readback");
+    require_ok(memcmp(padded_scores, scores,
+                      (size_t)QUERIES * TOP_K * sizeof(float)) == 0 &&
+                   memcmp(padded_indices, indices,
+                          (size_t)QUERIES * TOP_K * sizeof(uint32_t)) == 0 &&
+                   memcmp(padded_counts, counts, sizeof(counts)) == 0,
+               "streaming BF16 batched masked-capacity invariance");
+    require_ok(unsetenv("DS4_QWEN4_QSA_SCORE_BATCHED") == 0,
+               "streaming BF16 batched env clear");
+
     for (uint32_t query = 0; query < QUERIES; query++) {
         for (uint32_t block = 0; block < visible[query]; block++) {
             float score = 0.0f;
@@ -3258,9 +5592,587 @@ static void test_qsa_streaming_topk(void) {
     free(q);
 }
 
+static void test_qsa_streaming_topk_merge_select(void) {
+    /* Production-geometry companion to test_qsa_streaming_topk: keep 512
+     * with 1024-block tiles is the shape the threshold-filtered
+     * merge-select kernel is built for.  Every tile's ordered output must
+     * be byte-identical to the full-sort bitonic merge, including the
+     * first tile (which takes the in-kernel full-sort fallback) and the
+     * partial tail tile, and must match the CPU reference. */
+    enum {
+        QUERIES = 4,
+        BLOCKS = 4096,
+        TRUNCATED_BLOCKS = 2500,
+        HEADS = 4,
+        DIM = 128,
+        TOP_K = 512,
+        BLOCK_TILE = 1024,
+    };
+    float *q = malloc((size_t)QUERIES * HEADS * DIM * sizeof(float));
+    float *pooled = malloc((size_t)BLOCKS * DIM * sizeof(float));
+    uint32_t visible[QUERIES] = {BLOCKS, TRUNCATED_BLOCKS, 1024, 513};
+    uint32_t *indices = malloc((size_t)QUERIES * TOP_K * sizeof(uint32_t));
+    float *scores = malloc((size_t)QUERIES * TOP_K * sizeof(float));
+    uint32_t counts[QUERIES];
+    ranked_score *reference = malloc((size_t)BLOCKS * sizeof(*reference));
+    require_ok(q && pooled && indices && scores && reference,
+               "merge-select QSA host allocation");
+    for (uint32_t i = 0; i < QUERIES * HEADS * DIM; i++)
+        q[i] = 0.0031f * (float)((int)((i * 13u + 7u) % 61u) - 30);
+    for (uint32_t b = 0; b < BLOCKS; b++)
+        for (uint32_t d = 0; d < DIM; d++)
+            pooled[(size_t)b * DIM + d] =
+                0.0019f * (float)((int)((b * 31u + d * 11u) % 103u) - 51) +
+                3e-6f * (float)b *
+                    (float)((int)((d * 7u + 1u) % 13u) - 6);
+    uint16_t *pooled_bf16 = malloc((size_t)BLOCKS * DIM * sizeof(uint16_t));
+    float *pooled_bf16_f32 = malloc((size_t)BLOCKS * DIM * sizeof(float));
+    require_ok(pooled_bf16 && pooled_bf16_f32,
+               "merge-select QSA BF16 host allocation");
+    for (size_t i = 0; i < (size_t)BLOCKS * DIM; i++) {
+        pooled_bf16[i] = f32_to_bf16(pooled[i]);
+        pooled_bf16_f32[i] = bf16_to_f32(pooled_bf16[i]);
+    }
+    ds4_gpu_tensor *qt = tensor_from(
+        q, (size_t)QUERIES * HEADS * DIM * sizeof(float));
+    ds4_gpu_tensor *kt_bf16 = tensor_from(
+        pooled_bf16, (size_t)BLOCKS * DIM * sizeof(uint16_t));
+    ds4_gpu_tensor *vt = tensor_from(visible, sizeof(visible));
+    ds4_gpu_tensor *score_t = ds4_gpu_tensor_alloc(
+        (size_t)QUERIES * TOP_K * sizeof(float));
+    ds4_gpu_tensor *index_t = ds4_gpu_tensor_alloc(
+        (size_t)QUERIES * TOP_K * sizeof(uint32_t));
+    ds4_gpu_tensor *count_t = ds4_gpu_tensor_alloc(sizeof(counts));
+    ds4_gpu_tensor *tile_t = ds4_gpu_tensor_alloc(
+        (size_t)QUERIES * BLOCK_TILE * sizeof(float));
+    require_ok(qt && kt_bf16 && vt && score_t && index_t && count_t &&
+                   tile_t,
+               "merge-select QSA device allocation");
+    float *baseline_scores = malloc(
+        (size_t)QUERIES * TOP_K * sizeof(float));
+    uint32_t *baseline_indices = malloc(
+        (size_t)QUERIES * TOP_K * sizeof(uint32_t));
+    uint32_t baseline_counts[QUERIES];
+    float *full_scores = malloc((size_t)QUERIES * TOP_K * sizeof(float));
+    uint32_t *full_indices = malloc(
+        (size_t)QUERIES * TOP_K * sizeof(uint32_t));
+    uint32_t full_counts[QUERIES];
+    require_ok(baseline_scores && baseline_indices && full_scores &&
+                   full_indices,
+               "merge-select baseline host allocation");
+
+    require_ok(ds4_gpu_qwen4_qsa_stream_topk_bf16(
+                   score_t, index_t, count_t, tile_t, qt, kt_bf16, vt,
+                   QUERIES, BLOCKS, HEADS, DIM, TOP_K, BLOCK_TILE),
+               "merge-select baseline dispatch");
+    require_ok(ds4_gpu_tensor_read(score_t, 0, baseline_scores,
+                                   (size_t)QUERIES * TOP_K * sizeof(float)) &&
+                   ds4_gpu_tensor_read(
+                       index_t, 0, baseline_indices,
+                       (size_t)QUERIES * TOP_K * sizeof(uint32_t)) &&
+                   ds4_gpu_tensor_read(count_t, 0, baseline_counts,
+                                       sizeof(baseline_counts)),
+               "merge-select baseline readback");
+
+    for (int pass = 0; pass < 2; pass++) {
+        const uint32_t blocks = pass == 0 ? BLOCKS : TRUNCATED_BLOCKS;
+        /* Kernel-equivalence baseline at this capacity: the full-sort
+         * bitonic merge with the merge-select env cleared.  Outputs are
+         * NOT shared across capacities (q0 sees 4096 blocks in one run
+         * and 2500 in the other, which selects different top-512s), so
+         * each pass re-runs its own baseline. */
+        require_ok(setenv("DS4_QWEN4_QSA_MERGE_SELECT", "0", 1) == 0,
+                   "merge-select baseline env");
+        require_ok(ds4_gpu_qwen4_qsa_stream_topk_bf16(
+                       score_t, index_t, count_t, tile_t, qt, kt_bf16, vt,
+                       QUERIES, blocks, HEADS, DIM, TOP_K, BLOCK_TILE),
+                   "merge-select baseline dispatch");
+        require_ok(ds4_gpu_tensor_read(
+                       score_t, 0, baseline_scores,
+                       (size_t)QUERIES * TOP_K * sizeof(float)) &&
+                       ds4_gpu_tensor_read(
+                           index_t, 0, baseline_indices,
+                           (size_t)QUERIES * TOP_K * sizeof(uint32_t)) &&
+                       ds4_gpu_tensor_read(count_t, 0, baseline_counts,
+                                           sizeof(baseline_counts)),
+                   "merge-select baseline readback");
+        if (pass == 0) {
+            /* Preserve the full-capacity outputs for the CPU-reference
+             * check below (the truncated pass legitimately differs). */
+            memcpy(full_scores, baseline_scores,
+                   (size_t)QUERIES * TOP_K * sizeof(float));
+            memcpy(full_indices, baseline_indices,
+                   (size_t)QUERIES * TOP_K * sizeof(uint32_t));
+            memcpy(full_counts, baseline_counts, sizeof(baseline_counts));
+        }
+        require_ok(setenv("DS4_QWEN4_QSA_MERGE_SELECT", "1", 1) == 0,
+                   "merge-select env");
+        require_ok(ds4_gpu_qwen4_qsa_stream_topk_bf16(
+                       score_t, index_t, count_t, tile_t, qt, kt_bf16, vt,
+                       QUERIES, blocks, HEADS, DIM, TOP_K, BLOCK_TILE),
+                   "merge-select dispatch");
+        require_ok(ds4_gpu_tensor_read(
+                       score_t, 0, scores,
+                       (size_t)QUERIES * TOP_K * sizeof(float)) &&
+                       ds4_gpu_tensor_read(
+                           index_t, 0, indices,
+                           (size_t)QUERIES * TOP_K * sizeof(uint32_t)) &&
+                       ds4_gpu_tensor_read(count_t, 0, counts,
+                                           sizeof(counts)),
+                   "merge-select readback");
+        char label[64];
+        snprintf(label, sizeof(label),
+                 "merge-select byte identity blocks=%u", blocks);
+        require_ok(memcmp(baseline_scores, scores,
+                          (size_t)QUERIES * TOP_K * sizeof(float)) == 0 &&
+                       memcmp(baseline_indices, indices,
+                              (size_t)QUERIES * TOP_K *
+                                  sizeof(uint32_t)) == 0 &&
+                       memcmp(baseline_counts, counts,
+                              sizeof(baseline_counts)) == 0,
+                   label);
+    }
+    require_ok(unsetenv("DS4_QWEN4_QSA_MERGE_SELECT") == 0,
+               "merge-select env clear");
+
+    for (uint32_t query = 0; query < QUERIES; query++) {
+        for (uint32_t block = 0; block < visible[query]; block++) {
+            float score = 0.0f;
+            for (uint32_t h = 0; h < HEADS; h++) {
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < DIM; d++)
+                    dot = fmaf(q[((size_t)query * HEADS + h) * DIM + d],
+                               pooled_bf16_f32[(size_t)block * DIM + d], dot);
+                score += fmaxf(dot, 0.0f);
+            }
+            reference[block] = (ranked_score){
+                .score = score / sqrtf((float)DIM),
+                .index = block,
+            };
+        }
+        qsort(reference, visible[query], sizeof(*reference), ranked_desc);
+        const uint32_t expected_count = visible[query] < TOP_K
+            ? visible[query] : TOP_K;
+        require_ok(full_counts[query] == expected_count,
+                   "merge-select count");
+        for (uint32_t rank = 0; rank < expected_count; rank++) {
+            const size_t at = (size_t)query * TOP_K + rank;
+            require_ok(full_indices[at] == reference[rank].index,
+                       "merge-select ordered index");
+            const float tolerance =
+                2e-6f + 2e-4f * fabsf(reference[rank].score);
+            require_ok(fabsf(full_scores[at] - reference[rank].score) <=
+                           tolerance,
+                       "merge-select score parity");
+        }
+    }
+    puts("Qwen streaming QSA merge-select byte identity PASS");
+    free(full_indices);
+    free(full_scores);
+    free(baseline_indices);
+    free(baseline_scores);
+    ds4_gpu_tensor_free(tile_t);
+    ds4_gpu_tensor_free(count_t);
+    ds4_gpu_tensor_free(index_t);
+    ds4_gpu_tensor_free(score_t);
+    ds4_gpu_tensor_free(vt);
+    ds4_gpu_tensor_free(kt_bf16);
+    free(pooled_bf16_f32);
+    free(pooled_bf16);
+    free(reference);
+    free(scores);
+    free(indices);
+    free(pooled);
+    free(q);
+}
+
+static void test_qsa_streaming_topk_score_mm(void) {
+    /* Tensor-core index-scorer fixture.  The MMA kernel stages the F32
+     * query vectors and the BF16 pooled keys to F16 tiles (the mul_mm
+     * operand-rounding policy) and accumulates F32 on the matrix units,
+     * so the reference models exactly that rounding and accepts the
+     * accumulation-order slack as tolerance; rank swaps are allowed only
+     * between reference scores within the swap tolerance.  Geometry
+     * covers a partial M-tile (70 queries = 280 head rows), ragged merge
+     * tiles (2548 = 1024+1024+500, 1025 = 1024+1), masked-capacity
+     * invariance across different tail raggedness, and the below-
+     * threshold guard (5 queries must stay on the scalar kernel,
+     * byte-identical). */
+    enum {
+        QUERIES = 70,
+        BLOCKS = 2548,
+        CAP_BLOCKS = 1025,
+        HEADS = 4,
+        DIM = 128,
+        TOP_K = 512,
+        BLOCK_TILE = 1024,
+        SMALL_QUERIES = 5,
+        SMALL_BLOCKS = 37,
+        SMALL_TOP_K = 8,
+    };
+    float *q = malloc((size_t)QUERIES * HEADS * DIM * sizeof(float));
+    float *pooled = malloc((size_t)BLOCKS * DIM * sizeof(float));
+    uint32_t visible[QUERIES];
+    const uint32_t patterns[] = {BLOCKS, 2049, 1500, 1025, 513, 100, 1};
+    for (uint32_t query = 0; query < QUERIES; query++)
+        visible[query] = patterns[query % 7u];
+    uint32_t *indices = malloc((size_t)QUERIES * TOP_K * sizeof(uint32_t));
+    float *scores = malloc((size_t)QUERIES * TOP_K * sizeof(float));
+    uint32_t counts[QUERIES];
+    ranked_score *reference = malloc((size_t)BLOCKS * sizeof(*reference));
+    float *scalar_scores = malloc((size_t)QUERIES * TOP_K * sizeof(float));
+    uint32_t *scalar_indices =
+        malloc((size_t)QUERIES * TOP_K * sizeof(uint32_t));
+    uint32_t scalar_counts[QUERIES];
+    float *cap_scores = malloc((size_t)QUERIES * TOP_K * sizeof(float));
+    uint32_t *cap_indices =
+        malloc((size_t)QUERIES * TOP_K * sizeof(uint32_t));
+    uint32_t cap_counts[QUERIES];
+    require_ok(q && pooled && indices && scores && reference &&
+                   scalar_scores && scalar_indices && cap_scores &&
+                   cap_indices,
+               "score-mm QSA host allocation");
+    for (size_t i = 0; i < (size_t)QUERIES * HEADS * DIM; i++)
+        q[i] = 0.0021f * (float)((int)((i * 17u + 3u) % 59u) - 29);
+    for (uint32_t b = 0; b < BLOCKS; b++)
+        for (uint32_t d = 0; d < DIM; d++)
+            pooled[(size_t)b * DIM + d] =
+                0.0016f * (float)((int)((b * 37u + d * 13u) % 107u) - 53) +
+                3e-6f * (float)b *
+                    (float)((int)((d * 3u + 2u) % 9u) - 4);
+    uint16_t *pooled_bf16 = malloc((size_t)BLOCKS * DIM * sizeof(uint16_t));
+    require_ok(pooled_bf16 != NULL, "score-mm QSA BF16 host allocation");
+    for (size_t i = 0; i < (size_t)BLOCKS * DIM; i++)
+        pooled_bf16[i] = f32_to_bf16(pooled[i]);
+
+    ds4_gpu_tensor *qt = tensor_from(
+        q, (size_t)QUERIES * HEADS * DIM * sizeof(float));
+    ds4_gpu_tensor *kt_bf16 = tensor_from(
+        pooled_bf16, (size_t)BLOCKS * DIM * sizeof(uint16_t));
+    ds4_gpu_tensor *vt = tensor_from(visible, sizeof(visible));
+    ds4_gpu_tensor *score_t = ds4_gpu_tensor_alloc(
+        (size_t)QUERIES * TOP_K * sizeof(float));
+    ds4_gpu_tensor *index_t = ds4_gpu_tensor_alloc(
+        (size_t)QUERIES * TOP_K * sizeof(uint32_t));
+    ds4_gpu_tensor *count_t = ds4_gpu_tensor_alloc(sizeof(counts));
+    ds4_gpu_tensor *tile_t = ds4_gpu_tensor_alloc(
+        (size_t)QUERIES * BLOCK_TILE * sizeof(float));
+    require_ok(qt && kt_bf16 && vt && score_t && index_t && count_t &&
+                   tile_t,
+               "score-mm QSA device allocation");
+
+    const char *prior_raw = getenv("DS4_QWEN4_QSA_SCORE_MM");
+    char *prior = prior_raw ? strdup(prior_raw) : NULL;
+    require_ok(!prior_raw || prior, "score-mm environment copy");
+
+    /* Scalar (batched) baseline at full capacity. */
+    require_ok(setenv("DS4_QWEN4_QSA_SCORE_MM", "0", 1) == 0,
+               "score-mm scalar env");
+    require_ok(ds4_gpu_qwen4_qsa_stream_topk_bf16(
+                   score_t, index_t, count_t, tile_t, qt, kt_bf16, vt,
+                   QUERIES, BLOCKS, HEADS, DIM, TOP_K, BLOCK_TILE),
+               "score-mm scalar dispatch");
+    require_ok(ds4_gpu_tensor_read(score_t, 0, scalar_scores,
+                                   (size_t)QUERIES * TOP_K * sizeof(float)) &&
+                   ds4_gpu_tensor_read(
+                       index_t, 0, scalar_indices,
+                       (size_t)QUERIES * TOP_K * sizeof(uint32_t)) &&
+                   ds4_gpu_tensor_read(count_t, 0, scalar_counts,
+                                       sizeof(scalar_counts)),
+               "score-mm scalar readback");
+
+    /* MMA path at full capacity vs the F16-rounding reference. */
+    require_ok(setenv("DS4_QWEN4_QSA_SCORE_MM", "1", 1) == 0,
+               "score-mm enable");
+    require_ok(ds4_gpu_qwen4_qsa_stream_topk_bf16(
+                   score_t, index_t, count_t, tile_t, qt, kt_bf16, vt,
+                   QUERIES, BLOCKS, HEADS, DIM, TOP_K, BLOCK_TILE),
+               "score-mm dispatch");
+    require_ok(ds4_gpu_tensor_read(score_t, 0, scores,
+                                   (size_t)QUERIES * TOP_K * sizeof(float)) &&
+                   ds4_gpu_tensor_read(
+                       index_t, 0, indices,
+                       (size_t)QUERIES * TOP_K * sizeof(uint32_t)) &&
+                   ds4_gpu_tensor_read(count_t, 0, counts, sizeof(counts)),
+               "score-mm readback");
+
+    const float score_tol_abs = 2e-4f;
+    const float score_tol_rel = 6e-3f;
+    const float swap_tol = 8e-3f;
+    uint64_t exact_ranks = 0;
+    uint64_t compared_ranks = 0;
+    for (uint32_t query = 0; query < QUERIES; query++) {
+        for (uint32_t block = 0; block < visible[query]; block++) {
+            float score = 0.0f;
+            for (uint32_t h = 0; h < HEADS; h++) {
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < DIM; d++)
+                    dot += (float)(_Float16)
+                              q[((size_t)query * HEADS + h) * DIM + d] *
+                          (float)(_Float16)
+                              bf16_to_f32(
+                                  pooled_bf16[(size_t)block * DIM + d]);
+                score += fmaxf(dot, 0.0f);
+            }
+            reference[block] = (ranked_score){
+                .score = score / sqrtf((float)DIM),
+                .index = block,
+            };
+        }
+        qsort(reference, visible[query], sizeof(*reference), ranked_desc);
+        const uint32_t expected_count = visible[query] < TOP_K
+            ? visible[query] : TOP_K;
+        require_ok(counts[query] == expected_count,
+                   "score-mm count");
+        require_ok(scalar_counts[query] == expected_count,
+                   "score-mm scalar count");
+        for (uint32_t rank = 0; rank < expected_count; rank++) {
+            const size_t at = (size_t)query * TOP_K + rank;
+            require_ok(indices[at] < visible[query],
+                       "score-mm index visibility");
+            const float tol = score_tol_abs +
+                score_tol_rel * fabsf(reference[rank].score);
+            char label[96];
+            if (indices[at] == reference[rank].index) {
+                exact_ranks++;
+            } else {
+                /* Rank swap: the returned block must sit within the swap
+                 * tolerance of the reference score at this rank, and the
+                 * returned score must match that block's reference. */
+                float swapped = 0.0f;
+                bool found = false;
+                for (uint32_t b = 0; b < visible[query]; b++)
+                    if (reference[b].index == indices[at]) {
+                        swapped = reference[b].score;
+                        found = true;
+                        break;
+                    }
+                (void)found; /* qsort keeps every visible block */
+                snprintf(label, sizeof(label),
+                         "score-mm swap q=%u rank=%u", query, rank);
+                require_ok(fabsf(swapped - reference[rank].score) <=
+                               swap_tol,
+                           label);
+            }
+            compared_ranks++;
+            snprintf(label, sizeof(label),
+                     "score-mm score q=%u rank=%u got=%g expected=%g",
+                     query, rank, scores[at], reference[rank].score);
+            require_ok(fabsf(scores[at] - reference[rank].score) <= tol,
+                       label);
+        }
+    }
+    /* The F16 rounding is tiny relative to the fixture's score spread:
+     * the overwhelming majority of ranks must be exact, and every MMA
+     * score must stay in the scalar kernel's neighborhood at the same
+     * rank. */
+    require_ok(exact_ranks * 100u >= compared_ranks * 95u,
+               "score-mm rank agreement with F16 reference");
+    /* Observable engagement: the F16 staging must perturb at least some
+     * scores relative to the scalar kernel — a path that silently never
+     * dispatched would be byte-identical and must fail here. */
+    {
+        uint64_t changed = 0;
+        for (size_t i = 0; i < (size_t)QUERIES * TOP_K; i++)
+            if (scores[i] != scalar_scores[i]) changed++;
+        require_ok(changed > (uint64_t)QUERIES * TOP_K / 10u,
+                   "score-mm observable engagement");
+    }
+    for (uint32_t query = 0; query < QUERIES; query++) {
+        const uint32_t expected_count = visible[query] < TOP_K
+            ? visible[query] : TOP_K;
+        for (uint32_t rank = 0; rank < expected_count; rank++) {
+            const size_t at = (size_t)query * TOP_K + rank;
+            char label[96];
+            snprintf(label, sizeof(label),
+                     "score-mm scalar delta q=%u rank=%u", query, rank);
+            require_ok(fabsf(scores[at] - scalar_scores[at]) <= swap_tol,
+                       label);
+        }
+    }
+
+    /* Masked-capacity invariance: with every query's visible count
+     * clamped under CAP_BLOCKS, the MMA outputs must be byte-identical
+     * between blocks=CAP_BLOCKS (1024+1 ragged tail) and blocks=BLOCKS
+     * (1024+1024+500) — different tile tails, same visible content. */
+    for (uint32_t query = 0; query < QUERIES; query++)
+        visible[query] = visible[query] < CAP_BLOCKS
+            ? visible[query] : CAP_BLOCKS;
+    require_ok(ds4_gpu_tensor_write(vt, 0, visible, sizeof(visible)) != 0,
+               "score-mm capacity writeback");
+    require_ok(ds4_gpu_qwen4_qsa_stream_topk_bf16(
+                   score_t, index_t, count_t, tile_t, qt, kt_bf16, vt,
+                   QUERIES, BLOCKS, HEADS, DIM, TOP_K, BLOCK_TILE),
+               "score-mm capacity full dispatch");
+    require_ok(ds4_gpu_tensor_read(score_t, 0, cap_scores,
+                                   (size_t)QUERIES * TOP_K * sizeof(float)) &&
+                   ds4_gpu_tensor_read(
+                       index_t, 0, cap_indices,
+                       (size_t)QUERIES * TOP_K * sizeof(uint32_t)) &&
+                   ds4_gpu_tensor_read(count_t, 0, cap_counts,
+                                       sizeof(cap_counts)),
+               "score-mm capacity full readback");
+    require_ok(ds4_gpu_qwen4_qsa_stream_topk_bf16(
+                   score_t, index_t, count_t, tile_t, qt, kt_bf16, vt,
+                   QUERIES, CAP_BLOCKS, HEADS, DIM, TOP_K, BLOCK_TILE),
+               "score-mm capacity truncated dispatch");
+    require_ok(ds4_gpu_tensor_read(score_t, 0, scores,
+                                   (size_t)QUERIES * TOP_K * sizeof(float)) &&
+                   ds4_gpu_tensor_read(
+                       index_t, 0, indices,
+                       (size_t)QUERIES * TOP_K * sizeof(uint32_t)) &&
+                   ds4_gpu_tensor_read(count_t, 0, counts, sizeof(counts)),
+               "score-mm capacity truncated readback");
+    require_ok(memcmp(cap_scores, scores,
+                      (size_t)QUERIES * TOP_K * sizeof(float)) == 0 &&
+                   memcmp(cap_indices, indices,
+                          (size_t)QUERIES * TOP_K * sizeof(uint32_t)) == 0 &&
+                   memcmp(cap_counts, counts, sizeof(cap_counts)) == 0,
+               "score-mm masked-capacity invariance");
+
+    /* Below the query threshold the MMA env must be ignored: outputs
+     * byte-identical to the scalar kernel on a small ragged geometry
+     * (37 blocks = one 32+5 tile, 5 queries = 20 head rows). */
+    {
+        float *small_q =
+            malloc((size_t)SMALL_QUERIES * HEADS * DIM * sizeof(float));
+        uint32_t small_visible[SMALL_QUERIES] = {
+            SMALL_BLOCKS, 33, 8, 1, 17};
+        float *small_scores =
+            malloc((size_t)SMALL_QUERIES * SMALL_TOP_K * sizeof(float));
+        float *small_scalar =
+            malloc((size_t)SMALL_QUERIES * SMALL_TOP_K * sizeof(float));
+        uint32_t *small_indices = malloc(
+            (size_t)SMALL_QUERIES * SMALL_TOP_K * sizeof(uint32_t));
+        uint32_t *small_scalar_idx = malloc(
+            (size_t)SMALL_QUERIES * SMALL_TOP_K * sizeof(uint32_t));
+        uint32_t small_counts[SMALL_QUERIES];
+        uint32_t small_scalar_counts[SMALL_QUERIES];
+        require_ok(small_q && small_scores && small_scalar &&
+                       small_indices && small_scalar_idx,
+                   "score-mm small host allocation");
+        for (size_t i = 0;
+             i < (size_t)SMALL_QUERIES * HEADS * DIM; i++)
+            small_q[i] = 0.0017f * (float)((int)((i * 23u + 11u) % 61u) - 30);
+        ds4_gpu_tensor *small_qt = tensor_from(
+            small_q, (size_t)SMALL_QUERIES * HEADS * DIM * sizeof(float));
+        ds4_gpu_tensor *small_vt =
+            tensor_from(small_visible, sizeof(small_visible));
+        ds4_gpu_tensor *small_score_t = ds4_gpu_tensor_alloc(
+            (size_t)SMALL_QUERIES * SMALL_TOP_K * sizeof(float));
+        ds4_gpu_tensor *small_index_t = ds4_gpu_tensor_alloc(
+            (size_t)SMALL_QUERIES * SMALL_TOP_K * sizeof(uint32_t));
+        ds4_gpu_tensor *small_count_t =
+            ds4_gpu_tensor_alloc(sizeof(small_counts));
+        ds4_gpu_tensor *small_tile_t = ds4_gpu_tensor_alloc(
+            (size_t)SMALL_QUERIES * BLOCK_TILE * sizeof(float));
+        require_ok(small_qt && small_vt && small_score_t &&
+                       small_index_t && small_count_t && small_tile_t,
+                   "score-mm small device allocation");
+        require_ok(ds4_gpu_qwen4_qsa_stream_topk_bf16(
+                       small_score_t, small_index_t, small_count_t,
+                       small_tile_t, small_qt, kt_bf16, small_vt,
+                       SMALL_QUERIES, SMALL_BLOCKS, HEADS, DIM,
+                       SMALL_TOP_K, BLOCK_TILE),
+                   "score-mm small MMA-env dispatch");
+        require_ok(ds4_gpu_tensor_read(
+                       small_score_t, 0, small_scores,
+                       (size_t)SMALL_QUERIES * SMALL_TOP_K *
+                           sizeof(float)) &&
+                       ds4_gpu_tensor_read(
+                           small_index_t, 0, small_indices,
+                           (size_t)SMALL_QUERIES * SMALL_TOP_K *
+                               sizeof(uint32_t)) &&
+                       ds4_gpu_tensor_read(
+                           small_count_t, 0, small_counts,
+                           sizeof(small_counts)),
+                   "score-mm small readback");
+        require_ok(setenv("DS4_QWEN4_QSA_SCORE_MM", "0", 1) == 0,
+                   "score-mm small scalar env");
+        require_ok(ds4_gpu_qwen4_qsa_stream_topk_bf16(
+                       small_score_t, small_index_t, small_count_t,
+                       small_tile_t, small_qt, kt_bf16, small_vt,
+                       SMALL_QUERIES, SMALL_BLOCKS, HEADS, DIM,
+                       SMALL_TOP_K, BLOCK_TILE),
+                   "score-mm small scalar dispatch");
+        require_ok(ds4_gpu_tensor_read(
+                       small_score_t, 0, small_scalar,
+                       (size_t)SMALL_QUERIES * SMALL_TOP_K *
+                           sizeof(float)) &&
+                       ds4_gpu_tensor_read(
+                           small_index_t, 0, small_scalar_idx,
+                           (size_t)SMALL_QUERIES * SMALL_TOP_K *
+                               sizeof(uint32_t)) &&
+                       ds4_gpu_tensor_read(
+                           small_count_t, 0, small_scalar_counts,
+                           sizeof(small_scalar_counts)),
+                   "score-mm small scalar readback");
+        require_ok(memcmp(small_scores, small_scalar,
+                          (size_t)SMALL_QUERIES * SMALL_TOP_K *
+                              sizeof(float)) == 0 &&
+                       memcmp(small_indices, small_scalar_idx,
+                              (size_t)SMALL_QUERIES * SMALL_TOP_K *
+                                  sizeof(uint32_t)) == 0 &&
+                       memcmp(small_counts, small_scalar_counts,
+                              sizeof(small_counts)) == 0,
+                   "score-mm threshold guard byte identity");
+        ds4_gpu_tensor_free(small_tile_t);
+        ds4_gpu_tensor_free(small_count_t);
+        ds4_gpu_tensor_free(small_index_t);
+        ds4_gpu_tensor_free(small_score_t);
+        ds4_gpu_tensor_free(small_vt);
+        ds4_gpu_tensor_free(small_qt);
+        free(small_scalar_idx);
+        free(small_indices);
+        free(small_scalar);
+        free(small_scores);
+        free(small_q);
+    }
+
+    require_ok(prior
+                   ? setenv("DS4_QWEN4_QSA_SCORE_MM", prior, 1) == 0
+                   : unsetenv("DS4_QWEN4_QSA_SCORE_MM") == 0,
+               "score-mm environment restore");
+    free(prior);
+    puts("Qwen streaming QSA tensor-core scorer PASS");
+    ds4_gpu_tensor_free(tile_t);
+    ds4_gpu_tensor_free(count_t);
+    ds4_gpu_tensor_free(index_t);
+    ds4_gpu_tensor_free(score_t);
+    ds4_gpu_tensor_free(vt);
+    ds4_gpu_tensor_free(kt_bf16);
+    free(pooled_bf16);
+    free(cap_indices);
+    free(cap_scores);
+    free(scalar_indices);
+    free(scalar_scores);
+    free(reference);
+    free(scores);
+    free(indices);
+    free(pooled);
+    free(q);
+}
+
 int main(void) {
     require_ok(ds4_gpu_init(), "Metal initialization");
     test_fast_path_capabilities();
+    if (getenv("DS4_QWEN4_DENSE_MATVEC_BENCH") != NULL) {
+        benchmark_dense_q8_vs_q4();
+        ds4_gpu_cleanup();
+        free(dense_matvec_bench_allocation);
+        return 0;
+    }
+    if (getenv("DS4_QWEN4_MOE_Q4_BENCH") != NULL) {
+        benchmark_moe_q4_k_vs_q4_0();
+        ds4_gpu_cleanup();
+        free(dense_matvec_bench_allocation);
+        return 0;
+    }
+    if (getenv("DS4_QWEN4_GDN_BENCH") != NULL) {
+        benchmark_gdn_decode();
+        ds4_gpu_cleanup();
+        return 0;
+    }
     if (getenv("DS4_QWEN4_QSA_PROB_CACHE_FIXTURE_ONLY") != NULL) {
         test_qsa_probability_cache_exact();
         ds4_gpu_cleanup();
@@ -3286,14 +6198,22 @@ int main(void) {
     test_vision_gelu_tail();
     test_q8_0_matmul();
     test_model_q8_0_paths();
+    test_model_q8_0_mul_mm_rows();
+    test_model_bf16_matmul_rows();
     test_vision_fc2_q8_0_stride();
     test_moe_topk();
     test_moe_q4_k();
+    test_moe_q4_0();
+    test_moe_q4_0_mul_mm_id();
     test_moe_iq2_xxs_q2_k();
     test_ple_gate_conv();
     test_ple_long_tiled_schedule();
     test_gdn_prepare_and_output_norm();
     test_gdn_prepare_long_split();
+    test_gdn_bf16_state_decode();
+    test_gdn_bf16_capture_exact();
+    test_gdn_fused_bf16_state_decode();
+    test_gdn_capture_exact();
     const uint32_t lengths[] = {1u, 5u, 17u, 2048u, 8192u};
     for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); i++)
         test_gdn_length(lengths[i]);
@@ -3307,9 +6227,13 @@ int main(void) {
              i < sizeof(pooled_lengths) / sizeof(pooled_lengths[0]); i++)
             test_qsa(pooled_lengths[i], qsa_inputs[p]);
     test_qsa_prepare();
+    test_qsa_partial_commit_pool_boundary();
     test_qsa_sparse_attention();
     test_qsa_probability_cache_exact();
+    test_qsa_attention_gqa_mma();
     test_qsa_streaming_topk();
+    test_qsa_streaming_topk_merge_select();
+    test_qsa_streaming_topk_score_mm();
     ds4_gpu_cleanup();
     free(moe_rows8_fixture_allocation);
     free(moe_q2_rows8_fixture_allocation);

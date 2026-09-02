@@ -5247,6 +5247,11 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "ignore_eos")) {
+            if (!parse_ignore_eos_value(&p, r)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "thinking")) {
             if (!parse_thinking_control_value(&p, &thinking_enabled)) {
                 free(key);
@@ -5281,6 +5286,11 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     if (*p != '}') goto bad;
     if (!prompt) {
         snprintf(err, errlen, "missing prompt");
+        request_free(r);
+        return false;
+    }
+    if (!request_validate_ignore_eos(r, err, errlen)) {
+        free(prompt);
         request_free(r);
         return false;
     }
@@ -16083,6 +16093,23 @@ static void test_chat_ignore_eos_contract(void) {
         NULL, NULL,
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
         "\"temperature\":0,\"ignore_eos\":\"yes\"}",
+        128, 32768, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    TEST_ASSERT(!strcmp(err, "invalid JSON request"));
+
+    memset(err, 0, sizeof(err));
+    ok = parse_completion_request(
+        NULL,
+        "{\"prompt\":\"hello\",\"ignore_eos\":true}",
+        128, 32768, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    TEST_ASSERT(strstr(err, "temperature") != NULL);
+
+    memset(err, 0, sizeof(err));
+    ok = parse_completion_request(
+        NULL,
+        "{\"prompt\":\"hello\",\"temperature\":0,"
+        "\"ignore_eos\":\"yes\"}",
         128, 32768, &r, err, sizeof(err));
     TEST_ASSERT(!ok);
     TEST_ASSERT(!strcmp(err, "invalid JSON request"));

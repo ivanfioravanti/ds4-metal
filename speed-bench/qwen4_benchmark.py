@@ -644,7 +644,6 @@ def command_lines(args, mtp: bool, log_dir: Path,
     if cold_evidence:
         ds4_environment = dict(os.environ)
         ds4_environment["DS4_QWEN4_PLE_COLD_EVIDENCE"] = "1"
-        ds4_environment["DS4_QWEN4_VERIFY"] = "always"
     return ServerProcess(
         "ds4", ds4_command, args.ds4_port,
         log_dir / f"ds4-{phase}.log", args.startup_timeout,

@@ -547,7 +547,30 @@ networks; each keeps an environment kill switch and deterministic output.
    Q4_0-routed pack drop to 6.0e-8 mid and output (from 3.4e-4 / 2.9e-4)
    and the v3 Q4_K tiles to 1.9e-6 mid / 6.1e-5 output (from 2.0e-3 /
    3.9e-2).  Like the exp branch's arms these are quality routes, not
-   speed routes; the binary16 tiles remain the defaults.
+   speed routes; the binary16 tiles remain the defaults.  M5 HARDWARE
+   CORRECTION (2026-09-03): the quality claim transfers ONLY to the
+   grouped MoE twins — measured on the real M5 Max tensor units at the
+   fixture geometry (K=512), the grouped tiles hold the near-exact class
+   (5.96e-8 Q4_0, 1.91e-6/6.1e-5 Q4_K — same as the fallback), but the
+   DENSE direct-RHS f32stage twin does NOT: the real units compute the
+   device-memory F32 operand at ~binary16-class precision no matter how
+   the weight tile is staged, so F32 staging does not tighten the dense
+   route there (kernel-level rel_rms 4.0e-4 binary16 vs 6.9e-4 f32stage
+   at K=512, growing to 5.2e-4 / 7.7e-4 at K=8192; max_abs 0.024 vs
+   0.035; the tiled simdgroup kernel measures 1.1-3.2e-4 — on real M5
+   the dense f32stage twin is ~1.7x LOOSER than the default binary16
+   route, and `DS4_METAL_MATH_SAFE` is bit-identical, so compiler
+   fast-math is not the source; the mechanism is that the MoE twins hand
+   matmul2d threadgroup-staged cooperative tensors, which the driver
+   lowers to exact fp32 FMA, while the direct-RHS dense path reads the
+   F32 activation tile straight from device memory through the tensor
+   units' reduced-precision operand path).  The dense f32stage fixture is
+   recalibrated to that measured envelope (5e-2 abs / 1.5e-2 rel); the
+   dense quality-route claim now rests on nothing on M5 hardware, and
+   end-to-end the twins do not restore parity: greedy anchors at a 50K
+   prompt diverge at token 3 across binary16/f32stage/kill-switch with
+   top-k logit rms 1.55-1.87 and max delta 6.2-8.3 (same class as the
+   equivalence gate below).
 
    An earlier `nax_direct_rhs` probe on this same dispatch had measured
    exactly neutral and was removed — pre-M5 devices map matmul2d to
@@ -555,14 +578,13 @@ networks; each keeps an environment kill switch and deterministic output.
    enable rather than the shared mul_mm threshold.  Fixtures:
    `test_model_q8_0_mpp_rows` pins the dense route (all three token tiles,
    the split-prefix tail, and the below-threshold/unaligned fallbacks) and
-   `test_model_q8_0_mpp_f32stage_rows` pins the F32-staged twin at tight
-   bounds; `test_moe_q4_0_mul_mm_id` (the standard Q4_0-routed geometry)
+   `test_model_q8_0_mpp_f32stage_rows` pins the F32-staged twin at the
+   measured M5 envelope (see the correction above); `test_moe_q4_0_mul_mm_id` (the standard Q4_0-routed geometry)
    and `test_moe_q4_k_mul_mm_id` (the v3 Q4_K geometry at 600 rows) each
    end with their own f32stage pass; the whole metal fixture suite runs
    with the opt-in so every route stays parity-pinned on every machine
    (`DS4_QWEN4_TEST_DISABLE_TENSOR_ROUTE=1`
-   keeps a run legacy-only).  M5 throughput is not yet measured on
-   hardware.  On the M3 Ultra the forced route passes every Qwen fixture,
+   keeps a run legacy-only).  On the M3 Ultra the forced route passes every Qwen fixture,
    and `DS4_METAL_ENABLE_TENSOR=1 ./ds4_test --metal-tensor-equivalence`
    reproduces the accumulate drift locally on the portable fallback as
    well — short-prompt cases are bit-exact, while the long-prompt case
@@ -572,7 +594,65 @@ networks; each keeps an environment kill switch and deterministic output.
    fixtures pin tolerance classes, not bit parity; until the driver
    accumulate matches the reference kernels, quality-sensitive M5 runs
    should keep the kill switches above (and the drift PR's auto-withhold)
-   in mind, or opt the Qwen routes into their F32-staged twins.
+   in mind; the F32-staged twins are NOT a mitigation for the dense route
+   on real M5 silicon (the MoE twins are).
+
+MEASURED ON REAL M5 HARDWARE (M5 Max, 128 GiB, 2026-09-03, standard
+Q4_0-routed pack + Q4_1 PLE; ds4-bench 8192-row chunks, 32768-token
+interval frontiers on tripled promessi_sposi text, 64-token greedy decode
+each; config A = defaults, B = the two kill switches above, C = both
+f32stage envs): the TensorOps route is a decisive prefill win and
+decode-neutral, and it is what brings this 128 GiB machine into the M3
+Ultra's prefill class — the M5 Max's simdgroup baseline sits far below
+the M3 Ultra's (B measured 611-737 tok/s vs the M3's 1069-1135 warm
+band), so without the tensor units this machine would be strictly
+slower at prefill.
+
+```text
+frontier            32K    64K    96K   128K   160K   192K   224K  262078
+prefill A  tok/s   1236   1060    992    984    957    937    928    891
+prefill B  tok/s    737    680    666    650    639    633    620    611
+prefill C  tok/s    891    788    766    741    735    716    707    688
+A gain vs B        +68%   +56%   +49%   +51%   +50%   +48%   +50%   +46%
+decode  A  tok/s   38.7   38.7   38.6   36.7   37.0   36.6   36.1   35.2
+decode  B  tok/s   38.6   38.8   38.8   36.9   37.6   37.3   36.5   36.4
+```
+
+Acceptance-harness cross-check on the standard corpus (config A):
+cold-PLE first request 1105-1203 tok/s (cold fraction 1.0 verified),
+prefill-10k median 925, prefill-50k 879, prefill-100k 854 tok/s;
+decode-code-500 38.8 tok/s median.  The M3 Ultra's whole-258048-token
+frontier record (1010-1025 tok/s) still leads the M5 Max tensor route
+(891): the M5 wins at short frontiers (1236 at 32K) but its long-context
+prefill decay is steeper — the QSA scan and gathered attention are the
+context-growing stages and both are bandwidth-hungry.  Stage attribution
+at the fresh-chunk geometry (8192 rows, 2048 visible blocks; M3 Ultra
+reference in parentheses): routed MoE Q4_0 29.0 ms/layer on the real
+units vs 62.9 on the simdgroup id kernels (M3: 40.7 tensor / 43.2
+fallback — the real units pay ~29 percent over the M3's and the M5's
+own simdgroup path is far slower), gathered attention 158 (M3 125.6),
+streaming top-k 13.2 (12.5), GDN R4 12.1 (9.9), dense q8 12288x2560
+11.0 (21.7).  F32STAGE wall-clock cost: -23 percent prefill at the top
+frontier (891 -> 688 tok/s; the MoE stage alone 29.0 -> 65.8 ms/layer,
+i.e. the fp32-staged tiles are 2.3x slower than binary16 MPP and even
+lose to the simdgroup kernels) — given the precision correction above,
+config C is neither cheap nor tighter on M5.  MTP: decode-neutral like
+plain decode; on the deterministic counting continuation (engaged, 3.95
+of 4 accepted per cycle) depth-4 MTP delivered 60.1 tok/s (B: 56.9)
+against ~39 plain — while on novel prose the scheduler bypassed every
+cycle (0 accepted, 24-32 ms bypass cycles) exactly as on the M3.  The
+Metal-4 tensor banner ("Metal 4 tensor API enabled for Tensor kernels")
+is a global capability line and prints in B as well; route engagement is
+proven by the ~2x prefill separation and the stage numbers, not by the
+banner.  `DS4_TEST_MODEL=gguf/GLM-5.3-Flash-Q2.gguf ./ds4_test
+--metal-tensor-equivalence` on this machine reproduces the drift issue
+exactly (worst_rms 1.38592, worst_max_abs 7.26952, long-prompt greedy
+flips at step 0, ERR as expected until the driver accumulate fix), and
+the acceptance corpus itself now trips stop-token contracts on this
+pack (decode-prose greedy `<|im_end|>` at step 0 with a 1.13-logit
+margin under BOTH A and B; the mtp-10k prose case stops naturally at
+130/500 tokens, 173/500 plain) — a pack/corpus interaction to keep in
+mind when comparing acceptance documents across machines.
 
 Measured on the reference M3 Ultra with the experimental
 `q4dense-q40routed-exp2` profile (2048/8192-token chunks, 64-token greedy

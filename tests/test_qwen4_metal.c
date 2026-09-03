@@ -4100,6 +4100,85 @@ static void test_gdn_length(uint32_t tokens) {
         free(ref_state);
         free(ref_out);
     }
+
+    /* BF16-state cross-R byte identity at the same length: every state
+     * element's op sequence is independent of how rows map onto threads,
+     * so the swept R1/R2 BF16-state kernels must match R4 byte for byte
+     * (the prefill-width sweep cannot change numerics). */
+    {
+        uint16_t *initial_bf16 =
+            malloc(state_count * sizeof(uint16_t));
+        require_ok(initial_bf16 != NULL,
+                   "GDN BF16-state sweep allocation");
+        for (size_t i = 0; i < state_count; i++)
+            initial_bf16[i] = f32_to_bf16(initial[i]);
+        uint16_t *state_b16 = malloc(state_count * sizeof(uint16_t));
+        float *out_b16 = malloc(value_count * sizeof(float));
+        uint16_t *r_state = malloc(state_count * sizeof(uint16_t));
+        float *r_out = malloc(value_count * sizeof(float));
+        require_ok(state_b16 && out_b16 && r_state && r_out,
+                   "GDN BF16-state sweep buffers");
+        ds4_gpu_tensor *qt = tensor_from(q, qk_count * sizeof(float));
+        ds4_gpu_tensor *kt = tensor_from(k, qk_count * sizeof(float));
+        ds4_gpu_tensor *vt = tensor_from(v, value_count * sizeof(float));
+        ds4_gpu_tensor *dt = tensor_from(decay, gate_count * sizeof(float));
+        ds4_gpu_tensor *bt = tensor_from(beta, gate_count * sizeof(float));
+        ds4_gpu_tensor *mt = tensor_from(mask, tokens);
+        require_ok(qt && kt && vt && dt && bt && mt,
+                   "GDN BF16-state sweep device buffers");
+        for (uint32_t k = 0u; k < 3u; k++) {
+            const uint32_t r = k == 0u ? 4u : k;   /* R4 first: snapshot */
+            ds4_gpu_tensor *st = tensor_from(
+                initial_bf16, state_count * sizeof(uint16_t));
+            ds4_gpu_tensor *ot = ds4_gpu_tensor_alloc(
+                value_count * sizeof(float));
+            require_ok(st && ot, "GDN BF16-state sweep dispatch buffers");
+            require_ok(ds4_gpu_qwen4_gdn_prefill_bf16_state(
+                           ot, st, qt, kt, vt, dt, bt, mt,
+                           tokens, KH, VH, DIM, r),
+                       "GDN BF16-state sweep dispatch");
+            require_ok(ds4_gpu_tensor_read(
+                           ot, 0, r_out, value_count * sizeof(float)) &&
+                           ds4_gpu_tensor_read(
+                               st, 0, r_state,
+                               state_count * sizeof(uint16_t)),
+                       "GDN BF16-state sweep readback");
+            if (r == 4u) {
+                memcpy(out_b16, r_out, value_count * sizeof(float));
+                memcpy(state_b16, r_state, state_count * sizeof(uint16_t));
+            } else {
+                /* R instantiations contract the recurrence differently
+                 * under fast math (the fp32 R-sweep fixtures pin the same
+                 * class), so the FP32 output carries rounding-scale
+                 * differences while the BF16 state quantization absorbs
+                 * them: outputs are tolerance-pinned, states byte-pinned. */
+                snprintf(label, sizeof(label),
+                         "Qwen GDN BF16-state R%u output length=%u",
+                         r, tokens);
+                require_array_close(label, out_b16, r_out, value_count,
+                                    1e-6f, 1e-5f);
+                snprintf(label, sizeof(label),
+                         "Qwen GDN BF16-state R%u state length=%u",
+                         r, tokens);
+                require_ok(memcmp(state_b16, r_state,
+                                  state_count * sizeof(uint16_t)) == 0,
+                           label);
+            }
+            ds4_gpu_tensor_free(ot);
+            ds4_gpu_tensor_free(st);
+        }
+        ds4_gpu_tensor_free(mt);
+        ds4_gpu_tensor_free(bt);
+        ds4_gpu_tensor_free(dt);
+        ds4_gpu_tensor_free(vt);
+        ds4_gpu_tensor_free(kt);
+        ds4_gpu_tensor_free(qt);
+        free(r_out);
+        free(r_state);
+        free(out_b16);
+        free(state_b16);
+        free(initial_bf16);
+    }
     free(state_r4); free(state_r2); free(state_r1);
     free(out_r4); free(out_r2); free(out_r1);
     free(initial); free(mask); free(beta); free(decay); free(v); free(k); free(q);

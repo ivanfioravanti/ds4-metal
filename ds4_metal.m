@@ -48741,7 +48741,7 @@ static int ds4_gpu_qwen4_gdn_prefill_impl(
         value_heads % key_heads != 0 || head_dim != 128u ||
         (rows_per_thread != 1u && rows_per_thread != 2u &&
          rows_per_thread != 4u) || head_dim % rows_per_thread != 0 ||
-        (state_bf16 && rows_per_thread != 4u) ||
+        (state_bf16 && capture_slots != 0u && rows_per_thread != 4u) ||
         capture_slots >= n_tokens || (capture_slots != 0u && !state_seq)) {
         fprintf(stderr, "ds4: Qwen Gated DeltaNet received unsupported geometry\n");
         return 0;
@@ -48774,7 +48774,11 @@ static int ds4_gpu_qwen4_gdn_prefill_impl(
         const char *kernel = state_bf16
             ? (capture_slots != 0u
                    ? "kernel_qwen4_gdn_r4_bf16_capture_f32"
-                   : "kernel_qwen4_gdn_r4_bf16_f32")
+                   : (rows_per_thread == 4u
+                          ? "kernel_qwen4_gdn_r4_bf16_f32"
+                          : (rows_per_thread == 2u
+                                 ? "kernel_qwen4_gdn_r2_bf16_f32"
+                                 : "kernel_qwen4_gdn_r1_bf16_f32")))
             : capture_slots != 0u
             ? (rows_per_thread == 4u
                    ? "kernel_qwen4_gdn_r4_capture_f32"
@@ -48800,11 +48804,21 @@ static int ds4_gpu_qwen4_gdn_prefill_impl(
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         if (!enc) return 0;
-        enc.label = state_bf16 ? @"Qwen Gated DeltaNet R4 BF16 state"
-                                  : rows_per_thread == 4u ? @"Qwen Gated DeltaNet R4"
-                                          : (rows_per_thread == 2u
-                                             ? @"Qwen Gated DeltaNet R2"
-                                             : @"Qwen Gated DeltaNet R1");
+        /* Stage-profile labels carry the R so the swept variants stay
+         * attributable; the bf16 family keeps its R4 label verbatim for
+         * profile continuity with the existing records. */
+        NSString *gdn_label =
+            state_bf16
+            ? (rows_per_thread == 4u
+                   ? @"Qwen Gated DeltaNet R4 BF16 state"
+                   : (rows_per_thread == 2u
+                          ? @"Qwen Gated DeltaNet R2 BF16 state"
+                          : @"Qwen Gated DeltaNet R1 BF16 state"))
+            : (rows_per_thread == 4u
+                   ? @"Qwen Gated DeltaNet R4"
+                   : (rows_per_thread == 2u ? @"Qwen Gated DeltaNet R2"
+                                            : @"Qwen Gated DeltaNet R1"));
+        enc.label = gdn_label;
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:ds4_gpu_tensor_buffer(q)
@@ -48827,7 +48841,15 @@ static int ds4_gpu_qwen4_gdn_prefill_impl(
             [enc setBuffer:ds4_gpu_tensor_buffer(state_seq)
                     offset:ds4_gpu_tensor_offset(state_seq) atIndex:9];
         }
-        uint32_t simdgroups = 2u;
+        /* Threadgroup height for the recurrence: measured on the M3 Ultra,
+         * four simdgroups per threadgroup beat the historical two at
+         * prefill shapes (9.95 -> 9.05 ms/layer at 8192 rows, 2.71 -> 2.49
+         * at 2048) and go neutral-to-worse at verify-sized rows (16-128),
+         * so the wider grid is row-gated to real prefill batches and
+         * DS4_QWEN4_GDN_SIMDGROUPS still overrides both defaults.  The
+         * kernel has no threadgroup memory or barriers — the height change
+         * only regroups threads, so outputs are byte-identical. */
+        uint32_t simdgroups = n_tokens >= 1024u ? 4u : 2u;
         const char *simdgroups_raw = getenv("DS4_QWEN4_GDN_SIMDGROUPS");
         if (simdgroups_raw && simdgroups_raw[0]) {
             char *end = NULL;
@@ -48843,10 +48865,7 @@ static int ds4_gpu_qwen4_gdn_prefill_impl(
              threadsPerThreadgroup:MTLSizeMake(32, simdgroups, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(
-            cb, owned, state_bf16 ? "Qwen Gated DeltaNet R4 BF16 state"
-                       : rows_per_thread == 4u ? "Qwen Gated DeltaNet R4"
-                       : (rows_per_thread == 2u ? "Qwen Gated DeltaNet R2"
-                                                : "Qwen Gated DeltaNet R1"));
+            cb, owned, [gdn_label UTF8String]);
     }
 }
 

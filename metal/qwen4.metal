@@ -2642,6 +2642,8 @@ kernel void NAME(                                                              \
 }
 
 QWEN4_GDN_BF16_KERNEL(kernel_qwen4_gdn_r4_bf16_f32, 4)
+QWEN4_GDN_BF16_KERNEL(kernel_qwen4_gdn_r2_bf16_f32, 2)
+QWEN4_GDN_BF16_KERNEL(kernel_qwen4_gdn_r1_bf16_f32, 1)
 
 #define QWEN4_GDN_BF16_CAPTURE_KERNEL(NAME, R)                                  \
 kernel void NAME(                                                              \

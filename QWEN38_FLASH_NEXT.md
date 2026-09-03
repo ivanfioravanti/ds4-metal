@@ -1409,6 +1409,96 @@ The greedy CLI path now routes Qwen through the session executor in
 DeepSeek/GLM-shaped and crashed on the Qwen weight directory (a
 pre-existing gap that predates this branch's working tree).
 
+### Session twenty-one: the M5 Max decode/MTP attribution (no kernel landed)
+
+The M5 Max's own decode/MTP cost picture was measured for the first time
+(2026-09-03, standard Q4_0-routed pack, `speed-bench/qwen4_m5_mtp_probe.py`
+on top of the archived session-twenty sweep module; counting/factual/prose
+prompt families defined in the probe).  Measurement discipline matters on
+this host: sequential requests within one server decay 5-15 percent
+(first-to-third) and sequential server waves drift by up to ~10 tok/s, so
+every throughput comparison below comes from either fresh-server
+first requests or an interleaved round-robin protocol where every config's
+k-th request sees the same machine state; six co-resident servers cost
+plain decode ~2-3 tok/s and MTP cycles ~7 percent, so absolute and
+interleaved numbers are kept separate.
+
+The MTP cycle split at short context (~1.1K-token prompts), per engaged
+cycle medians: base single-row target pass ~25.6 ms (plain decode 37.5-39.4
+tok/s across the probe bracket), snapshot ~0.5 ms, draft chain ~2.7 ms per
+drafted token (the chain already encodes all depths into one command
+buffer with a single host sync), verify 31.3/39.1/46.3/53.8/56.7/69.5/77.5
+ms at depths 2-8 (~7.7 ms per marginal row), history reconcile 3.3-6.0 ms,
+commit 3.3-6.1 ms.  Versus the M3 Ultra the M5 is at parity on the base
+pass and draft chain, slightly cheaper at shallow verify (31.3 vs 34.5 at
+depth 2) and slightly dearer at deep verify (77.5 vs 73.7 at depth 8):
+the depth optimum therefore moved — on deterministic counting the
+fresh-server first-request throughput rises through depth 8 (66.8 / 70.1 /
+73.1 / 73.4 tok/s at depths 5-8, acceptance 5.0/5.86/7.0/7.73), while
+factual-list prompts saturate at depth 5-6 (~48-50 tok/s fresh, acceptance
+~3.2) and prose never engages (125 bypass cycles per request at
+25.5-26.5 ms — within ~1 ms of plain per cycle).  Margins 90/110/130
+decide identically at depth 6 on every family; the 110 default stands.
+
+Verify-pass GPU attribution (DS4_METAL_GPU_STAGE_PROFILE at depths 4 and
+7, relative view — the per-op flush costs decode ~8-10 percent throughput
+so these tables rank kernels, they do not price the wall): the dense Q8_0
+projection family dominates and scales LINEARLY with rows (the
+"Qwen model Q8_0 projection" label alone is 20.9 ms/forward at rows=4 and
+46.8 at rows=7 versus 6.3-6.6 at rows=1 — every token row re-dequantizes
+and re-reads the same weight blocks, including the 2560x~152K output head
+once per row), the routed Q4_0 experts scale ~4.5x for 7x rows (already
+bandwidth-bound per (row, expert) pair with only ~10-15 percent cross-row
+expert collisions to exploit), and the BF16 control matmuls are flat in
+rows.  The plain M=1 window attributes as dense-matvec family ~60 percent
+(BF16 matmul ~6.2 ms/forward, Q8 projections ~6.3 + 3.2, HC fused family
+~7.3), routed Q4_0 ~4.2, sparse QSA attention ~1.7 flat in context — and
+the whole 38.7 -> 35.2 tok/s long-context falloff lives in the QSA
+indexer scan: the M=1 block scoring kernel grows 0.19 -> 1.18 ms/forward
+and the bitonic ordered top-k 1.71 -> 2.34 ms across 65K -> 262K context
+while gathered attention and every other label stay flat.
+
+Two kernel attacks on the verify pass were built and measured, and both
+LOST — recorded here so the direction is not re-tried blindly.  (1)
+Routing the 2..8-row verify projections through the existing
+weight-sharing `kernel_qwen4_q8_0_f32_rows8` (via
+`DS4_QWEN4_Q8_0_EXACT_MIN_ROWS=4`) regressed engaged depth-4 by ~7 percent
+and depth-7 by ~5 percent: one SIMDgroup per output row serially advancing
+eight token rows sacrifices too much thread-level parallelism at small M.
+(2) A purpose-built micro-batch shared-tile kernel (one 256-thread
+threadgroup per output row, eight SIMDgroups split-K over in_dim, the
+reference per-slice Q8_0 arithmetic, per-token accumulators predicated
+over compile-time row indices, fixture-pinned to <= 9.2e-5 max error and
+byte-identical verify commits via `--mtp-verify-depth`
+worst_argmax_gap=0.000) was 13-15 percent slower end-to-end and 5.9x
+slower on the Q8 label under the stage profiler (46.8 -> 275.5 ms/forward
+at rows=7) — the strided eight-token x reload pattern and per-token
+accumulator pressure defeat the weight-traffic saving on this GPU
+generation.  Both were reverted; the per-row reference kernels remain the
+verify authority.  What the attribution says could still pay: a fused
+single-dispatch QSA indexer scorer+selector (scoring plus the multi-level
+bitonic currently cost ~3.5 ms/forward at 262K and both grow linearly —
+the top-k runs full 2048-wide bitonic sorts at every reduction level with
+single-threadgroup grids at the tail), and the output head's per-row
+weight re-reads if a sharing shape can be found that keeps the per-row
+kernels' occupancy.  The M=1 dense-matvec family (~60 percent of plain
+decode, all far above their weight-traffic floors) remains the big plain-
+decode target but is a latency-bound occupancy campaign, not a single
+kernel swap.
+
+The concrete configuration answer for the M5 Max mirrors the M3 Ultra's
+shape with the optimum a notch shallower in cost terms: `--mtp-draft 7`
+for known-deterministic continuations (~72-74 tok/s fresh-server,
++85 percent over plain 39; the interleaved matrix confirms d7 and d8 tied
+at the top there — 61.3 vs 61.9 mean tok/s under six-server co-residency —
+but d8 buys nothing over 7 on counting and is clearly worse on factual
+lists), `--mtp-draft 5` for mixed predictable workloads (49.0-49.8 tok/s
+factual interleaved, the family's peak, with 58-60 counting — within a few
+percent of the deeper drafts), and leave the scheduler margin at 110.
+The verify pass prices every row at ~7.7 ms and the M5's acceptance on
+counting is near-perfect at every depth, which is exactly why deeper
+drafts keep paying here longer than on the M3.
+
 ## Integration status
 
 Pack conversion, trusted-local loading, single-base Metal mapping, adaptive

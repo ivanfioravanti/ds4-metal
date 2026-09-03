@@ -49568,6 +49568,35 @@ int ds4_gpu_qwen4_qsa_attention_bf16(
             queries >= gqa_t2d_min_rows &&
             query_heads / kv_heads == 12u && head_dim == 256u &&
             ratio == 4u && top_k == 512u;
+        /* GQA load-share scalar variant: four threadgroups per (query,
+         * KV head) each fuse three sibling query heads' rank loops, so
+         * every gathered K/V row amortizes over three heads instead of
+         * one — a 4x cut of the redundant L2 gather traffic on the
+         * non-tensor route — while each head still runs the incumbent
+         * kernel's exact scalar FMA sequence (bitwise-identical outputs;
+         * only the loads are shared; HPERG=3 is the measured M3 Ultra
+         * occupancy optimum).  Default ON for prefill-sized batches;
+         * DS4_QWEN4_QSA_GQA_SHARE=0 restores the per-(query, head)
+         * kernel, and DS4_QWEN4_QSA_GQA_SHARE_MIN_ROWS (default 32)
+         * keeps decode and MTP-verify rows (M=1..8) on today's kernel
+         * shape.  The M5 tensor route keeps precedence. */
+        const char *gqa_share = getenv("DS4_QWEN4_QSA_GQA_SHARE");
+        bool gqa_share_enabled = !(gqa_share && strcmp(gqa_share, "0") == 0);
+        if (gqa_share && strcmp(gqa_share, "1") == 0)
+            gqa_share_enabled = true;
+        uint32_t gqa_share_min_rows = 32u;
+        const char *gqa_share_rows =
+            getenv("DS4_QWEN4_QSA_GQA_SHARE_MIN_ROWS");
+        if (gqa_share_rows) {
+            const long parsed = strtol(gqa_share_rows, NULL, 0);
+            if (parsed >= 0 && parsed <= 65536L)
+                gqa_share_min_rows = (uint32_t)parsed;
+        }
+        const bool gqa_share_path =
+            gqa_share_enabled && !gqa_t2d_path && !gqa_mma_path &&
+            queries >= gqa_share_min_rows &&
+            query_heads / kv_heads == 12u && head_dim == 256u &&
+            ratio == 4u;
         const char *kernel_name =
             gqa_t2d_path
                 ? "kernel_qwen4_qsa_attention_gqa_t2d_f32"
@@ -49575,12 +49604,16 @@ int ds4_gpu_qwen4_qsa_attention_bf16(
                        ? (gqa_mma_qsplit
                               ? "kernel_qwen4_qsa_attention_gqa_mma_qsplit_f32"
                               : "kernel_qwen4_qsa_attention_gqa_mma_f32")
-                       : (prob_cache_enabled
-                              ? "kernel_qwen4_qsa_attention_bf16_f32"
-                              : "kernel_qwen4_qsa_attention_bf16_f32_legacy"));
+                       : (gqa_share_path
+                              ? (prob_cache_enabled
+                                     ? "kernel_qwen4_qsa_attention_gqa_share_f32"
+                                     : "kernel_qwen4_qsa_attention_gqa_share_f32_legacy")
+                              : (prob_cache_enabled
+                                     ? "kernel_qwen4_qsa_attention_bf16_f32"
+                                     : "kernel_qwen4_qsa_attention_bf16_f32_legacy")));
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_pipeline(kernel_name);
-        if (!pipeline && gqa_t2d_path) {
+        if (!pipeline && (gqa_t2d_path || gqa_share_path)) {
             /* Kernel absent (pre-tensor toolchain): fall back. */
             pipeline = ds4_gpu_get_pipeline(
                 prob_cache_enabled
@@ -49622,6 +49655,10 @@ int ds4_gpu_qwen4_qsa_attention_bf16(
             gqa_t2d_bytes > scratch_floats * sizeof(float))
             scratch_floats = (gqa_t2d_bytes + sizeof(float) - 1u) /
                              sizeof(float);
+        /* GQA load-share needs only the shared combine block (partials +
+         * gmax/gsum), already covered by combine_floats: no staging
+         * tiles, the gathered rows amortize over the sibling heads
+         * straight from registers. */
         const NSUInteger scratch_bytes =
             (NSUInteger)scratch_floats * sizeof(float);
         if (scratch_bytes > [g_device maxThreadgroupMemoryLength]) {
@@ -49658,9 +49695,11 @@ int ds4_gpu_qwen4_qsa_attention_bf16(
             ? @"Qwen sparse QSA attention GQA T2D"
             : (gqa_mma_path
                    ? @"Qwen sparse QSA attention GQA MMA"
-                   : (prob_cache_enabled
-                          ? @"Qwen sparse QSA attention"
-                          : @"Qwen sparse QSA attention legacy"));
+                   : (gqa_share_path
+                          ? @"Qwen sparse QSA attention GQA share"
+                          : (prob_cache_enabled
+                                 ? @"Qwen sparse QSA attention"
+                                 : @"Qwen sparse QSA attention legacy")));
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:ds4_gpu_tensor_buffer(q)
@@ -49688,7 +49727,10 @@ int ds4_gpu_qwen4_qsa_attention_bf16(
         [enc setThreadgroupMemoryLength:scratch_bytes atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(
                  queries,
-                 (gqa_mma_path || gqa_t2d_path) ? kv_heads : query_heads, 1)
+                 (gqa_mma_path || gqa_t2d_path || gqa_share_path)
+                     ? kv_heads
+                     : query_heads,
+                 gqa_share_path ? 4u : 1u)
              threadsPerThreadgroup:MTLSizeMake(
                  gqa_t2d_path ? 128u
                      : (gqa_mma_path ? 192u : 256u),

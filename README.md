@@ -246,10 +246,10 @@ Vision-Exp has its own DSpark checkpoint. Do not use the 0731 support model:
 Qwen3.8-Flash-Next (`qwen4exp` in GGUF terms) runs on its own Metal graph:
 36 gated delta-net layers and 12 gated GQA layers with the QSA block-sparse
 indexer, four-stream hyper-connections, the hashed per-layer n-gram table,
-512-expert MoE with a shared expert, and the built-in MTP block. Use the
-converter in `gguf-tools/` on the Hugging Face checkpoint (the stock
-`ggml-org` Q8_0 GGUF also loads once its two parts are merged with
-`llama-gguf-split --merge`):
+512-expert MoE with a shared expert, and the built-in MTP block. Build the
+GGUF from the Hugging Face checkpoint with the converter in `gguf-tools/`;
+the stock `ggml-org` Q8_0 GGUF also loads once its two parts are merged with
+`llama-gguf-split --merge`:
 
 ```sh
 python gguf-tools/qwen4_exp_convert.py --src /path/to/Qwen3.8-Flash-Next \
@@ -271,32 +271,17 @@ llama-quantize --imatrix imatrix.gguf --allow-requantize --tensor-type hc_=f16 \
 ```
 
 The Q8 file keeps every weight at 8 bits except the QSA indexer projections,
-which stay at the released BF16 (20M parameters; an 8-bit indexer measured
-0.2% worse teacher-forced NLL), and matches the mlx-lm 8-bit reference to a
-mean KL of 5e-3 on teacher-forced text; the MXFP4 file keeps
-the routed experts in native MXFP4 blocks, the Q4K file requantizes the
-expert gate/up projections to Q4_K, and the two-bit tiers take them to Q2_K
-or (with an importance matrix from `llama-imatrix`) IQ2_XXS while the 640-wide
-expert down projections, too narrow for 256-value blocks, go to MXFP4. The
-first matching `--tensor-type` wins, and the MTP block's experts stay MXFP4
-because an importance matrix collected with llama.cpp never sees them. The
-`hc_=f16` override keeps the hyper-connection mixers at F16: the Q8_0 base
-type would requantize them, and DS4's Q8_0 prefill GEMM is several times
-slower than its F16 one on their shapes, which halved prefill speed. On the
-same 256-token text Q8 stays closest to the 8-bit reference, then Q4K,
-MXFP4, Q2K and IQ2 (even with a standard calibration corpus), so Q2K is the
-better two-bit choice unless the last 5 GB matter. All need a Mac with more
-unified memory than the file size. MTP speeds up greedy decoding. With a
-temperature above zero MTP accepts drafts that match the greedy token, like
-the GLM path, which skews sampled output toward the greedy choice;
-`--mtp-exact-sampling` keeps the exact sampling distribution at a smaller
-speedup. The serve script passes it. Prefill runs in 8192-token chunks
-(`DS4_QWEN4_PREFILL_CHUNK` overrides; the transient buffers scale with it,
-about 12 GB at 8192). Two switches restore earlier paths for A/B
-checks, `DS4_QWEN4_NO_FUSE=1` (unfused decode kernels),
-`DS4_QWEN4_NO_IDX_SELECT=1` (the argsort top-k) and `DS4_QWEN4_NO_ATTN_MM=1`
-(the per-token attention kernel for prefill batches), and `DS4_QWEN4_TIMING=1`
-prints stage timings.
+which stay at the released BF16. The MXFP4 file keeps the routed experts in
+native MXFP4 blocks, the Q4K file requantizes the expert gate/up projections
+to Q4_K, and the two-bit files take them to Q2_K or, with an importance
+matrix from `llama-imatrix`, IQ2_XXS; the 640-wide expert down projections
+are too narrow for 256-value blocks and go to MXFP4. The first matching
+`--tensor-type` wins, and the MTP block's experts (`blk.48`) stay MXFP4
+because an importance matrix collected with llama.cpp never sees them. Keep
+the `hc_=f16` override: the Q8_0 base type would otherwise requantize the
+hyper-connection mixers, which slows prefill. Q2K is the better two-bit
+choice unless the last few GB matter. All need a Mac with more unified memory
+than the file size.
 
 ```sh
 ./ds4 -m gguf/Qwen3.8-Flash-Next-Q8.gguf --ctx 32768
@@ -304,13 +289,24 @@ prints stage timings.
 ./ds4-server -m gguf/Qwen3.8-Flash-Next-Q8.gguf --ctx 65536 --kv-disk-dir ~/.ds4/server-kv
 ./ds4-server -m gguf/Qwen3.8-Flash-Next-Q8.gguf --vision gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf
 ./ds4-agent -m gguf/Qwen3.8-Flash-Next-MXFP4.gguf
-DS4_TIER=Q4K DS4_HOST=127.0.0.1 ./serve-qwen4.sh   # server with MTP, disk KV and vision
+./ds4-server -m gguf/Qwen3.8-Flash-Next-Q4K.gguf --mtp --mtp-exact-sampling --vision gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf
 ```
+
+The MTP block is inside the same GGUF; `--mtp` enables it and speeds up
+greedy decoding. At non-zero temperature it keeps target-matching greedy
+drafts, like the GLM path, which skews sampled output toward the greedy
+choice; `--mtp-exact-sampling` preserves the ordinary sampling distribution
+at a smaller speedup. Prefill runs in 8192-token chunks
+(`DS4_QWEN4_PREFILL_CHUNK` overrides it; the transient buffers scale with the
+chunk size). For A/B checks, `DS4_QWEN4_NO_FUSE=1` selects the unfused decode
+kernels, `DS4_QWEN4_NO_IDX_SELECT=1` the argsort top-k and
+`DS4_QWEN4_NO_ATTN_MM=1` the per-token attention kernel for prefill batches;
+`DS4_QWEN4_TIMING=1` prints stage timings.
 
 `--batched-session N` keeps N sessions resident; their decode steps run one
 after another rather than as one grouped batch, so it buys concurrency, not
-throughput. Thinking is on by default with the model's `xhigh` reasoning instruction;
-the server's `qwen3.8-flash-next-chat` alias disables it and
+throughput. Thinking is on by default with the model's `xhigh` reasoning
+instruction; the server's `qwen3.8-flash-next-chat` alias disables it and
 `qwen3.8-flash-next-reasoner` forces it. Tool calls use the model's native
 `<tool_call><function=...><parameter=...>` format in both the server and the
 agent. Disk KV checkpoints and live prefix reuse work as for the other models;
@@ -318,26 +314,24 @@ the recurrent state travels with the checkpoint, so a session cannot be rewound
 to an arbitrary earlier position and a shorter prompt is prefilled again.
 
 The model's native window is 262144 tokens. For longer prompts set
-`DS4_QWEN4_YARN_FACTOR=4` (or `DS4_YARN=4` with the serve script), which
+`DS4_QWEN4_YARN_FACTOR=4`, which
 applies the static YaRN scaling from the model card, up to about 1M tokens;
-use a factor of 2 for 512k. A 369k-token two-needle prompt is answered
-correctly this way. Static YaRN costs a little accuracy on short prompts, so
-leave it off otherwise.
+use a factor of 2 for 512k. Static YaRN costs a little accuracy on short
+prompts, so leave it off otherwise.
 
 Images go through the model's Qwen3-VL vision tower. Pass llama.cpp's mmproj
 file (`ggml-org/Qwen3.8-Flash-Next-GGUF` ships a Q8_0 one, or run
 `convert_hf_to_gguf.py --mmproj --outtype f16` on the checkpoint) with
 `--vision` and send `image_url` parts as usual. Each image is resized to
 multiples of 32 pixels within 64 to 1024 tokens (`DS4_QWEN4_IMAGE_MAX_TOKENS`
-raises the cap), encoded on the GPU in well under a second, and takes the
-model's 3D rope positions; live KV reuse keys on the image fingerprints. The
-F16 mmproj reproduces the Hugging Face tower to a cosine of 1.0000
-(`tests/qwen4_exp/vision_ref.py`); the Q8_0 one stays above 0.999 on average.
+raises the cap), encoded on the GPU, and takes the model's 3D rope positions;
+live KV reuse keys on the image fingerprints. `make test-qwen4-vision`
+compares the tower with the Hugging Face implementation.
 
 Metal only for now. The Metal graph accepts Q8_0, Q4_0, F16, BF16 and F32
 dense weights, Q8_0/MXFP4/Q4_0/Q4_K/Q2_K/IQ2_XXS experts, F16/F32/Q8_0
-hyper-connection mixers and a Q8_0/Q4_0/MXFP4/F16/F32 n-gram table. Multi-node tensor
-parallelism is not implemented yet.
+hyper-connection mixers and a Q8_0/Q4_0/MXFP4/F16/F32 n-gram table.
+Multi-node tensor parallelism is not implemented yet.
 
 ## GLM 5.3 Flash
 

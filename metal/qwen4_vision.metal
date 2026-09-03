@@ -1,12 +1,7 @@
-/*
- * Qwen3.8-Flash-Next vision tower: the Qwen3-VL ViT (27 blocks of width
- * 1152, 16 heads of 72 with 2D rope over the patch grid) and its 2x2 patch
- * merger.  The dense matmuls run through kernel_qwen4_dense_mm; these
- * kernels are the glue: layernorm, bias/activation, rope and the attention
- * over one image.  Rows are patches in 2x2 merge-window order, so merging
- * is a plain reshape and the grid position of a row follows from its
- * window index.
- */
+/* Qwen3.8-Flash-Next vision tower glue around kernel_qwen4_dense_mm:
+ * layernorm, bias/activation, 2D rope and the attention over one image.
+ * Rows are patches in 2x2 merge-window order, so the merger is a plain
+ * reshape and a row's grid position follows from its window index. */
 
 struct ds4_metal_args_qwen4_vis {
     uint32_t rows;
@@ -171,7 +166,8 @@ kernel void kernel_qwen4_vis_bias_act(
         /* fast-math tanh overflows past ~44; the result is saturated there anyway */
         const float u = clamp(0.7978845608f * (t + 0.044715f * t * t * t), -30.0f, 30.0f);
         t = 0.5f * t * (1.0f + tanh(u));
+    } else if (args.mode == 1) {
+        t = 0.5f * t * (1.0f + qwen4_vis_erf(t * 0.70710678f));
     }
-    else if (args.mode == 1) t = 0.5f * t * (1.0f + qwen4_vis_erf(t * 0.70710678f));
     x[gid] = t;
 }

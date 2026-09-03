@@ -2872,8 +2872,6 @@ static void append_glm_tool_calls_text(buf *b, const tool_calls *calls,
     buf_putc(b, '\n');
 }
 
-/* --- Qwen3.8 (ChatML, <tool_call><function=...><parameter=...>) ------------ */
-
 /* Parameter values render as the template does: strings verbatim, other
  * JSON values as their (minified) JSON text. */
 static void append_qwen_tool_calls_text(buf *b, const tool_calls *calls, bool has_content,
@@ -3186,7 +3184,6 @@ static void append_qwen_tool_response(buf *b, const char *text, size_t len) {
     free(body);
 }
 
-/* tool results (tool role, or Anthropic tool_result blocks in a user turn) */
 static void append_qwen_tool_result_message(buf *b, const chat_msg *m) {
     const char *content = m && m->content ? m->content : "";
     if (m && m->role && !strcmp(m->role, "user") && m->tool_call_ids_len > 0) {
@@ -3207,7 +3204,8 @@ static void append_qwen_tool_result_message(buf *b, const chat_msg *m) {
     append_qwen_tool_response(b, content, strlen(content));
 }
 
-static void append_qwen_assistant_message(buf *out, const chat_msg *m, const tool_schema_orders *tool_orders) {
+static void append_qwen_assistant_message(buf *out, const chat_msg *m,
+                                          const tool_schema_orders *tool_orders) {
     const char *content = m && m->content ? m->content : "";
     const char *reasoning = m && m->reasoning ? m->reasoning : "";
     const bool has_calls = m && m->calls.len > 0;
@@ -3215,21 +3213,19 @@ static void append_qwen_assistant_message(buf *out, const chat_msg *m, const too
     append_trimmed_text(&body, content);
     const bool has_content = body.len > 0;
     if (has_content && !has_calls) {
-        /* a plain answer keeps the whitespace the model ended it with, so the
-         * echoed turn re-tokenizes to the sampled tokens; the template's trim
-         * would break prefix reuse there */
+        /* keep a plain answer's trailing whitespace so the echoed turn
+         * re-tokenizes to the sampled tokens */
         const char *end = content + strlen(content);
         while (end > content && isspace((unsigned char)end[-1])) end--;
         buf_append(&body, end, strlen(end));
     }
     buf_puts(out, "<|im_start|>assistant\n");
     if (!text_starts_with_think_tag(content)) {
-        /* the template keeps every assistant turn's reasoning block; with an
-         * empty one it is exactly the no-thinking generation prompt */
+        /* an empty reasoning block is exactly the no-thinking generation prompt */
         buf_puts(out, "<think>\n");
         append_trimmed_text(out, reasoning);
-        /* sampled tool text already carries whatever the model emitted after
-         * its own </think>; the template separator would double it */
+        /* sampled tool text already carries what the model emitted after its
+         * own </think>; the template separator would double it */
         const bool sampled_after_think = !has_content && reasoning[0] &&
             m->calls.raw_tool_text && m->calls.raw_tool_text[0];
         buf_puts(out, sampled_after_think ? "\n</think>" : "\n</think>\n\n");
@@ -3241,12 +3237,10 @@ static void append_qwen_assistant_message(buf *out, const chat_msg *m, const too
 }
 
 static void append_qwen_generation_prompt(buf *out, bool think) {
-    buf_puts(out, think ? "<|im_start|>assistant\n<think>\n" : "<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    buf_puts(out, think ? "<|im_start|>assistant\n<think>\n"
+                        : "<|im_start|>assistant\n<think>\n\n</think>\n\n");
 }
 
-/* messages[start..] of the conversation body: user turns, grouped tool
- * results in a user turn, assistant turns; ends with the generation prompt
- * when the last turn is not an assistant's */
 static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
                                      const tool_schema_orders *tool_orders, bool think) {
     bool pending_assistant = false;
@@ -6175,7 +6169,9 @@ static bool parse_qwen_generated_message_ex(const char *text,
         return true;
     }
     const char *raw_block_start = start;
-    while (raw_block_start > text && (raw_block_start[-1] == '\n' || raw_block_start[-1] == ' ')) raw_block_start--;
+    while (raw_block_start > text &&
+           (raw_block_start[-1] == '\n' || raw_block_start[-1] == ' '))
+        raw_block_start--;
     size_t content_len = trim_tool_separator_ws(text, 0, (size_t)(raw_block_start - text));
 
     const char *p = start;
@@ -11935,9 +11931,9 @@ static void send_prefill_failure_response(server *s, const job *j,
     http_error(j->fd, s->enable_cors, 500, err);
 }
 
-/* Qwen: the bytes render_qwen_chat_prompt_text() appends after the prompt's
- * "<think>\n" (thinking) or "<think>\n\n</think>\n\n" (no thinking) for this
- * assistant turn, so the live checkpoint and the next prompt agree byte for byte. */
+/* The bytes render_qwen_chat_prompt_text() appends after this turn's
+ * generation prompt, so the live checkpoint and the next prompt agree byte for
+ * byte. */
 static char *build_qwen_assistant_suffix(const request *r, const char *content,
                                          const char *reasoning, bool with_reasoning,
                                          const tool_calls *calls) {
@@ -11970,9 +11966,7 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
     buf_puts(&suffix, content ? content : "");
     append_tool_calls_text_for_syntax(&suffix, syntax, calls,
                                       r ? &r->tool_orders : NULL);
-    if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
-        buf_puts(&suffix, "<|im_end|>");
-    } else if (syntax != SERVER_MODEL_SYNTAX_GLM) {
+    if (syntax != SERVER_MODEL_SYNTAX_GLM) {
         buf_puts(&suffix, "<｜end▁of▁sentence｜>");
     }
     return buf_take(&suffix);
@@ -12006,9 +12000,7 @@ static char *build_responses_visible_assistant_suffix(const request *r,
     buf_puts(&suffix, content ? content : "");
     append_tool_calls_text_for_syntax(&suffix, syntax, calls,
                                       r ? &r->tool_orders : NULL);
-    if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
-        buf_puts(&suffix, "<|im_end|>");
-    } else if (syntax != SERVER_MODEL_SYNTAX_GLM) {
+    if (syntax != SERVER_MODEL_SYNTAX_GLM) {
         buf_puts(&suffix, "<｜end▁of▁sentence｜>");
     }
     return buf_take(&suffix);
@@ -16670,7 +16662,8 @@ static void test_render_qwen_tool_round_trip(void) {
     TEST_ASSERT(strstr(prompt, expected_tail) != NULL);
     free(prompt);
 
-    char *tail = render_live_tool_tail_for_syntax(SERVER_MODEL_SYNTAX_QWEN, &msgs, 2, &orders, DS4_THINK_NONE);
+    char *tail = render_live_tool_tail_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, &msgs, 2, &orders, DS4_THINK_NONE);
     TEST_ASSERT(tail != NULL);
     TEST_ASSERT(!strcmp(tail,
         "<|im_end|>\n<|im_start|>user\n<tool_response>\nhi\n</tool_response>\n<tool_response>\nsecond\n</tool_response><|im_end|>\n"
@@ -16709,7 +16702,8 @@ static void test_parse_qwen_tool_call_message(void) {
     tool_calls_free(&calls);
 
     /* thinking never closed: no tool call is executed */
-    content = NULL; reasoning = NULL;
+    content = NULL;
+    reasoning = NULL;
     tool_calls none = {0};
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
         SERVER_MODEL_SYNTAX_QWEN, "still thinking about <tool_call>", true, &content, &reasoning, &none));
@@ -16720,7 +16714,8 @@ static void test_parse_qwen_tool_call_message(void) {
     tool_calls_free(&none);
 
     /* malformed: missing </function> */
-    content = NULL; reasoning = NULL;
+    content = NULL;
+    reasoning = NULL;
     tool_calls bad = {0};
     TEST_ASSERT(!parse_generated_message_ex_for_syntax(
         SERVER_MODEL_SYNTAX_QWEN, "x</think>\n<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</tool_call>",
@@ -16738,7 +16733,8 @@ static void test_qwen_thinking_visible_text_matches_render(void) {
     user1.role = xstrdup("user");
     user1.content = xstrdup("What is 2+2?");
     chat_msgs_push(&msgs, user1);
-    char *prompt_text = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL, DS4_THINK_HIGH);
+    char *prompt_text = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL, DS4_THINK_HIGH);
     const char *gen = "<|im_start|>assistant\n<think>\n";
     TEST_ASSERT(strlen(prompt_text) > strlen(gen));
     TEST_ASSERT(!strcmp(prompt_text + strlen(prompt_text) - strlen(gen), gen));
@@ -16762,7 +16758,8 @@ static void test_qwen_thinking_visible_text_matches_render(void) {
     h_user2.role = xstrdup("user");
     h_user2.content = xstrdup("Thanks!");
     chat_msgs_push(&history, h_user2);
-    char *future = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_QWEN, &history, NULL, NULL, DS4_THINK_HIGH);
+    char *future = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, &history, NULL, NULL, DS4_THINK_HIGH);
     TEST_ASSERT(strlen(future) > strlen(visible));
     TEST_ASSERT(!memcmp(future, visible, strlen(visible)));
     TEST_ASSERT(!strncmp(future + strlen(visible), "<|im_start|>user\n", 17));
@@ -16785,7 +16782,8 @@ static void test_qwen_checkpoint_suffix_matches_render(void) {
     user.role = xstrdup("user");
     user.content = xstrdup("run it");
     chat_msgs_push(&msgs, user);
-    char *prompt = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL, DS4_THINK_HIGH);
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL, DS4_THINK_HIGH);
     tool_calls calls = {0};
     tool_call tc = {0};
     tc.name = xstrdup("bash");
@@ -16809,7 +16807,8 @@ static void test_qwen_checkpoint_suffix_matches_render(void) {
     res.role = xstrdup("tool");
     res.content = xstrdup("a.txt");
     chat_msgs_push(&msgs, res);
-    char *next = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL, DS4_THINK_HIGH);
+    char *next = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL, DS4_THINK_HIGH);
     TEST_ASSERT(next && live.ptr && !strncmp(next, live.ptr, live.len));
     TEST_ASSERT(!strcmp(next + live.len, "\n<|im_start|>user\n<tool_response>\na.txt\n</tool_response><|im_end|>\n"
                                          "<|im_start|>assistant\n<think>\n"));

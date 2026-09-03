@@ -1,11 +1,8 @@
-/* Standalone Metal kernel tests for Qwen3.8-Flash-Next (metal/qwen4.metal).
- * Every kernel runs at the release model's shapes and at the synthetic
- * mini's shapes against a double-precision reference of the same math as
- * the ds4.c CPU reference.  Weights live in an anonymous mmap that stands
- * in for the model map. Build: make test-qwen4-kernels */
+/* Metal kernel tests for Qwen3.8-Flash-Next (metal/qwen4.metal): every kernel
+ * at the release and mini model shapes against a double-precision reference.
+ * Build: make test-qwen4-kernels */
 
 #include <math.h>
-#include <float.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -99,8 +96,9 @@ static double sigmoid_d(double x) { return x >= 0 ? 1.0 / (1.0 + exp(-x)) : exp(
 static double silu_d(double x) { return x * sigmoid_d(x); }
 static double softplus_d(double x) { return x > 20.0 ? x : log1p(exp(x)); }
 
-/* ---- weight arena --------------------------------------------------------- */
+/* ---- weight arena ---- */
 
+/* anonymous mmap standing in for the model map; weights are appended, never freed */
 typedef struct {
     uint8_t *base;
     uint64_t size;
@@ -200,13 +198,16 @@ static uint64_t arena_q4_K(arena_t *a, uint64_t rows, uint64_t cols, double **sh
         for (uint64_t b = 0; b < blocks; b++) {
             uint8_t *blk = w + (r * blocks + b) * 144u;
             /* per-group scale/min in 6 bits, block d/dmin as f16 */
-            const float d = scale / 63.0f / 15.0f, dmin = scale / 63.0f / 15.0f;
+            const float d = scale / 63.0f / 15.0f, dmin = d;
             const uint16_t dh = f32_to_f16(d), mh = f32_to_f16(dmin);
             const float dq = f16_to_f32(dh), mq = f16_to_f32(mh);
             memcpy(blk, &dh, 2);
             memcpy(blk + 2, &mh, 2);
             uint8_t sc[8], mn[8];
-            for (int g = 0; g < 8; g++) { sc[g] = (uint8_t)(1 + (int)(62.0f * (0.5f * frand() + 0.5f))); mn[g] = (uint8_t)((int)(63.0f * (0.5f * frand() + 0.5f))); }
+            for (int g = 0; g < 8; g++) {
+                sc[g] = (uint8_t)(1 + (int)(62.0f * (0.5f * frand() + 0.5f)));
+                mn[g] = (uint8_t)((int)(63.0f * (0.5f * frand() + 0.5f)));
+            }
             uint8_t *s = blk + 4;
             for (int g = 0; g < 4; g++) { s[g] = sc[g] & 63; s[g + 4] = mn[g] & 63; }
             for (int g = 4; g < 8; g++) {
@@ -227,7 +228,7 @@ static uint64_t arena_q4_K(arena_t *a, uint64_t rows, uint64_t cols, double **sh
     return off;
 }
 
-static const uint8_t t_ksigns_iq2xs[128] = {
+static const uint8_t ksigns_iq2xs[128] = {
       0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
     144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
     160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
@@ -237,7 +238,7 @@ static const uint8_t t_ksigns_iq2xs[128] = {
      96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
     240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
 };
-static const uint64_t t_iq2xxs_grid[256] = {
+static const uint64_t iq2xxs_grid[256] = {
     0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
     0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,
     0x08080808082b082b, 0x08080808082b2b08, 0x08080808082b2b2b, 0x0808080819080819,
@@ -304,7 +305,7 @@ static const uint64_t t_iq2xxs_grid[256] = {
     0x2b2b082b08080808, 0x2b2b190808192b08, 0x2b2b2b0819190808, 0x2b2b2b1908081908,
 };
 
-/* optional raw dump so tests/qwen4_exp/check_quant_dump.py can cross-check the shadow against gguf-py */
+/* QWEN4_DUMP_QUANT=DIR: write the raw blocks and the shadow values for offline checks */
 static void dump_quant(const char *type, const uint8_t *raw, uint64_t raw_bytes, const double *shadow, uint64_t n) {
     const char *dir = getenv("QWEN4_DUMP_QUANT");
     if (!dir) return;
@@ -326,11 +327,14 @@ static uint64_t arena_q2_K(arena_t *a, uint64_t rows, uint64_t cols, double **sh
     for (uint64_t r = 0; r < rows; r++) {
         for (uint64_t b = 0; b < blocks; b++) {
             uint8_t *blk = w + (r * blocks + b) * 84u;
-            const uint16_t dh = f32_to_f16(scale / 15.0f / 3.0f), mh = f32_to_f16(scale / 15.0f / 3.0f);
+            const uint16_t dh = f32_to_f16(scale / 15.0f / 3.0f), mh = dh;
             const float dq = f16_to_f32(dh), mq = f16_to_f32(mh);
             memcpy(blk + 80, &dh, 2);
             memcpy(blk + 82, &mh, 2);
-            for (int g = 0; g < 16; g++) blk[g] = (uint8_t)((int)(15.0f * (0.5f * frand() + 0.5f)) | ((int)(15.0f * (0.5f * frand() + 0.5f)) << 4));
+            for (int g = 0; g < 16; g++) {
+                const int sc = (int)(15.0f * (0.5f * frand() + 0.5f)), mn = (int)(15.0f * (0.5f * frand() + 0.5f));
+                blk[g] = (uint8_t)(sc | (mn << 4));
+            }
             memset(blk + 16, 0, 64);
             for (int g = 0; g < 16; g++) {
                 const int q_base = 32 * (g / 8) + 16 * (g & 1), shift = ((g / 2) & 3) * 2;
@@ -369,8 +373,8 @@ static uint64_t arena_iq2_xxs(arena_t *a, uint64_t rows, uint64_t cols, double *
                 memcpy(blk + 2 + ib32 * 8, q2, 8);
                 const float dl = dq * (0.5f + (float)(aux_s >> 28)) * 0.25f;
                 for (int j = 0; j < 4; j++) {
-                    const uint8_t *grid = (const uint8_t *)(t_iq2xxs_grid + ((aux_g >> (8 * j)) & 0xFF));
-                    const uint32_t signs = t_ksigns_iq2xs[(aux_s >> (7 * j)) & 127];
+                    const uint8_t *grid = (const uint8_t *)(iq2xxs_grid + ((aux_g >> (8 * j)) & 0xFF));
+                    const uint32_t signs = ksigns_iq2xs[(aux_s >> (7 * j)) & 127];
                     for (int i = 0; i < 8; i++) {
                         (*shadow)[r * cols + b * 256 + ib32 * 32 + j * 8 + i] = dl * grid[i] * (((signs >> i) & 1) ? -1.0 : 1.0);
                     }
@@ -383,7 +387,7 @@ static uint64_t arena_iq2_xxs(arena_t *a, uint64_t rows, uint64_t cols, double *
 }
 
 /* q8_0 rows of `cols` elements (cols % 32 == 0), `rows` rows */
-static uint64_t arena_q8(arena_t *a, uint64_t rows, uint64_t cols, double **shadow, float scale) {
+static uint64_t arena_q8_0(arena_t *a, uint64_t rows, uint64_t cols, double **shadow, float scale) {
     const uint64_t blocks = cols / 32;
     const uint64_t off = arena_alloc(a, rows * blocks * 34u);
     uint8_t *w = a->base + off;
@@ -427,13 +431,19 @@ static float *download(const ds4_gpu_tensor *t, uint64_t n) {
     return out;
 }
 
+static void check_tensor(const char *what, const ds4_gpu_tensor *t, const double *ref, uint64_t n, double tol) {
+    float *got = download(t, n);
+    check_close(what, got, ref, n, tol);
+    free(got);
+}
+
 static float *rand_vec(uint64_t n, float scale) {
     float *v = malloc(n * sizeof(float));
     for (uint64_t i = 0; i < n; i++) v[i] = scale * frand();
     return v;
 }
 
-/* ---- hyper-connections ------------------------------------------------------ */
+/* ---- hyper-connections ---- */
 
 static void test_hc(arena_t *a, uint32_t E, uint32_t rank, uint32_t T, uint32_t wtype) {
     const bool f16 = wtype == 1u, q8 = wtype == 8u;
@@ -441,15 +451,15 @@ static void test_hc(arena_t *a, uint32_t E, uint32_t rank, uint32_t T, uint32_t 
     const float eps = 1e-6f;
     double *g_gamma, *g_down, *g_up, *g_inj;
     const uint64_t gamma_off = arena_f32(a, dim, &g_gamma, 0.5f, 1.5f);
-    const uint64_t down_off = q8 ? arena_q8(a, rank, dim, &g_down, 0.05f)
+    const uint64_t down_off = q8 ? arena_q8_0(a, rank, dim, &g_down, 0.05f)
                             : f16 ? arena_f16(a, (uint64_t)rank * dim, &g_down, 0.05f)
                                   : arena_f32(a, (uint64_t)rank * dim, &g_down, -0.05f, 0.05f);
     /* q8 up rows need rank % 32; smaller ranks keep f16 like the converter does */
     const uint32_t up_type = q8 && (rank % 32) == 0 ? 8u : q8 ? 1u : wtype;
-    const uint64_t up_off = up_type == 8u ? arena_q8(a, dim, rank, &g_up, 0.2f)
+    const uint64_t up_off = up_type == 8u ? arena_q8_0(a, dim, rank, &g_up, 0.2f)
                           : up_type == 1u ? arena_f16(a, (uint64_t)dim * rank, &g_up, 0.2f)
                                           : arena_f32(a, (uint64_t)dim * rank, &g_up, -0.2f, 0.2f);
-    const uint64_t inj_off = q8 ? arena_q8(a, hc, dim, &g_inj, 0.05f)
+    const uint64_t inj_off = q8 ? arena_q8_0(a, hc, dim, &g_inj, 0.05f)
                            : f16 ? arena_f16(a, (uint64_t)hc * dim, &g_inj, 0.05f)
                                  : arena_f32(a, (uint64_t)hc * dim, &g_inj, -0.05f, 0.05f);
     float *R = rand_vec((uint64_t)T * dim, 1.0f);
@@ -516,23 +526,24 @@ static void test_hc(arena_t *a, uint32_t E, uint32_t rank, uint32_t T, uint32_t 
                "hc gate mix");
     require_ok(ds4_gpu_qwen4_hc_combine_tensor(gR, gblk, ginj, T, E, hc), "hc combine");
     char name[96];
-    snprintf(name, sizeof(name), "hc E=%u rank=%u T=%u %s: xn", E, rank, T, q8 ? "q8_0" : f16 ? "f16" : "f32");
-    float *got = download(gxn, (uint64_t)T * dim); check_close(name, got, xn, (uint64_t)T * dim, 1e-5); free(got);
-    snprintf(name, sizeof(name), "hc E=%u rank=%u T=%u %s: lowrank", E, rank, T, q8 ? "q8_0" : f16 ? "f16" : "f32");
-    got = download(glo, (uint64_t)T * rank); check_close(name, got, lo, (uint64_t)T * rank, 2e-4); free(got);   /* f16 low-rank weights */
-    snprintf(name, sizeof(name), "hc E=%u rank=%u T=%u %s: inject partials", E, rank, T, q8 ? "q8_0" : f16 ? "f16" : "f32");
-    got = download(ginj, (uint64_t)T * hc * CH * hc); check_close(name, got, part, (uint64_t)T * hc * CH * hc, 2e-5); free(got);
-    snprintf(name, sizeof(name), "hc E=%u rank=%u T=%u %s: mixed", E, rank, T, q8 ? "q8_0" : f16 ? "f16" : "f32");
-    got = download(gmixed, (uint64_t)T * E); check_close(name, got, mixed, (uint64_t)T * E, 2e-5); free(got);
-    snprintf(name, sizeof(name), "hc E=%u rank=%u T=%u %s: combine", E, rank, T, q8 ? "q8_0" : f16 ? "f16" : "f32");
-    got = download(gR, (uint64_t)T * dim); check_close(name, got, R2, (uint64_t)T * dim, 2e-5); free(got);
+    const char *tname = q8 ? "q8_0" : f16 ? "f16" : "f32";
+    snprintf(name, sizeof(name), "hc E=%u rank=%u T=%u %s: xn", E, rank, T, tname);
+    check_tensor(name, gxn, xn, (uint64_t)T * dim, 1e-5);
+    snprintf(name, sizeof(name), "hc E=%u rank=%u T=%u %s: lowrank", E, rank, T, tname);
+    check_tensor(name, glo, lo, (uint64_t)T * rank, 2e-4);   /* f16 low-rank weights */
+    snprintf(name, sizeof(name), "hc E=%u rank=%u T=%u %s: inject partials", E, rank, T, tname);
+    check_tensor(name, ginj, part, (uint64_t)T * hc * CH * hc, 2e-5);
+    snprintf(name, sizeof(name), "hc E=%u rank=%u T=%u %s: mixed", E, rank, T, tname);
+    check_tensor(name, gmixed, mixed, (uint64_t)T * E, 2e-5);
+    snprintf(name, sizeof(name), "hc E=%u rank=%u T=%u %s: combine", E, rank, T, tname);
+    check_tensor(name, gR, R2, (uint64_t)T * dim, 2e-5);
     ds4_gpu_tensor_free(gblk); ds4_gpu_tensor_free(gmixed); ds4_gpu_tensor_free(ginj);
     ds4_gpu_tensor_free(glo); ds4_gpu_tensor_free(gxn); ds4_gpu_tensor_free(gR);
     free(R2); free(mixed); free(part); free(lo); free(xn); free(blk); free(R);
     free(g_gamma); free(g_down); free(g_up); free(g_inj);
 }
 
-/* ---- gated delta net ------------------------------------------------------- */
+/* ---- gated delta net ---- */
 
 static void gdn_reference(uint32_t Hk, uint32_t Hv, uint32_t D, uint32_t K, uint32_t T,
                           const float *qkv_in, const float *z, const float *ab_in,
@@ -592,8 +603,8 @@ static void test_gdn(arena_t *a, uint32_t Hk, uint32_t Hv, uint32_t D, uint32_t 
      * fused front kernel can be checked against the same reference */
     const uint32_t E = 2560;
     double *alpha_w, *beta_w;
-    const uint64_t alpha_off = arena_q8(a, Hv, E, &alpha_w, 0.05f);
-    const uint64_t beta_off = arena_q8(a, Hv, E, &beta_w, 0.05f);
+    const uint64_t alpha_off = arena_q8_0(a, Hv, E, &alpha_w, 0.05f);
+    const uint64_t beta_off = arena_q8_0(a, Hv, E, &beta_w, 0.05f);
     float *mixed = rand_vec((uint64_t)T * E, 1.0f);
     float *ab = malloc((uint64_t)T * 2 * Hv * sizeof(float));
     for (uint32_t t = 0; t < T; t++) {
@@ -657,11 +668,11 @@ static void test_gdn(arena_t *a, uint32_t Hk, uint32_t Hv, uint32_t D, uint32_t 
         }
         const char *mname = mode == 0 ? "chunk" : mode == 1 ? "decode" : "fused";
         snprintf(name, sizeof(name), "gdn %u/%u/%u T=%u %s: output", Hk, Hv, D, T, mname);
-        float *got = download(gout, (uint64_t)T * vd); check_close(name, got, ref_out, (uint64_t)T * vd, 5e-5); free(got);
+        check_tensor(name, gout, ref_out, (uint64_t)T * vd, 5e-5);
         snprintf(name, sizeof(name), "gdn %u/%u/%u T=%u %s: state", Hk, Hv, D, T, mname);
-        got = download(gstate, (uint64_t)Hv * D * D); check_close(name, got, ref_state, (uint64_t)Hv * D * D, 5e-5); free(got);
+        check_tensor(name, gstate, ref_state, (uint64_t)Hv * D * D, 5e-5);
         snprintf(name, sizeof(name), "gdn %u/%u/%u T=%u %s: conv history", Hk, Hv, D, T, mname);
-        got = download(ghist, (uint64_t)(K - 1) * C); check_close(name, got, ref_hist, (uint64_t)(K - 1) * C, 1e-6); free(got);
+        check_tensor(name, ghist, ref_hist, (uint64_t)(K - 1) * C, 1e-6);
         ds4_gpu_tensor_free(gmixed);
         ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(ghist); ds4_gpu_tensor_free(gstate);
         ds4_gpu_tensor_free(gb); ds4_gpu_tensor_free(ga); ds4_gpu_tensor_free(gz); ds4_gpu_tensor_free(gqkv);
@@ -672,7 +683,7 @@ static void test_gdn(arena_t *a, uint32_t Hk, uint32_t Hv, uint32_t D, uint32_t 
     free(mixed); free(alpha_w); free(beta_w);
 }
 
-/* ---- indexer matrix scorer ---------------------------------------------------- */
+/* ---- indexer matrix scorer ---- */
 
 static void test_idx_score_mm(uint32_t T, uint32_t n, uint32_t pos0) {
     const uint32_t Hi = 4, Di = 128, ratio = 4;
@@ -703,14 +714,19 @@ static void test_idx_score_mm(uint32_t T, uint32_t n, uint32_t pos0) {
                ds4_gpu_qwen4_idx_score_tensor(gs, gq, gk, T, n, Hi, Di, pos0, ratio), "idx score mm");
     float *got = download(gs, (uint64_t)T * n);
     /* invisible entries are -3e38 on both sides: compare them exactly by mapping to 0 */
-    for (uint64_t i = 0; i < (uint64_t)T * n; i++) { if (ref[i] < -1e37) { ref[i] = 0.0; got[i] = got[i] < -1e37f ? 0.0f : 1.0f; } }
+    for (uint64_t i = 0; i < (uint64_t)T * n; i++) {
+        if (ref[i] < -1e37) {
+            ref[i] = 0.0;
+            got[i] = got[i] < -1e37f ? 0.0f : 1.0f;
+        }
+    }
     char name[96];
     snprintf(name, sizeof(name), "idx score mm T=%u n=%u pos0=%u", T, n, pos0);
     check_close(name, got, ref, (uint64_t)T * n, 4e-3);   /* queries rounded to half */
     free(got); ds4_gpu_tensor_free(gs); ds4_gpu_tensor_free(gk); ds4_gpu_tensor_free(gq); free(ref); free(keyh); free(keyf); free(q);
 }
 
-/* ---- indexer radix select ----------------------------------------------------- */
+/* ---- indexer radix select ---- */
 
 static int cmp_desc_idx(void *ctx, const void *a, const void *b) {
     const float *sc = ctx;
@@ -768,8 +784,13 @@ static void test_attn_mm(uint32_t T, uint32_t pos0, bool sparse) {
         const uint32_t pos = pos0 + t, n_blocks = (pos + 1) / ratio, nb = n_blocks < k_blocks ? n_blocks : k_blocks;
         uint32_t blocks[16], n = 0;
         for (uint32_t i = 0; i < nb; i++) {
-            uint32_t b; bool dup;
-            do { b = (uint32_t)(frand() * n_blocks) % n_blocks; dup = false; for (uint32_t j = 0; j < i; j++) dup |= blocks[j] == b; } while (dup);
+            uint32_t b;
+            bool dup;
+            do {
+                b = (uint32_t)((frand() + 1.0f) * 0.5f * n_blocks) % n_blocks;
+                dup = false;
+                for (uint32_t j = 0; j < i && !dup; j++) dup = blocks[j] == b;
+            } while (dup);
             blocks[i] = b;
         }
         for (uint32_t i = 0; i < nb; i++) for (uint32_t r = 0; r < ratio; r++) sel[(uint64_t)t * sel_stride + n++] = (int32_t)(blocks[i] * ratio + r);
@@ -802,7 +823,7 @@ static void test_attn_mm(uint32_t T, uint32_t pos0, bool sparse) {
     ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gcnt); ds4_gpu_tensor_free(go_ref); ds4_gpu_tensor_free(go_new);
 }
 
-/* ---- PLE -------------------------------------------------------------------- */
+/* ---- PLE ---- */
 
 static void test_ple(arena_t *a, uint32_t E, uint32_t T) {
     const uint32_t hc = 4, dim = E * hc, K = 4, dil = 3, H = (K - 1) * dil;
@@ -873,10 +894,11 @@ static void test_ple(arena_t *a, uint32_t E, uint32_t T) {
             ds4_gpu_tensor_free(vn); ds4_gpu_tensor_free(vg); ds4_gpu_tensor_free(vval);
             ds4_gpu_tensor_free(vkey); ds4_gpu_tensor_free(vR);
         }
-        snprintf(name, sizeof(name), "ple E=%u T=%u %s: residual", E, T, mode ? "decode" : "chunk");
-        float *got = download(gR, (uint64_t)T * dim); check_close(name, got, ref_R, (uint64_t)T * dim, 2e-5); free(got);
-        snprintf(name, sizeof(name), "ple E=%u T=%u %s: history", E, T, mode ? "decode" : "chunk");
-        got = download(ghist, (uint64_t)H * dim); check_close(name, got, ref_hist, (uint64_t)H * dim, 2e-5); free(got);
+        const char *mname = mode ? "decode" : "chunk";
+        snprintf(name, sizeof(name), "ple E=%u T=%u %s: residual", E, T, mname);
+        check_tensor(name, gR, ref_R, (uint64_t)T * dim, 2e-5);
+        snprintf(name, sizeof(name), "ple E=%u T=%u %s: history", E, T, mname);
+        check_tensor(name, ghist, ref_hist, (uint64_t)H * dim, 2e-5);
         ds4_gpu_tensor_free(ghist); ds4_gpu_tensor_free(gnormed); ds4_gpu_tensor_free(ggated);
         ds4_gpu_tensor_free(gval); ds4_gpu_tensor_free(gkey); ds4_gpu_tensor_free(gR);
     }
@@ -884,7 +906,7 @@ static void test_ple(arena_t *a, uint32_t E, uint32_t T) {
     free(gk); free(gq); free(gc); free(cw);
 }
 
-/* ---- router ------------------------------------------------------------------ */
+/* ---- router ---- */
 
 static void test_router(arena_t *a, uint32_t NE, uint32_t k, uint32_t T) {
     const uint32_t E = 2560;
@@ -898,16 +920,17 @@ static void test_router(arena_t *a, uint32_t NE, uint32_t k, uint32_t T) {
     ds4_gpu_tensor *gw = upload(NULL, (uint64_t)T * k);
     ds4_gpu_tensor *gsg = upload(NULL, T);
     require_ok(ds4_gpu_qwen4_router_topk_tensor(gsel, gw, gl, gx, a->base, a->size, gate_off, 0u, E, gsg, T, NE, k), "router");
+    char name[96];
     {
-        float *sg = download(gsg, T);
         double *ref = malloc(T * sizeof(double));
-        for (uint32_t tk = 0; tk < T; tk++) {
+        for (uint32_t t = 0; t < T; t++) {
             double acc = 0.0;
-            for (uint32_t i = 0; i < E; i++) acc += gate_w[i] * x[(uint64_t)tk * E + i];
-            ref[tk] = acc;
+            for (uint32_t i = 0; i < E; i++) acc += gate_w[i] * x[(uint64_t)t * E + i];
+            ref[t] = acc;
         }
-        check_close("router shared gate logit", sg, ref, T, 1e-5);
-        free(ref); free(sg);
+        snprintf(name, sizeof(name), "router NE=%u k=%u T=%u: shared gate logit", NE, k, T);
+        check_tensor(name, gsg, ref, T, 1e-5);
+        free(ref);
     }
     ds4_gpu_tensor_free(gsg); ds4_gpu_tensor_free(gx); free(x); free(gate_w);
     int32_t *sel = malloc((uint64_t)T * k * 4);
@@ -943,11 +966,12 @@ static void test_router(arena_t *a, uint32_t NE, uint32_t k, uint32_t T) {
         free(ref); free(p);
     }
     if (worst > 1e-6) { fprintf(stderr, "router weights max|d| %.3e\n", worst); exit(1); }
-    printf("  %-44s ok  max|d|=%.2e\n", "router softmax top-k", worst);
+    snprintf(name, sizeof(name), "router NE=%u k=%u T=%u: softmax top-k", NE, k, T);
+    printf("  %-44s ok  max|d|=%.2e\n", name, worst);
     free(w); free(sel); ds4_gpu_tensor_free(gw); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gl); free(logits);
 }
 
-/* ---- attention + indexer ---------------------------------------------------------- */
+/* ---- attention + indexer ---- */
 
 static void rope_ref(double *x, uint32_t n_rot, uint32_t pos, double base) {
     const uint32_t nh = n_rot / 2;
@@ -979,7 +1003,6 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
     float *iq = rand_vec((uint64_t)n_pos * Hi * Di, 1.0f);
     float *ik = rand_vec((uint64_t)n_pos * Di, 1.0f);
 
-    /* reference caches (double) */
     double *kc = malloc((uint64_t)cap * Hkv * D * sizeof(double));
     double *vc = malloc((uint64_t)cap * Hkv * D * sizeof(double));
     double *ref_out = malloc((uint64_t)n_pos * H * D * sizeof(double));
@@ -1002,14 +1025,14 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
             double ss = 0.0;
             for (uint32_t i = 0; i < D; i++) ss += (double)src[i] * src[i];
             const double r = 1.0 / sqrt(ss / D + eps);
-            double *dst = kc + ((uint64_t)pos * Hkv + h) * D;
-            for (uint32_t i = 0; i < D; i++) dst[i] = f16_to_f32(f32_to_f16((float)(src[i] * r * gk_w[i])));
-            /* rope on the f32 value before the f16 store, as the kernel does */
+            double *dst = kc + ((uint64_t)pos * Hkv + h) * D, *vdst = vc + ((uint64_t)pos * Hkv + h) * D;
+            const float *vsrc = vp + ((uint64_t)pos * Hkv + h) * D;
             double tmp[256];
+            /* rope on the f32 value before the f16 store, as the kernel does */
             for (uint32_t i = 0; i < D; i++) tmp[i] = src[i] * r * gk_w[i];
             rope_ref(tmp, n_rot, pos, base);
             for (uint32_t i = 0; i < D; i++) dst[i] = f16_to_f32(f32_to_f16((float)tmp[i]));
-            for (uint32_t i = 0; i < D; i++) vc[((uint64_t)pos * Hkv + h) * D + i] = f16_to_f32(f32_to_f16(vp[((uint64_t)pos * Hkv + h) * D + i]));
+            for (uint32_t i = 0; i < D; i++) vdst[i] = f16_to_f32(f32_to_f16(vsrc[i]));
         }
         for (uint32_t h = 0; h < Hi; h++) {
             const float *src = iq + ((uint64_t)pos * Hi + h) * Di;
@@ -1117,7 +1140,7 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
             require_ok(ds4_gpu_qwen4_idx_block_key_tensor(gbk, gikc, gpos3, a->base, a->size, gik_off, n_blocks - 1, 1,
                                                           ratio, Di, n_rot, (float)base, (float)eps), "block key");
         }
-        bool sparse = n_blocks > k_blocks;
+        const bool sparse = n_blocks > k_blocks;
         if (sparse) {
             require_ok(ds4_gpu_qwen4_idx_score_tensor(gscore, giqo, gbk, 1, n_blocks, Hi, Di, pos, ratio), "idx score");
             require_ok(ds4_gpu_qwen4_idx_select_tensor(gselb, gscore, n_blocks, 1, k_blocks), "idx select");
@@ -1144,9 +1167,7 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
     }
     char name[96];
     snprintf(name, sizeof(name), "attention H=%u/%u D=%u k=%u n=%u", H, Hkv, D, k_blocks, n_pos);
-    float *got = download(gout, (uint64_t)n_pos * H * D);
-    check_close(name, got, ref_out, (uint64_t)n_pos * H * D, 5e-4);   /* half KV; block order differs */
-    free(got);
+    check_tensor(name, gout, ref_out, (uint64_t)n_pos * H * D, 5e-4);   /* half KV; block order differs */
 
     ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gnsel); ds4_gpu_tensor_free(gselt); ds4_gpu_tensor_free(gselb);
     ds4_gpu_tensor_free(gscore); ds4_gpu_tensor_free(gbk); ds4_gpu_tensor_free(gikc); ds4_gpu_tensor_free(giqo);
@@ -1157,29 +1178,29 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
     free(gq_w); free(gk_w); free(giq_w); free(gik_w);
 }
 
-/* ---- routed experts ----------------------------------------------------------- */
+/* ---- routed experts ---- */
 
-static uint32_t g_moe_tier = 12u;   /* gate/up type for the 256-multiple, T > 8 case: 12 q4_K, 10 q2_K, 16 iq2_xxs */
-
-static uint64_t arena_tier(arena_t *a, uint32_t tier, uint64_t rows, uint64_t cols, double **shadow) {
-    return tier == 12u ? arena_q4_K(a, rows, cols, shadow, 0.05f) :
-           tier == 10u ? arena_q2_K(a, rows, cols, shadow, 0.05f) :
-           tier == 16u ? arena_iq2_xxs(a, rows, cols, shadow, 0.05f) : arena_q8(a, rows, cols, shadow, 0.05f);
+static uint64_t arena_tier(arena_t *a, uint32_t wtype, uint64_t rows, uint64_t cols, double **shadow) {
+    return wtype == 12u ? arena_q4_K(a, rows, cols, shadow, 0.05f) :
+           wtype == 10u ? arena_q2_K(a, rows, cols, shadow, 0.05f) :
+           wtype == 16u ? arena_iq2_xxs(a, rows, cols, shadow, 0.05f) : arena_q8_0(a, rows, cols, shadow, 0.05f);
 }
 
-static void test_moe(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, uint32_t F, uint32_t T, bool q8) {
+/* wtype is the gate/up type (0 f32, 8 q8_0, 12 q4_K, 10 q2_K, 16 iq2_xxs); down
+ * and the shared expert are q8_0, or f32 with wtype 0 */
+static void test_moe(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, uint32_t F, uint32_t T, uint32_t wtype) {
     double *gate_w, *up_w, *down_w, *sg_w, *su_w, *sd_w;
     uint64_t gate_off, up_off, down_off, sg_off, su_off, sd_off;
-    const bool q4k = q8 && (E % 256) == 0 && T > 8;   /* the sub-8-bit tiers: k/iq gate/up, q8_0 down */
-    const uint32_t wtype = q4k ? g_moe_tier : q8 ? 8u : 0u;
+    const bool q8 = wtype != 0u;
+    const uint32_t dtype = q8 ? 8u : 0u;
     const char *tier_name = wtype == 12u ? "q4_K" : wtype == 10u ? "q2_K" : wtype == 16u ? "iq2_xxs" : q8 ? "q8_0" : "f32";
     if (q8) {
         gate_off = arena_tier(a, wtype, (uint64_t)NE * F, E, &gate_w);
         up_off = arena_tier(a, wtype, (uint64_t)NE * F, E, &up_w);
-        down_off = arena_q8(a, (uint64_t)NE * E, F, &down_w, 0.05f);
-        sg_off = arena_q8(a, F, E, &sg_w, 0.05f);
-        su_off = arena_q8(a, F, E, &su_w, 0.05f);
-        sd_off = arena_q8(a, E, F, &sd_w, 0.05f);
+        down_off = arena_q8_0(a, (uint64_t)NE * E, F, &down_w, 0.05f);
+        sg_off = arena_q8_0(a, F, E, &sg_w, 0.05f);
+        su_off = arena_q8_0(a, F, E, &su_w, 0.05f);
+        sd_off = arena_q8_0(a, E, F, &sd_w, 0.05f);
     } else {
         gate_off = arena_f32(a, (uint64_t)NE * F * E, &gate_w, -0.05f, 0.05f);
         up_off = arena_f32(a, (uint64_t)NE * F * E, &up_w, -0.05f, 0.05f);
@@ -1235,7 +1256,6 @@ static void test_moe(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, uint32
     ds4_gpu_tensor *gpart = upload(NULL, (uint64_t)T * n_out * E);
     ds4_gpu_tensor *gsg = upload(sgate, T);
     ds4_gpu_tensor *gout = upload(NULL, (uint64_t)T * E);
-    const uint32_t dtype = q8 ? 8u : 0u;   /* down and shared stay q8_0 / f32 */
     require_ok(ds4_gpu_qwen4_moe_mid_tensor(gmid, gx, gsel, a->base, a->size, gate_off, up_off, wtype, NE, T, slots, E, F,
                                             sg_off, su_off, dtype), "moe mid");
     require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, down_off, dtype, NE, T, slots, F, E,
@@ -1256,15 +1276,16 @@ static void test_moe(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, uint32
     ds4_gpu_tensor *gR = upload(R0, (uint64_t)T * 4 * E);
     ds4_gpu_tensor *ginj = upload(injv, (uint64_t)T * 4 * CH * 4);
     require_ok(ds4_gpu_qwen4_moe_reduce_tensor(gout, gpart, gw, gsg, NULL, gR, ginj, T, slots, n_out, E, 4), "moe reduce");
-    snprintf(name, sizeof(name), "moe %s E=%u F=%u slots=%u T=%u: reduce+combine", q8 ? "q8_0" : "f32", E, F, slots, T);
-    float *gotR = download(gR, (uint64_t)T * 4 * E); check_close(name, gotR, R_ref, (uint64_t)T * 4 * E, 2e-5); free(gotR);
+    const char *dname = q8 ? "q8_0" : "f32";
+    snprintf(name, sizeof(name), "moe %s E=%u F=%u slots=%u T=%u: reduce+combine", dname, E, F, slots, T);
+    check_tensor(name, gR, R_ref, (uint64_t)T * 4 * E, 2e-5);
     ds4_gpu_tensor_free(ginj); ds4_gpu_tensor_free(gR); free(R_ref); free(injv); free(R0);
     snprintf(name, sizeof(name), "moe %s E=%u F=%u slots=%u T=%u: mid (+shared)", tier_name, E, F, slots, T);
-    float *got = download(gmid, (uint64_t)T * n_out * F); check_close(name, got, mid, (uint64_t)T * n_out * F, 2e-5); free(got);
-    snprintf(name, sizeof(name), "moe %s E=%u F=%u slots=%u T=%u: down (+shared)", q8 ? "q8_0" : "f32", E, F, slots, T);
-    got = download(gpart, (uint64_t)T * n_out * E); check_close(name, got, part, (uint64_t)T * n_out * E, 2e-5); free(got);
-    snprintf(name, sizeof(name), "moe %s E=%u F=%u slots=%u T=%u: out", q8 ? "q8_0" : "f32", E, F, slots, T);
-    got = download(gout, (uint64_t)T * E); check_close(name, got, out, (uint64_t)T * E, 2e-5); free(got);
+    check_tensor(name, gmid, mid, (uint64_t)T * n_out * F, 2e-5);
+    snprintf(name, sizeof(name), "moe %s E=%u F=%u slots=%u T=%u: down (+shared)", dname, E, F, slots, T);
+    check_tensor(name, gpart, part, (uint64_t)T * n_out * E, 2e-5);
+    snprintf(name, sizeof(name), "moe %s E=%u F=%u slots=%u T=%u: out", dname, E, F, slots, T);
+    check_tensor(name, gout, out, (uint64_t)T * E, 2e-5);
     if (q8 && (E % 64) == 0 && (F % 64) == 0) {
         /* prefill path: lists + tiled GEMMs over routed slots only (f16 tiles) */
         ds4_gpu_tensor *glists = ds4_gpu_tensor_alloc((uint64_t)NE * T * 4);
@@ -1272,14 +1293,16 @@ static void test_moe(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, uint32
         ds4_gpu_tensor *gmid2 = upload(NULL, (uint64_t)T * slots * F);
         ds4_gpu_tensor *gpart2 = upload(NULL, (uint64_t)T * slots * E);
         require_ok(ds4_gpu_qwen4_moe_build_lists_tensor(glists, gcounts, gsel, T, slots, NE, T), "moe lists");
-        require_ok(ds4_gpu_qwen4_moe_mm_mid_tensor(gmid2, gx, glists, gcounts, a->base, a->size, gate_off, up_off, wtype, NE, T, slots, slots, E, F, T), "moe mm mid");
-        require_ok(ds4_gpu_qwen4_moe_mm_down_tensor(gpart2, gmid2, glists, gcounts, a->base, a->size, down_off, dtype, NE, T, slots, slots, F, E, T), "moe mm down");
+        require_ok(ds4_gpu_qwen4_moe_mm_mid_tensor(gmid2, gx, glists, gcounts, a->base, a->size, gate_off, up_off, wtype,
+                                                   NE, T, slots, slots, E, F, T), "moe mm mid");
+        require_ok(ds4_gpu_qwen4_moe_mm_down_tensor(gpart2, gmid2, glists, gcounts, a->base, a->size, down_off, dtype,
+                                                    NE, T, slots, slots, F, E, T), "moe mm down");
         double *mid_r = malloc((uint64_t)T * slots * F * sizeof(double));
         double *part_r = malloc((uint64_t)T * slots * E * sizeof(double));
-        for (uint32_t tk = 0; tk < T; tk++)
+        for (uint32_t t = 0; t < T; t++)
             for (uint32_t s = 0; s < slots; s++) {
-                memcpy(mid_r + ((uint64_t)tk * slots + s) * F, mid + ((uint64_t)tk * n_out + s) * F, F * sizeof(double));
-                memcpy(part_r + ((uint64_t)tk * slots + s) * E, part + ((uint64_t)tk * n_out + s) * E, E * sizeof(double));
+                memcpy(mid_r + ((uint64_t)t * slots + s) * F, mid + ((uint64_t)t * n_out + s) * F, F * sizeof(double));
+                memcpy(part_r + ((uint64_t)t * slots + s) * E, part + ((uint64_t)t * n_out + s) * E, E * sizeof(double));
             }
         int32_t *cnt = malloc((uint64_t)NE * 4);
         require_ok(ds4_gpu_tensor_read(gcounts, 0, cnt, (uint64_t)NE * 4), "counts read");
@@ -1288,9 +1311,9 @@ static void test_moe(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, uint32
         if (total != (int)(T * slots)) { fprintf(stderr, "moe lists: %d pairs != %u\n", total, T * slots); exit(1); }
         free(cnt);
         snprintf(name, sizeof(name), "moe mm %s E=%u F=%u slots=%u T=%u: mid", tier_name, E, F, slots, T);
-        got = download(gmid2, (uint64_t)T * slots * F); check_close(name, got, mid_r, (uint64_t)T * slots * F, 3e-3); free(got);
+        check_tensor(name, gmid2, mid_r, (uint64_t)T * slots * F, 3e-3);
         snprintf(name, sizeof(name), "moe mm %s E=%u F=%u slots=%u T=%u: down", tier_name, E, F, slots, T);
-        got = download(gpart2, (uint64_t)T * slots * E); check_close(name, got, part_r, (uint64_t)T * slots * E, 3e-3); free(got);
+        check_tensor(name, gpart2, part_r, (uint64_t)T * slots * E, 3e-3);
         free(part_r); free(mid_r);
         ds4_gpu_tensor_free(gpart2); ds4_gpu_tensor_free(gmid2); ds4_gpu_tensor_free(gcounts); ds4_gpu_tensor_free(glists);
     }
@@ -1317,7 +1340,7 @@ static void test_mtp(arena_t *a, uint32_t E, uint32_t hc) {
     double inv = 1.0 / sqrt(ss / E + eps);
     for (uint32_t i = 0; i < E; i++) cat[i] = e[i] * inv * g_e[i];
     double full = 0.0;
-    for (uint32_t i = 0; i < (uint64_t)hc * E; i++) full += (double)R[i] * R[i];
+    for (uint32_t i = 0; i < hc * E; i++) full += (double)R[i] * R[i];
     inv = 1.0 / sqrt(full / ((double)hc * E) + eps);
     for (uint32_t s = 0; s < hc; s++) {
         for (uint32_t i = 0; i < E; i++) {
@@ -1334,9 +1357,9 @@ static void test_mtp(arena_t *a, uint32_t E, uint32_t hc) {
     require_ok(ds4_gpu_qwen4_mtp_combine_tensor(gout, gproj, E, hc), "mtp combine");
     char name[96];
     snprintf(name, sizeof(name), "mtp stage E=%u hc=%u", E, hc);
-    float *got = download(gcat, (uint64_t)(hc + 1u) * 2u * E); check_close(name, got, cat, (uint64_t)(hc + 1u) * 2u * E, 1e-5); free(got);
+    check_tensor(name, gcat, cat, (uint64_t)(hc + 1u) * 2u * E, 1e-5);
     snprintf(name, sizeof(name), "mtp combine E=%u hc=%u", E, hc);
-    got = download(gout, (uint64_t)hc * E); check_close(name, got, R_ref, (uint64_t)hc * E, 1e-6); free(got);
+    check_tensor(name, gout, R_ref, (uint64_t)hc * E, 1e-6);
     ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gproj); ds4_gpu_tensor_free(gcat); ds4_gpu_tensor_free(gR); ds4_gpu_tensor_free(ge);
     free(R_ref); free(cat); free(proj); free(R); free(e); free(g_e); free(g_h);
 }
@@ -1370,8 +1393,8 @@ static double bench_run(const char *name, bench_fn fn, void *ud, uint32_t reps) 
 typedef struct {
     arena_t *a;
     uint64_t off[12];
-    ds4_gpu_tensor *t[44];
-    uint32_t n[8];
+    ds4_gpu_tensor *t[43];
+    uint32_t n[3];
 } bench_ctx;
 
 static int bench_q8_small(void *ud) { bench_ctx *c = ud; return ds4_gpu_matmul_q8_0_tensor(c->t[1], c->a->base, c->a->size, c->off[0], 2560, 48, c->t[0], 1); }
@@ -1391,7 +1414,7 @@ static int bench_gdn_front(void *ud) {
     return ds4_gpu_qwen4_gdn_front_tensor(c->t[11], c->t[12], c->t[0], c->t[13], c->t[14], c->a->base, c->a->size,
                                           c->off[6], c->off[0], c->off[0], c->off[7], c->off[7], 8u, 1, 16, 48, 128, 4, 2560, NULL, 0u);
 }
-static int bench_gdn_old(void *ud) {
+static int bench_gdn_unfused(void *ud) {
     bench_ctx *c = ud;
     return ds4_gpu_matmul_q8_0_tensor(c->t[13], c->a->base, c->a->size, c->off[0], 2560, 48, c->t[0], 1) &&
            ds4_gpu_matmul_q8_0_tensor(c->t[14], c->a->base, c->a->size, c->off[0], 2560, 48, c->t[0], 1) &&
@@ -1457,8 +1480,8 @@ static int bench_gdn_scan(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_gd
 static void bench_dispatch(arena_t *a) {
     bench_ctx c = { .a = a };
     double *sh;
-    c.off[0] = arena_q8(a, 48, 2560, &sh, 0.05f); free(sh);
-    c.off[1] = arena_q8(a, 6144, 2560, &sh, 0.05f); free(sh);
+    c.off[0] = arena_q8_0(a, 48, 2560, &sh, 0.05f); free(sh);
+    c.off[1] = arena_q8_0(a, 6144, 2560, &sh, 0.05f); free(sh);
     c.off[2] = arena_f32(a, 10240, &sh, 0.5f, 1.5f); free(sh);
     c.off[3] = arena_f16(a, 320ull * 10240, &sh, 0.05f); free(sh);
     c.off[4] = arena_f16(a, 4ull * 10240, &sh, 0.05f); free(sh);
@@ -1475,15 +1498,9 @@ static void bench_dispatch(arena_t *a) {
     c.t[9] = ds4_gpu_tensor_alloc(4096ull * 512 * 2);  /* v cache f16 */
     c.t[10] = upload(NULL, ds4_gpu_qwen4_attn_part_floats(2, 24, 256));
     c.t[12] = upload(NULL, 3 * 10240);              /* conv state */
-    c.off[8] = arena_q8(a, 16ull * 640, 2560, &sh, 0.05f); free(sh);   /* 16 experts gate */
-    c.off[9] = arena_q8(a, 16ull * 640, 2560, &sh, 0.05f); free(sh);   /* up */
-    c.off[10] = arena_q8(a, 16ull * 2560, 640, &sh, 0.05f); free(sh);  /* down */
-    {
-        int32_t sel[10];
-        for (int i = 0; i < 10; i++) sel[i] = (i * 3) % 16;
-        c.t[16] = ds4_gpu_tensor_alloc(10 * 4);
-        require_ok(ds4_gpu_tensor_write(c.t[16], 0, sel, 10 * 4), "sel write");
-    }
+    c.off[8] = arena_q8_0(a, 16ull * 640, 2560, &sh, 0.05f); free(sh);   /* 16 experts gate */
+    c.off[9] = arena_q8_0(a, 16ull * 640, 2560, &sh, 0.05f); free(sh);   /* up */
+    c.off[10] = arena_q8_0(a, 16ull * 2560, 640, &sh, 0.05f); free(sh);  /* down */
     c.off[11] = arena_f32(a, 512ull * 2560, &sh, -0.05f, 0.05f); free(sh);
     c.t[18] = upload(NULL, 256ull * 2560);        /* x for 256 tokens */
     c.t[19] = upload(NULL, 256ull * 10240);       /* wide scratch */
@@ -1509,9 +1526,11 @@ static void bench_dispatch(arena_t *a) {
         const uint64_t kv_n = 262144ull * 512;
         _Float16 *kv = malloc(kv_n * 2);
         for (uint64_t i = 0; i < kv_n; i++) kv[i] = (_Float16)(frand() - 0.5f);
-        c.t[31] = ds4_gpu_tensor_alloc(kv_n * 2); ds4_gpu_tensor_write(c.t[31], 0, kv, kv_n * 2);
+        c.t[31] = ds4_gpu_tensor_alloc(kv_n * 2);
+        require_ok(c.t[31] && ds4_gpu_tensor_write(c.t[31], 0, kv, kv_n * 2), "k cache write");
         for (uint64_t i = 0; i < kv_n; i += 7) kv[i] = (_Float16)(frand() - 0.5f);
-        c.t[32] = ds4_gpu_tensor_alloc(kv_n * 2); ds4_gpu_tensor_write(c.t[32], 0, kv, kv_n * 2);
+        c.t[32] = ds4_gpu_tensor_alloc(kv_n * 2);
+        require_ok(c.t[32] && ds4_gpu_tensor_write(c.t[32], 0, kv, kv_n * 2), "v cache write");
         free(kv);
         float *qf = malloc(1024ull * 6144 * 4);
         for (int i = 0; i < 1024 * 6144; i++) qf[i] = frand() - 0.5f;
@@ -1526,18 +1545,30 @@ static void bench_dispatch(arena_t *a) {
                 const uint32_t lo = variant ? n_blocks - 2048 : 0, span = n_blocks - lo;
                 uint32_t blocks[512];
                 for (int i = 0; i < 512; i++) {
-                    uint32_t b; int dup;
-                    do { b = lo + (uint32_t)(frand() * span) % span; dup = 0; for (int j = 0; j < i; j++) if (blocks[j] == b) { dup = 1; break; } } while (dup);
+                    uint32_t b;
+                    bool dup;
+                    do {
+                        b = lo + (uint32_t)((frand() + 1.0f) * 0.5f * span) % span;
+                        dup = false;
+                        for (int j = 0; j < i && !dup; j++) dup = blocks[j] == b;
+                    } while (dup);
                     blocks[i] = b;
                 }
-                for (int i = 1; i < 512; i++) { uint32_t b = blocks[i]; int j = i - 1; while (j >= 0 && blocks[j] > b) { blocks[j + 1] = blocks[j]; j--; } blocks[j + 1] = b; }
-                for (int i = 0; i < 512; i++) for (int r = 0; r < 4; r++) sel[(uint64_t)t * 2052 + i * 4 + r] = (int32_t)(blocks[i] * 4 + r);
+                for (int i = 1; i < 512; i++) {
+                    const uint32_t b = blocks[i];
+                    int j = i - 1;
+                    while (j >= 0 && blocks[j] > b) { blocks[j + 1] = blocks[j]; j--; }
+                    blocks[j + 1] = b;
+                }
+                for (int i = 0; i < 512; i++)
+                    for (int r = 0; r < 4; r++) sel[(uint64_t)t * 2052 + i * 4 + r] = (int32_t)(blocks[i] * 4 + r);
                 cnt[t] = 2048;
             }
             c.t[35 + variant] = ds4_gpu_tensor_alloc(1024ull * 2052 * 4);
-            ds4_gpu_tensor_write(c.t[35 + variant], 0, sel, 1024ull * 2052 * 4);
+            require_ok(c.t[35 + variant] && ds4_gpu_tensor_write(c.t[35 + variant], 0, sel, 1024ull * 2052 * 4), "sel write");
         }
-        c.t[38] = ds4_gpu_tensor_alloc(1024 * 4); ds4_gpu_tensor_write(c.t[38], 0, cnt, 1024 * 4);
+        c.t[38] = ds4_gpu_tensor_alloc(1024 * 4);
+        require_ok(c.t[38] && ds4_gpu_tensor_write(c.t[38], 0, cnt, 1024 * 4), "cnt write");
         c.t[37] = upload(NULL, 1024ull * 6144);
         free(sel); free(cnt);
     }
@@ -1548,12 +1579,14 @@ static void bench_dispatch(arena_t *a) {
     {   /* random queries and keys: the select bench needs a real score spread */
         float *q = malloc(1024ull * 512 * 4);
         for (int i = 0; i < 1024 * 512; i++) q[i] = frand() - 0.5f;
-        ds4_gpu_tensor_write(c.t[28], 0, q, 1024ull * 512 * 4); free(q);
+        require_ok(ds4_gpu_tensor_write(c.t[28], 0, q, 1024ull * 512 * 4), "indexer q write");
+        free(q);
         _Float16 *k = malloc(65536ull * 128 * 2);
         for (int i = 0; i < 65536 * 128; i++) k[i] = (_Float16)(frand() - 0.5f);
-        ds4_gpu_tensor_write(c.t[25], 0, k, 65536ull * 128 * 2); free(k);
+        require_ok(c.t[25] && ds4_gpu_tensor_write(c.t[25], 0, k, 65536ull * 128 * 2), "block key write");
+        free(k);
     }
-    {
+    {   /* expert lists for the T=256 moe benches; the decode benches use the first 10 */
         int32_t *sel = malloc(256 * 10 * 4);
         for (int i = 0; i < 256 * 10; i++) sel[i] = (i * 7) % 16;
         c.t[16] = ds4_gpu_tensor_alloc(256 * 10 * 4);
@@ -1574,7 +1607,7 @@ static void bench_dispatch(arena_t *a) {
     c.n[0] = 2000; c.n[1] = 0; bench_run("attn_decode pos=2000 no split", bench_attn, &c, 50);
     c.n[0] = 2000; c.n[1] = 1; bench_run("attn_decode pos=2000 split", bench_attn, &c, 50);
     bench_run("gdn_front (fused)", bench_gdn_front, &c, 100);
-    bench_run("gdn gemv a/b + conv + prep (prefill path)", bench_gdn_old, &c, 100);
+    bench_run("gdn gemv a/b + conv + prep (prefill path)", bench_gdn_unfused, &c, 100);
     bench_run("gdn_scan", bench_gdn_scan, &c, 100);
     printf("  --- prefill T=256 ---\n");
     bench_run("router f32 512x2560 T=256 (DS4)", bench_p_router_f32, &c, 20);
@@ -1592,7 +1625,8 @@ static void bench_dispatch(arena_t *a) {
     {   /* decays in (0,1], betas in (0,1) for the scan benches */
         float *g = malloc(1024 * 48 * 4), *b = malloc(1024 * 48 * 4);
         for (int i = 0; i < 1024 * 48; i++) { g[i] = 0.9f + 0.1f * frand(); b[i] = 0.5f * frand() + 0.25f; }
-        ds4_gpu_tensor_write(c.t[13], 0, g, 1024 * 48 * 4); ds4_gpu_tensor_write(c.t[14], 0, b, 1024 * 48 * 4);
+        require_ok(ds4_gpu_tensor_write(c.t[13], 0, g, 1024 * 48 * 4) && ds4_gpu_tensor_write(c.t[14], 0, b, 1024 * 48 * 4),
+                   "scan input write");
         free(g); free(b);
     }
     bench_run("gdn scan r4 T=1024", bench_p_gdn_r4, &c, 5);
@@ -1622,7 +1656,7 @@ static void test_multi_gemv(arena_t *a, uint32_t E, uint32_t T) {
     const uint32_t types[4] = { E % 256 == 0 ? 12u : 8u, 30u, 2u, 1u };
     double *sh[4];
     uint64_t offs[4];
-    offs[0] = E % 256 == 0 ? arena_q4_K(a, rows[0], E, &sh[0], 0.05f) : arena_q8(a, rows[0], E, &sh[0], 0.05f);
+    offs[0] = E % 256 == 0 ? arena_q4_K(a, rows[0], E, &sh[0], 0.05f) : arena_q8_0(a, rows[0], E, &sh[0], 0.05f);
     offs[1] = arena_bf16(a, (uint64_t)rows[1] * E, &sh[1], 0.05f);
     offs[2] = arena_q4_0(a, rows[2], E, &sh[2], 0.05f);
     offs[3] = arena_f16(a, (uint64_t)rows[3] * E, &sh[3], 0.05f);
@@ -1633,17 +1667,16 @@ static void test_multi_gemv(arena_t *a, uint32_t E, uint32_t T) {
     require_ok(ds4_gpu_qwen4_multi_gemv_tensor(gx, T, E, 4, outs, a->base, a->size, offs, types, rows), "multi gemv");
     for (int i = 0; i < 4; i++) {
         double *ref = malloc((uint64_t)T * rows[i] * sizeof(double));
-        for (uint32_t tk = 0; tk < T; tk++)
+        for (uint32_t t = 0; t < T; t++)
             for (uint32_t r = 0; r < rows[i]; r++) {
                 double acc = 0.0;
-                for (uint32_t k = 0; k < E; k++) acc += sh[i][(uint64_t)r * E + k] * x[(uint64_t)tk * E + k];
-                ref[(uint64_t)tk * rows[i] + r] = acc;
+                for (uint32_t k = 0; k < E; k++) acc += sh[i][(uint64_t)r * E + k] * x[(uint64_t)t * E + k];
+                ref[(uint64_t)t * rows[i] + r] = acc;
             }
         char name[96];
         snprintf(name, sizeof(name), "multi gemv out%d type %u rows %u T=%u", i, types[i], rows[i], T);
-        float *got = download(outs[i], (uint64_t)T * rows[i]);
-        check_close(name, got, ref, (uint64_t)T * rows[i], 3e-5);
-        free(got); free(ref); free(sh[i]); ds4_gpu_tensor_free(outs[i]);
+        check_tensor(name, outs[i], ref, (uint64_t)T * rows[i], 3e-5);
+        free(ref); free(sh[i]); ds4_gpu_tensor_free(outs[i]);
     }
     ds4_gpu_tensor_free(gx); free(x);
 }
@@ -1651,7 +1684,7 @@ static void test_multi_gemv(arena_t *a, uint32_t E, uint32_t T) {
 /* dense tiled GEMM against a double reference for f32, f16 and q8_0 rows */
 static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T, uint32_t wtype) {
     double *sh;
-    uint64_t off = wtype == 8u ? arena_q8(a, rows, in_dim, &sh, 0.05f)
+    uint64_t off = wtype == 8u ? arena_q8_0(a, rows, in_dim, &sh, 0.05f)
                  : wtype == 1u ? arena_f16(a, (uint64_t)rows * in_dim, &sh, 0.05f)
                                : arena_f32(a, (uint64_t)rows * in_dim, &sh, -0.05f, 0.05f);
     float *x = rand_vec((uint64_t)T * in_dim, 1.0f);
@@ -1667,9 +1700,8 @@ static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T
     require_ok(ds4_gpu_qwen4_dense_mm_tensor(gout, gx, a->base, a->size, off, wtype, T, in_dim, rows), "dense mm");
     char name[96];
     snprintf(name, sizeof(name), "dense mm type %u %ux%u T=%u", wtype, rows, in_dim, T);
-    float *got = download(gout, (uint64_t)T * rows);
-    check_close(name, got, ref, (uint64_t)T * rows, 3e-5);
-    free(got); free(ref); free(x); free(sh);
+    check_tensor(name, gout, ref, (uint64_t)T * rows, 3e-5);
+    free(ref); free(x); free(sh);
     ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gx);
 }
 
@@ -1719,17 +1751,14 @@ int main(void) {
     test_attention(&arena, 24, 2, 256, 64, 4, 128, 2, 21);
     test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
     printf("routed experts\n");
-    test_moe(&arena, 16, 10, 2560, 640, 2, true);
-    test_moe(&arena, 16, 10, 2560, 640, 37, true);
-    test_moe(&arena, 16, 10, 2560, 640, 100, true);
-    g_moe_tier = 10u;
-    test_moe(&arena, 16, 10, 2560, 640, 37, true);
-    g_moe_tier = 16u;
-    test_moe(&arena, 16, 10, 2560, 640, 37, true);
-    g_moe_tier = 12u;
-    test_moe(&arena, 8, 10, 2560, 640, 1, false);
-    test_moe(&arena, 32, 10, 64, 32, 3, true);
-    test_moe(&arena, 32, 10, 64, 32, 3, false);
+    test_moe(&arena, 16, 10, 2560, 640, 2, 8u);
+    test_moe(&arena, 16, 10, 2560, 640, 37, 12u);
+    test_moe(&arena, 16, 10, 2560, 640, 100, 12u);
+    test_moe(&arena, 16, 10, 2560, 640, 37, 10u);
+    test_moe(&arena, 16, 10, 2560, 640, 37, 16u);
+    test_moe(&arena, 8, 10, 2560, 640, 1, 0u);
+    test_moe(&arena, 32, 10, 64, 32, 3, 8u);
+    test_moe(&arena, 32, 10, 64, 32, 3, 0u);
     printf("dense mm\n");
     test_dense_mm(&arena, 2560, 512, 37, 0u);
     test_dense_mm(&arena, 10240, 320, 33, 1u);

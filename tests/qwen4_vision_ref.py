@@ -6,13 +6,15 @@
 2. Runs tests/test_qwen4_vision with the mmproj GGUF on the same image.
 3. Reports per-token cosine similarity and max abs difference.
 
-Usage: python vision_ref.py --snapshot DIR --mmproj FILE --image FILE [--max-tokens N]
+Usage: python tests/qwen4_vision_ref.py --snapshot DIR --mmproj FILE --image FILE [--max-tokens N]
 """
 import argparse
+import json
 import os
 import struct
 import subprocess
 import sys
+import tempfile
 
 import numpy as np
 
@@ -28,7 +30,6 @@ def hf_embeddings(snapshot, image_path, min_tokens, max_tokens):
     cfg = AutoConfig.from_pretrained(snapshot).vision_config
     cfg._attn_implementation = "eager"
     model = Qwen4ExpVisionModel(cfg).float().eval()
-    import json
     weight_map = json.load(open(os.path.join(snapshot, "model.safetensors.index.json")))["weight_map"]
     shards = sorted({shard for key, shard in weight_map.items() if key.startswith("model.visual.")})
     state = {}
@@ -64,18 +65,17 @@ def ds4_embeddings(binary, mmproj, image_path, out_path, min_tokens, max_tokens)
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--snapshot", required=True)
     ap.add_argument("--mmproj", required=True)
     ap.add_argument("--image", required=True)
-    ap.add_argument("--binary", default=os.path.join(os.path.dirname(__file__), "..", "test_qwen4_vision"))
+    ap.add_argument("--binary", default=os.path.join(os.path.dirname(__file__), "test_qwen4_vision"))
     ap.add_argument("--min-tokens", type=int, default=64)
     ap.add_argument("--max-tokens", type=int, default=1024)
     ap.add_argument("--out", default=None, help="DS4 embedding dump path (default: a temp file)")
     ap.add_argument("--min-cos", type=float, default=0.99)
     args = ap.parse_args()
     if args.out is None:
-        import tempfile
         args.out = os.path.join(tempfile.mkdtemp(prefix="qwen4-vision-"), "embeddings.bin")
 
     ds4, ds4_grid = ds4_embeddings(args.binary, args.mmproj, args.image, args.out, args.min_tokens, args.max_tokens)

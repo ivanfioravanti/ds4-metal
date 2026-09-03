@@ -259,13 +259,8 @@ typedef struct {
 typedef enum {
     AGENT_TOOL_SYNTAX_DSML,
     AGENT_TOOL_SYNTAX_GLM,
-    AGENT_TOOL_SYNTAX_QWEN,   /* <tool_call><function=..><parameter=..> */
+    AGENT_TOOL_SYNTAX_QWEN,
 } agent_tool_syntax;
-
-/* GLM and Qwen both open a call with <tool_call> and render as chat messages */
-static inline bool agent_syntax_is_xml_tool_call(agent_tool_syntax syntax) {
-    return syntax != AGENT_TOOL_SYNTAX_DSML;
-}
 
 typedef enum {
     AGENT_DSML_SEARCH,
@@ -385,6 +380,11 @@ static agent_tool_syntax agent_tool_syntax_for_engine(ds4_engine *engine) {
 
 static bool agent_tool_syntax_assistant_turn_uses_eos(agent_tool_syntax syntax) {
     return syntax != AGENT_TOOL_SYNTAX_GLM;
+}
+
+/* GLM and Qwen both open a call with <tool_call> and render as chat messages */
+static bool agent_syntax_is_xml_tool_call(agent_tool_syntax syntax) {
+    return syntax != AGENT_TOOL_SYNTAX_DSML;
 }
 
 static void agent_worker_append_assistant_turn_end(agent_worker *w) {
@@ -1328,26 +1328,28 @@ static const char agent_qwen_tools_prompt_after_schemas[] =
     "- Use whole=true only when the user explicitly asks for the complete file contents or when bounded chunks are insufficient for the task; add raw=true only when line numbers would corrupt the payload.\n"
     "- " AGENT_EDIT_TARGET_RULE "\n";
 
-/* the shared schema list, one {"type": "function", "function": ...} per line */
+/* the GLM schema list, each line wrapped as {"type": "function", "function": ...} */
 static char *agent_build_qwen_tools_prompt(bool edit_upto) {
+    static const char wrap[] = "\n{\"type\": \"function\", \"function\": ";
     const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
                                  : agent_glm_tools_prompt_edit_exact;
     size_t lines = 1;
     for (const char *q = agent_glm_tool_schemas; *q; q++) lines += *q == '\n';
-    size_t cap = strlen(agent_qwen_tools_prompt_intro) + strlen(agent_qwen_tools_prompt_after_schemas) +
-                 strlen(edit) + strlen(agent_glm_tools_prompt_rules_tail) + strlen(agent_glm_tool_schemas) + 48 * lines;
+    size_t cap = strlen(agent_qwen_tools_prompt_intro) +
+                 strlen(agent_glm_tool_schemas) + lines * sizeof(wrap) +
+                 strlen(agent_qwen_tools_prompt_after_schemas) + strlen(edit) +
+                 strlen(agent_glm_tools_prompt_rules_tail) + 1;
     char *out = xmalloc(cap);
-    size_t n = 0;
-    n += (size_t)snprintf(out + n, cap - n, "%s", agent_qwen_tools_prompt_intro);
+    size_t n = (size_t)snprintf(out, cap, "%s", agent_qwen_tools_prompt_intro);
     const char *p = agent_glm_tool_schemas;
     while (*p) {
         const char *nl = strchr(p, '\n');
         size_t len = nl ? (size_t)(nl - p) : strlen(p);
-        if (len) n += (size_t)snprintf(out + n, cap - n, "\n{\"type\": \"function\", \"function\": %.*s}", (int)len, p);
+        if (len) n += (size_t)snprintf(out + n, cap - n, "%s%.*s}", wrap, (int)len, p);
         p += len + (nl ? 1 : 0);
     }
-    n += (size_t)snprintf(out + n, cap - n, "%s%s%s", agent_qwen_tools_prompt_after_schemas, edit,
-                          agent_glm_tools_prompt_rules_tail);
+    snprintf(out + n, cap - n, "%s%s%s", agent_qwen_tools_prompt_after_schemas, edit,
+             agent_glm_tools_prompt_rules_tail);
     return out;
 }
 
@@ -2026,34 +2028,15 @@ static void agent_glm_tool_parse(agent_dsml_parser *p) {
     }
 }
 
-static void agent_dsml_finish(agent_dsml_parser *p) {
-    if (!p || p->state == AGENT_DSML_DONE || p->state == AGENT_DSML_ERROR)
-        return;
-    if (!agent_syntax_is_xml_tool_call(p->syntax) || !p->glm_after_call)
-        return;
-
-    while (p->parse_pos < p->raw_len &&
-           (p->raw[p->parse_pos] == ' ' || p->raw[p->parse_pos] == '\t' ||
-            p->raw[p->parse_pos] == '\r' || p->raw[p->parse_pos] == '\n'))
-        p->parse_pos++;
-    if (p->parse_pos >= p->raw_len) {
-        p->glm_after_call = false;
-        p->state = AGENT_DSML_DONE;
-    }
-}
-
-/* Parse as much of the accumulated DSML buffer as possible.  The parser can be
- * called after every streamed byte: incomplete input leaves state unchanged
- * until enough bytes arrive, while malformed completed input switches to
- * AGENT_DSML_ERROR so the model gets a retryable tool error. */
-/* A Qwen parameter value is JSON when it is a whole number, true/false/null,
- * or a bracketed object/array; everything else stays a string. */
+/* A Qwen parameter value is JSON when it is a number, true/false/null, or a
+ * bracketed object/array; everything else stays a string. */
 static bool agent_qwen_value_is_json(const char *v, size_t n) {
     while (n && (v[0] == ' ' || v[0] == '\t')) { v++; n--; }
     while (n && (v[n - 1] == ' ' || v[n - 1] == '\t' || v[n - 1] == '\n')) n--;
     if (!n) return false;
     if ((v[0] == '{' && v[n - 1] == '}') || (v[0] == '[' && v[n - 1] == ']')) return true;
-    if ((n == 4 && !memcmp(v, "true", 4)) || (n == 5 && !memcmp(v, "false", 5)) || (n == 4 && !memcmp(v, "null", 4)))
+    if ((n == 4 && !memcmp(v, "true", 4)) || (n == 5 && !memcmp(v, "false", 5)) ||
+        (n == 4 && !memcmp(v, "null", 4)))
         return true;
     char tmp[64];
     if (n >= sizeof(tmp)) return false;
@@ -2183,6 +2166,26 @@ static void agent_qwen_tool_parse(agent_dsml_parser *p) {
     }
 }
 
+static void agent_dsml_finish(agent_dsml_parser *p) {
+    if (!p || p->state == AGENT_DSML_DONE || p->state == AGENT_DSML_ERROR)
+        return;
+    if (!agent_syntax_is_xml_tool_call(p->syntax) || !p->glm_after_call)
+        return;
+
+    while (p->parse_pos < p->raw_len &&
+           (p->raw[p->parse_pos] == ' ' || p->raw[p->parse_pos] == '\t' ||
+            p->raw[p->parse_pos] == '\r' || p->raw[p->parse_pos] == '\n'))
+        p->parse_pos++;
+    if (p->parse_pos >= p->raw_len) {
+        p->glm_after_call = false;
+        p->state = AGENT_DSML_DONE;
+    }
+}
+
+/* Parse as much of the accumulated DSML buffer as possible.  The parser can be
+ * called after every streamed byte: incomplete input leaves state unchanged
+ * until enough bytes arrive, while malformed completed input switches to
+ * AGENT_DSML_ERROR so the model gets a retryable tool error. */
 static void agent_dsml_parse(agent_dsml_parser *p) {
     if (p->syntax == AGENT_TOOL_SYNTAX_QWEN) {
         agent_qwen_tool_parse(p);
@@ -4841,10 +4844,11 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
 static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
     ds4_chat_begin(w->engine, out);
     ds4_think_mode think_mode = effective_think_mode(w->cfg);
-    if (agent_tool_syntax_for_engine(w->engine) == AGENT_TOOL_SYNTAX_QWEN) {
+    const agent_tool_syntax syntax = agent_tool_syntax_for_engine(w->engine);
+    if (syntax == AGENT_TOOL_SYNTAX_QWEN) {
         const char *effort = ds4_qwen4_reasoning_effort_text(think_mode);
         if (effort) ds4_chat_append_message(w->engine, out, "system", effort);
-    } else if (agent_tool_syntax_for_engine(w->engine) == AGENT_TOOL_SYNTAX_GLM) {
+    } else if (syntax == AGENT_TOOL_SYNTAX_GLM) {
         const char *effort = ds4_glm_reasoning_effort_text(think_mode);
         if (effort) ds4_chat_append_message(w->engine, out, "system", effort);
     } else if (w->cfg->gen.think_mode == DS4_THINK_MAX &&
@@ -7167,7 +7171,10 @@ static void test_agent_qwen_tool_parser_two_calls_and_error(void) {
     const char *text =
         "<tool_call>\n<function=list>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>\n"
         "<tool_call>\n<function=read>\n<parameter=path>\n/tmp/x\n</parameter>\n</function>\n</tool_call>";
-    agent_dsml_parser p = { .syntax = AGENT_TOOL_SYNTAX_QWEN, .state = AGENT_DSML_SEARCH };
+    agent_dsml_parser p = {
+        .syntax = AGENT_TOOL_SYNTAX_QWEN,
+        .state = AGENT_DSML_SEARCH,
+    };
     agent_dsml_feed(&p, text, strlen(text));
     agent_dsml_finish(&p);
     AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
@@ -7177,7 +7184,10 @@ static void test_agent_qwen_tool_parser_two_calls_and_error(void) {
     agent_dsml_parser_free(&p);
 
     const char *bad = "<tool_call>\n<function=list>\n<parameter=path>\n.\n</parameter>\n</tool_call>";
-    agent_dsml_parser q = { .syntax = AGENT_TOOL_SYNTAX_QWEN, .state = AGENT_DSML_SEARCH };
+    agent_dsml_parser q = {
+        .syntax = AGENT_TOOL_SYNTAX_QWEN,
+        .state = AGENT_DSML_SEARCH,
+    };
     agent_dsml_feed(&q, bad, strlen(bad));
     agent_dsml_finish(&q);
     AGENT_TEST_ASSERT(q.state == AGENT_DSML_ERROR);
@@ -9646,8 +9656,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         {
             malformed_tool = true;
             snprintf(dsml.error, sizeof(dsml.error),
-                     tool_syntax == AGENT_TOOL_SYNTAX_GLM ?
-                     "incomplete GLM tool call" :
+                     tool_syntax == AGENT_TOOL_SYNTAX_QWEN ? "incomplete Qwen tool call" :
+                     tool_syntax == AGENT_TOOL_SYNTAX_GLM ? "incomplete GLM tool call" :
                      "incomplete DSML tool call");
         }
 
@@ -9670,15 +9680,18 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             agent_tool_observation_puts(&observation, "\n");
         } else if (malformed_tool) {
             agent_tool_observation_puts(
-                &observation, tool_syntax == AGENT_TOOL_SYNTAX_GLM ?
-                "Tool error: invalid GLM tool call: " :
+                &observation,
+                tool_syntax == AGENT_TOOL_SYNTAX_QWEN ? "Tool error: invalid Qwen tool call: " :
+                tool_syntax == AGENT_TOOL_SYNTAX_GLM ? "Tool error: invalid GLM tool call: " :
                 "Tool error: invalid DSML tool call: ");
             agent_tool_observation_puts(
                 &observation, dsml.error[0] ? dsml.error : "parse error");
             agent_tool_observation_puts(&observation, "\n");
             agent_tool_observation_puts(
-                &observation, tool_syntax == AGENT_TOOL_SYNTAX_QWEN ? agent_qwen_syntax_reminder :
-                tool_syntax == AGENT_TOOL_SYNTAX_GLM ? agent_glm_syntax_reminder : agent_dsml_syntax_reminder);
+                &observation,
+                tool_syntax == AGENT_TOOL_SYNTAX_QWEN ? agent_qwen_syntax_reminder :
+                tool_syntax == AGENT_TOOL_SYNTAX_GLM ? agent_glm_syntax_reminder :
+                agent_dsml_syntax_reminder);
         } else {
             agent_tool_observation_free(&observation);
             observation = agent_execute_tool_observation(w, &dsml.calls);

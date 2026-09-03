@@ -3285,9 +3285,9 @@ void ds4_gpu_decode_graphs_invalidate(void);
  * GDN qkv [T][2*Hk*D + Hv*D] with tiled value heads, GDN state [Hv][D][D]
  * (dv-major), KV cache [cap][Hkv*D] f16, indexer k cache [cap][Di] f32,
  * block keys [n_blocks][Di] f16. */
-/* xn = grouped RMSNorm(R) * gamma; inj_part [T][hc*QWEN4_HC_CHUNKS][n_inject] =
- * per-chunk partial inject dots (consumers apply 2*sigmoid(sum/hc)).  The low-rank
- * projection is a plain GEMV of xn; gate_mix applies silu(lo/hc) itself. */
+/* xn = grouped RMSNorm(R) * gamma.  inj_part [T][hc*DS4_QWEN4_HC_CHUNKS][n_inject]
+ * holds per-chunk partial inject dots (consumers apply 2*sigmoid(sum/hc)); the
+ * low-rank projection is a plain GEMV of xn and gate_mix applies silu(lo/hc). */
 #define DS4_QWEN4_HC_CHUNKS 8
 int ds4_gpu_qwen4_hc_norm_tensor(
         ds4_gpu_tensor *xn, ds4_gpu_tensor *inj_part, const ds4_gpu_tensor *R,
@@ -3329,8 +3329,8 @@ int ds4_gpu_qwen4_ple_conv_tensor(
         ds4_gpu_tensor *history, const void *model_map, uint64_t model_size, uint64_t weight_offset,
         uint32_t weight_type, uint32_t n_tokens, uint32_t n_channels, uint32_t conv_kernel, uint32_t dilation,
         ds4_gpu_tensor *snap_history, uint32_t snap_tok);
-/* up to four projections of x in one dispatch; weight types 0 f32, 1 f16, 2 q4_0,
- * 8 q8_0, 30 bf16, 39 mxfp4 */
+/* up to four projections of x in one dispatch; weight types 0 f32, 1 f16,
+ * 2 q4_0, 8 q8_0, 30 bf16, 39 mxfp4 */
 int ds4_gpu_qwen4_multi_gemv_tensor(
         const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t in_dim, uint32_t n_out,
         ds4_gpu_tensor *const *outs, const void *model_map, uint64_t model_size,
@@ -3393,13 +3393,15 @@ int ds4_gpu_qwen4_moe_down_tensor(
         uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
         uint32_t ff_dim, uint32_t out_dim,
         uint64_t shared_down_offset, uint32_t shared_type);
-/* shared_gate NULL: no shared expert; shared NULL: shared output is part slot n_slots;
- * otherwise `shared` [T][dim] holds it.  part_stride = slots per token in part. */
+/* shared_gate NULL: no shared expert; shared NULL: the shared output is part
+ * slot n_slots, otherwise `shared` [T][dim] holds it.  part_stride = slots per
+ * token in part. */
 int ds4_gpu_qwen4_moe_reduce_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *part, const ds4_gpu_tensor *weights,
         const ds4_gpu_tensor *shared_gate, const ds4_gpu_tensor *shared, ds4_gpu_tensor *R, const ds4_gpu_tensor *inj,
         uint32_t n_tokens, uint32_t n_slots, uint32_t part_stride, uint32_t dim, uint32_t n_hc);
-/* prefill experts: per-expert token lists, then expert-grouped tiled GEMMs (q8_0/mxfp4/q4_K/q2_K/iq2_xxs) */
+/* prefill experts: per-expert token lists, then expert-grouped tiled GEMMs
+ * (q8_0/mxfp4/q4_K/q2_K/iq2_xxs) */
 int ds4_gpu_qwen4_moe_build_lists_tensor(
         ds4_gpu_tensor *lists, ds4_gpu_tensor *counts, const ds4_gpu_tensor *selected,
         uint32_t n_tokens, uint32_t n_slots, uint32_t n_expert, uint32_t list_cap);
@@ -3439,7 +3441,8 @@ typedef struct {
 int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, const float *pos_embed, uint32_t n_patches,
                                 uint32_t grid_w, const void *model_map, uint64_t model_size,
                                 const ds4_qwen4_vision_weights *w);
-/* prefill dense GEMM (f32/f16/q8_0 rows, 32x32 tiles) and the batched hc mix pieces */
+/* prefill dense GEMM (f32/f16/q8_0 rows, 32x32 tiles) and the batched hc mix
+ * pieces */
 int ds4_gpu_qwen4_dense_mm_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type,

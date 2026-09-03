@@ -194,31 +194,29 @@ python3 gguf-tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv
 
 ## Qwen3.8 Flash Next
 
-`qwen4_exp_convert.py` wraps llama.cpp's `convert_hf_to_gguf.py` (a llama.cpp
-master checkout, b96806d96 or newer, found through `--llama-cpp` or
-`$LLAMA_CPP`; run it with a Python that has torch, safetensors and
-transformers, e.g. llama.cpp's own venv) and writes the `qwen4exp` schema DS4
-loads, including the MTP block as `blk.<n>.nextn.*`:
+`qwen4_exp_convert.py` wraps llama.cpp's `convert_hf_to_gguf.py` and writes
+the `qwen4exp` schema DS4 loads, including the MTP block as `blk.<n>.nextn.*`.
+It needs a llama.cpp master checkout (b96806d96 or newer, found through
+`--llama-cpp` or `$LLAMA_CPP`) and a Python with torch, safetensors and
+transformers, such as llama.cpp's own venv:
 
 ```sh
 python gguf-tools/qwen4_exp_convert.py --src /path/to/Qwen3.8-Flash-Next \
   --out Qwen3.8-Flash-Next-Q8.gguf --outtype q8_0
-python gguf-tools/qwen4_exp_convert.py --src ... --out Qwen3.8-Flash-Next-MXFP4.gguf \
-  --outtype q8_0 --experts mxfp4
+python gguf-tools/qwen4_exp_convert.py --src /path/to/Qwen3.8-Flash-Next \
+  --out Qwen3.8-Flash-Next-MXFP4.gguf --outtype q8_0 --experts mxfp4
 ```
 
-Options: `--outtype q8_0|f32`, `--experts q8_0|mxfp4|q4_k|f32` (routed
-experts; `--experts-down` picks the 640-wide down projection type when the
-gate/up type needs 256-wide rows), `--ngram q8_0|mxfp4|q4_0|f32` (the 51B
-parameter per-layer n-gram table), `--hc-type f16|f32|q8_0` (hyper-connection
-mixers), `--indexer bf16|f16|q8_0|f32` (the QSA indexer projections, kept at
-the released BF16 by default as every published GGUF does), `--no-mtp`,
+Options: `--outtype q8_0|f32` (dense projections), `--experts
+q8_0|mxfp4|q4_k|f32` (routed experts; `--experts-down` picks the 640-wide down
+projection type when the gate/up type needs 256-wide rows), `--ngram
+q8_0|mxfp4|q4_0|f32` (the per-layer n-gram table), `--hc-type f16|f32|q8_0`
+(hyper-connection mixers), `--indexer bf16|f16|q8_0|f32` (the QSA indexer
+projections, kept at the released BF16 by default), `--no-mtp` and
 `--dry-run`. Norms, conv kernels, `ssm_a`, dt biases and the routers stay F32.
 `gen_qwen4_unicode.py` regenerates `ds4_qwen4_unicode.inc` for the `qwen35`
 pre-tokenizer from a current `regex` release.
 
-The scripts that build the mini test model, its HF oracle fixtures and the
-parity checks live in `tests/qwen4_exp/` (each docstring says what it needs;
-the model and fixtures are generated locally). `make test-qwen4-kernels` runs
-the Metal kernel tests and `make test-qwen4-vision` checks the vision tower
-against the HF implementation.
+`make test-qwen4-kernels` runs the Metal kernel tests and
+`make test-qwen4-vision` checks the vision tower against the HF implementation
+(`tests/qwen4_vision_ref.py`).

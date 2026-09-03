@@ -1,10 +1,5 @@
 #include "ds4_kvstore.h"
 
-/* routed-expert quantizations whose checkpoints the store keys on */
-bool ds4_kvstore_quant_bits_supported(int quant_bits) {
-    return quant_bits == 2 || quant_bits == 4 || quant_bits == 5 || quant_bits == 6 || quant_bits == 8;
-}
-
 /* Shared disk KV checkpoint file support.
  *
  * The low-level file layout and payload helpers are intentionally shared.  The
@@ -417,6 +412,12 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
     kv_le_put64(h + 24, created_at);
     kv_le_put64(h + 32, last_used);
     kv_le_put64(h + 40, payload_bytes);
+}
+
+/* routed-expert quantizations whose checkpoints the store keys on */
+bool ds4_kvstore_quant_bits_supported(int quant_bits) {
+    return quant_bits == 2 || quant_bits == 4 || quant_bits == 5 ||
+           quant_bits == 6 || quant_bits == 8;
 }
 
 bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,

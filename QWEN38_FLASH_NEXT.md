@@ -1076,6 +1076,95 @@ binary16-class), and the raw chunked-matmul rates — rebuild with
 speed-bench/t2d_probe speed-bench/t2d_probe.m` and run from the repo
 root.
 
+THE PRE-M5 COUNTERPART LANDED (2026-09-03, M3 Ultra, scalar route):
+`kernel_qwen4_qsa_attention_gqa_share_f32` (+ `_legacy` twin) cuts the
+gathered-attention L2 traffic fourfold on the NON-tensor route with
+BITWISE-IDENTICAL outputs — the T2D stage win without tensor units, the
+F16 rounding, or the drift budget.  The lever is organizational only:
+the selected-block list and the rank -> simdgroup mapping (rank = sg;
+rank += nsg) depend on the query, never the head, so the row a
+simdgroup gathers is the same for all 12 sibling query heads.  The
+kernel dispatches four 256-thread threadgroups per (query, KV head)
+(group.z slices the twelve siblings into groups of three) and fuses
+each group's rank loops: the simdgroup loads its gathered K/V row once
+into registers, converts BF16 -> F32 once (exact, so every head
+multiplies the identical operand values the per-head device-load path
+produced), and runs each sibling head's dot -> simdgroup-reduce ->
+online-softmax -> PV-FMA with the incumbent's lane/dim slicing, rank
+order, and reduction order verbatim; each head's eight partials still
+combine inside one threadgroup.  No threadgroup staging tiles, no
+barriers beyond the incumbent's combine, no matmul2d, no simdgroup
+matrices — which is the lesson of the discarded variants below.
+Default ON at prefill batch sizes on the non-tensor route (the M5 T2D
+route keeps precedence); `DS4_QWEN4_QSA_GQA_SHARE=0` restores the
+per-(query, head) kernel and `DS4_QWEN4_QSA_GQA_SHARE_MIN_ROWS`
+(default 32) keeps decode and MTP-verify rows (M=1..8) on today's
+kernel shape.  NUMERICS CONTRACT: ideal class, achieved — the fixture
+A/B against the kill switch is 0/245760 mismatched floats at fixture
+magnitudes AND at production magnitudes (score spread ~+-12x12),
+through both pipeline names (probability-cache on and legacy); the
+CPU-reference max error is 1.12e-08, identical to the incumbent's.  A
+below-min-rows arm pins the small-batch shape against the CPU
+reference and a non-12-head geometry pins the gate exclusion (a broken
+gate would dispatch the constexpr-12 kernel on an 8-head map and
+diverge).  Because the kernel writes byte-identical `out` buffers, the
+model's logits and greedy generations are unchanged by construction —
+no drift re-measurement applies.
+
+HPERG (heads fused per group) is pinned to THREE as the measured
+occupancy optimum on the M3 Ultra, and the sweep is the interesting
+part (qsa-prefill-bench 8192 rows, gathered-attention ms/layer):
+incumbent 132.6; HPERG=2 82.9; HPERG=3 74.6; HPERG=4 82.2; HPERG=6
+155.5.  Wider fusion amortizes more traffic but the register-resident
+Q slices (HPERG x 8) and accumulators grow past what keeps two
+threadgroups resident per core, and the occupancy loss dominates the
+traffic win from HPERG=4 up.  Three discarded organizations are
+recorded as negative results: (a) full 12-head single-group fusion
+with everything in registers measures 802 ms/layer — the ~224-register
+demand spills catastrophically; (b) cooperative threadgroup staging of
+16-rank K/V tiles with a shared q block (the T2D kernel's
+organization, scalar arithmetic) measures 154.4 — the staging is pure
+overhead here because each gathered row is consumed by exactly ONE
+simdgroup in the preserved mapping, so threadgroup memory never
+broadcasts anything a register cannot hold (a z-split staging variant
+with six heads per group measured 197); (c) HPERG=2 keeps the best
+occupancy but pays double the conversions and half the amortization
+(82.9).  Also re-measured this session on the M3: forcing the T2D
+route via DS4_METAL_ENABLE_TENSOR=1 runs the gathered stage at 69.4
+ms/layer (the portable fallback profits from the same traffic cut
+even through matmul2d) but regresses dense 23.4 -> 27.1 and routed MoE
+42.8 -> 45.6 ms/layer, so the opt-in pre-M5 gating stands unchanged.
+
+MEASURED (M3 Ultra, standard Q4_0-routed pack + Q4_1 PLE, same-recipe
+back-to-back sweep — 8192-row chunks, 32768-token interval frontiers
+on tripled promessi_sposi, 64-token greedy decode, single pass per
+arm; the fresh baseline below sat a few percent under the sessions
+16-18 record band, so the pair is internally consistent but absolute
+records should use identical-session comparisons):
+
+```text
+frontier            32K    64K    96K   128K   160K   192K   224K  262078
+prefill OFF tok/s   1047   1018   1001    985    970    950    933    911
+prefill ON  tok/s   1161   1135   1116   1038   1007    970    964    953
+ON gain             +11%   +11%   +12%    +5%    +4%    +2%    +3%    +5%
+decode  OFF tok/s   32.0   31.7   31.5   30.3   30.6   30.4   30.4   30.2
+decode  ON  tok/s   32.2   31.9   31.9   30.7   30.6   30.5   30.3   29.8
+```
+
+Stage attribution at the fresh-chunk geometry (qsa-prefill-bench 8192
+rows, defaults): gathered attention 132.6 -> 74.1 ms/layer (-44%; x12
+per 8K chunk 1591 -> 889 ms), routed MoE 42.6, streaming top-k 13.4,
+GDN R4 10.1, dense q8 23.2 unchanged.  The gain tapers at long
+frontiers because the gathered stage's per-chunk work is constant
+while the context-growing scan/paging stages take the larger share of
+each chunk.  Decode is unchanged (route gated off below 32 queries;
+the M=1 exact-arithmetic authority is untouched).  Fixtures:
+`test_qsa_attention_gqa_share` (bitwise A/B at both magnitudes, both
+pipeline names, small-batch gate, non-12-head exclusion); the GQA-T2D
+fixture isolates its scalar reference arm from the new default with
+`DS4_QWEN4_QSA_GQA_SHARE=0` so both organizations stay pinned on every
+machine.
+
 The experimental Apple Neural Engine runtime that this branch once
 carried (`ds4_ane.m`, its transport kernels, diagnostics, and the
 vendored oMLX license) was REMOVED by owner decision: it was never wired

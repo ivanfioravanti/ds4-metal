@@ -3383,6 +3383,286 @@ kernel void kernel_qwen4_qsa_attention_bf16_f32_legacy(
         nsg);
 }
 
+/* GQA load-share variant of the sparse QSA attention: the incumbent's
+ * arithmetic with a quarter of the gather traffic and no extra sync.
+ *
+ * The model has 12 query heads per KV head, and the selected-block list
+ * depends only on the query, so the per-(query, head) dispatch re-loads the
+ * IDENTICAL gathered K/V rows twelve times through L2 (the measured ~412
+ * GB/layer against a 16.8 MB cache footprint that pins the scalar kernel at
+ * the L2 bandwidth limit).  The selected ranks also map to simdgroups by
+ * rank class alone (rank = sg; rank += nsg), so the row a simdgroup gathers
+ * never depends on the head: this organization runs HPERG head siblings in
+ * ONE 256-thread threadgroup (group.z slices the twelve siblings into
+ * GQA/HPERG groups) and fuses their rank loops — each simdgroup loads its
+ * K/V row once into registers, converts BF16 -> F32 once (the conversion is
+ * exact, so each head multiplies the identical operand values the per-head
+ * device-load path produced), and then runs every sibling head's dot ->
+ * simdgroup-reduce -> online-softmax -> PV-FMA with the incumbent's lane/dim
+ * slicing, rank order, and reduction order preserved verbatim.  There is no
+ * threadgroup staging, no matmul2d, no simdgroup matrices — the gathered
+ * rows simply amortize over HPERG heads instead of one, cutting the L2
+ * gather traffic GQA/HPERG-fold.  HPERG is pinned to three (four groups):
+ * the measured optimum on the M3 Ultra — wider fusion amortizes more
+ * traffic but leaves the register-resident Q slices and accumulators too
+ * large for two resident threadgroups per core, and the occupancy loss
+ * dominates (six heads per group measures 2x slower than three).  Each
+ * head's eight partials still combine inside one threadgroup, so the
+ * contract is BITWISE-IDENTICAL output to
+ * kernel_qwen4_qsa_attention_bf16_f32.
+ */
+template <bool LEGACY>
+static inline void qwen4_qsa_attention_gqa_share_f32(
+        constant qwen4_qsa_attention_args &args,
+        device const float *q,
+        device const float *raw_gate,
+        device const ushort *key_cache,
+        device const ushort *value_cache,
+        device const uint *selected_blocks,
+        device const uint *selected_counts,
+        device const uint *visible_tokens,
+        device float *out,
+        threadgroup float *scratch,
+        uint3 group,
+        uint tid,
+        ushort lane,
+        ushort sg,
+        ushort nsg) {
+    (void)LEGACY;   /* both pipeline names share the bitwise-identical body */
+    (void)nsg;      /* the dispatch pins 256 threads = 8 simdgroups */
+    constexpr uint GQA = 12u;
+    constexpr uint HPERG = 3u;   /* sibling heads fused per threadgroup;
+                                   measured optimum, see header note */
+    constexpr uint NGROUPS = GQA / HPERG;
+    constexpr uint D = 256u;
+    constexpr uint NSG = 8u;
+    constexpr uint TPT = 256u;
+
+    const uint query = group.x;
+    const uint kv_head = group.y;
+    if (query >= args.queries || kv_head >= args.kv_heads ||
+        group.z >= NGROUPS)
+        return;
+    const uint head_base = kv_head * GQA + group.z * HPERG;
+    const uint visible = min(visible_tokens[query], args.cache_cap);
+    const uint complete = visible / args.ratio;
+    const uint block_count =
+        min(min(selected_counts[query], args.top_k), complete);
+    const uint tail = visible - complete * args.ratio;
+    const uint selected = block_count * args.ratio + tail;
+    const uint dim0 = (uint)lane * 8u;
+    if (selected == 0u) {
+        for (uint i = tid; i < HPERG * D; i += TPT)
+            out[((ulong)query * args.query_heads + head_base + i / D) *
+                args.head_dim + (i % D)] = 0.0f;
+        return;
+    }
+
+    /* Each lane keeps its eight-dim slice of this group's sibling query
+     * rows in registers (loaded straight from device memory, lossless). */
+    float4 q0[HPERG];
+    float4 q1[HPERG];
+    #pragma unroll
+    for (uint h = 0u; h < HPERG; h++) {
+        const device const float *qrow =
+            q + ((ulong)query * args.query_heads + head_base + h) *
+                    args.head_dim +
+                dim0;
+        q0[h] = *((device const float4 *)(qrow));
+        q1[h] = *((device const float4 *)(qrow + 4u));
+    }
+
+    float4 acc0[HPERG];
+    float4 acc1[HPERG];
+    float max_score[HPERG];
+    float sum_exp[HPERG];
+    #pragma unroll
+    for (uint h = 0u; h < HPERG; h++) {
+        acc0[h] = 0.0f;
+        acc1[h] = 0.0f;
+        max_score[h] = -INFINITY;
+        sum_exp[h] = 0.0f;
+    }
+
+    /* The incumbent's rank loop, verbatim mapping; the gathered K/V row
+     * stays in registers (converted once) while all sibling heads consume
+     * it. */
+    for (uint rank = sg; rank < selected; rank += NSG) {
+        uint token;
+        if (rank < block_count * args.ratio) {
+            const uint block = selected_blocks[
+                (ulong)query * args.top_k + rank / args.ratio];
+            token = block * args.ratio + rank % args.ratio;
+        } else {
+            token = complete * args.ratio +
+                    rank - block_count * args.ratio;
+        }
+        if (token >= visible) continue;
+        const ulong kbase =
+            ((ulong)token * args.kv_heads + kv_head) * args.head_dim;
+        const uint4 kraw = *((device const uint4 *)(
+            key_cache + kbase + dim0));
+        const uint4 vraw = *((device const uint4 *)(
+            value_cache + kbase + dim0));
+        thread const ushort *kq = (thread const ushort *)&kraw;
+        thread const ushort *vq = (thread const ushort *)&vraw;
+        const float kf0 = qwen4_bf16_to_f32(kq[0]);
+        const float kf1 = qwen4_bf16_to_f32(kq[1]);
+        const float kf2 = qwen4_bf16_to_f32(kq[2]);
+        const float kf3 = qwen4_bf16_to_f32(kq[3]);
+        const float kf4 = qwen4_bf16_to_f32(kq[4]);
+        const float kf5 = qwen4_bf16_to_f32(kq[5]);
+        const float kf6 = qwen4_bf16_to_f32(kq[6]);
+        const float kf7 = qwen4_bf16_to_f32(kq[7]);
+        const float vf0 = qwen4_bf16_to_f32(vq[0]);
+        const float vf1 = qwen4_bf16_to_f32(vq[1]);
+        const float vf2 = qwen4_bf16_to_f32(vq[2]);
+        const float vf3 = qwen4_bf16_to_f32(vq[3]);
+        const float vf4 = qwen4_bf16_to_f32(vq[4]);
+        const float vf5 = qwen4_bf16_to_f32(vq[5]);
+        const float vf6 = qwen4_bf16_to_f32(vq[6]);
+        const float vf7 = qwen4_bf16_to_f32(vq[7]);
+        #pragma unroll
+        for (uint h = 0u; h < HPERG; h++) {
+            float dot = q0[h].x * kf0 + q0[h].y * kf1 +
+                        q0[h].z * kf2 + q0[h].w * kf3;
+            dot += q1[h].x * kf4 + q1[h].y * kf5 +
+                   q1[h].z * kf6 + q1[h].w * kf7;
+            dot = simd_sum(dot) * rsqrt((float)args.head_dim);
+
+            /* The score is uniform across the simdgroup after simd_sum, so
+             * the online softmax state and the rescale factor stay uniform
+             * too. */
+            const float new_max = max(max_score[h], dot);
+            const float factor = exp(max_score[h] - new_max);
+            const float p = exp(dot - new_max);
+            max_score[h] = new_max;
+            sum_exp[h] = sum_exp[h] * factor + p;
+            acc0[h] *= factor;
+            acc1[h] *= factor;
+
+            acc0[h] = float4(
+                fma(p, vf0, acc0[h].x),
+                fma(p, vf1, acc0[h].y),
+                fma(p, vf2, acc0[h].z),
+                fma(p, vf3, acc0[h].w));
+            acc1[h] = float4(
+                fma(p, vf4, acc1[h].x),
+                fma(p, vf5, acc1[h].y),
+                fma(p, vf6, acc1[h].z),
+                fma(p, vf7, acc1[h].w));
+        }
+    }
+
+    /* Cross-simdgroup combine per head: partials in threadgroup memory,
+     * then every lane rescales its own dim slice by
+     * exp(group_max - global_max).  The mapping, reduction order, and
+     * expressions are the incumbent's. */
+    threadgroup float *partials = scratch;
+    threadgroup float *gmax = scratch + NSG * D;
+    threadgroup float *gsum = gmax + NSG;
+    #pragma unroll
+    for (uint h = 0u; h < HPERG; h++) {
+        const ulong qbase =
+            ((ulong)query * args.query_heads + head_base + h) *
+            args.head_dim;
+        *((threadgroup float4 *)(partials + (ulong)sg * D + dim0)) = acc0[h];
+        *((threadgroup float4 *)(partials + (ulong)sg * D + dim0 + 4u)) =
+            acc1[h];
+        if (lane == 0u) {
+            gmax[sg] = max_score[h];
+            gsum[sg] = sum_exp[h];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float maximum = -INFINITY;
+        for (uint g = 0u; g < NSG; g++)
+            maximum = max(maximum, gmax[g]);
+        if (!isfinite(maximum)) {
+            for (uint dim = lane; dim < D; dim += 32u)
+                out[qbase + dim] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            continue;
+        }
+        float total = 0.0f;
+        for (uint g = 0u; g < NSG; g++)
+            total += gsum[g] * exp(gmax[g] - maximum);
+
+        float4 r0 = 0.0f;
+        float4 r1 = 0.0f;
+        for (uint g = 0u; g < NSG; g++) {
+            const float weight = gmax[g] == -INFINITY
+                ? 0.0f : exp(gmax[g] - maximum);
+            r0 += weight * *((threadgroup float4 *)(
+                partials + (ulong)g * D + dim0));
+            r1 += weight * *((threadgroup float4 *)(
+                partials + (ulong)g * D + dim0 + 4u));
+        }
+        const float inv_sum = total > 0.0f ? 1.0f / total : 0.0f;
+        const float4 inv0 = float4(inv_sum);
+        const float4 inv1 = float4(inv_sum);
+        float4 gated0 = r0 * inv0;
+        float4 gated1 = r1 * inv1;
+        gated0 *= float4(
+            1.0f / (1.0f + exp(-raw_gate[qbase + dim0 + 0u])),
+            1.0f / (1.0f + exp(-raw_gate[qbase + dim0 + 1u])),
+            1.0f / (1.0f + exp(-raw_gate[qbase + dim0 + 2u])),
+            1.0f / (1.0f + exp(-raw_gate[qbase + dim0 + 3u])));
+        gated1 *= float4(
+            1.0f / (1.0f + exp(-raw_gate[qbase + dim0 + 4u])),
+            1.0f / (1.0f + exp(-raw_gate[qbase + dim0 + 5u])),
+            1.0f / (1.0f + exp(-raw_gate[qbase + dim0 + 6u])),
+            1.0f / (1.0f + exp(-raw_gate[qbase + dim0 + 7u])));
+        *((device float4 *)(out + qbase + dim0)) = gated0;
+        *((device float4 *)(out + qbase + dim0 + 4u)) = gated1;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void kernel_qwen4_qsa_attention_gqa_share_f32(
+        constant qwen4_qsa_attention_args &args [[buffer(0)]],
+        device const float *q [[buffer(1)]],
+        device const float *raw_gate [[buffer(2)]],
+        device const ushort *key_cache [[buffer(3)]],
+        device const ushort *value_cache [[buffer(4)]],
+        device const uint *selected_blocks [[buffer(5)]],
+        device const uint *selected_counts [[buffer(6)]],
+        device const uint *visible_tokens [[buffer(7)]],
+        device float *out [[buffer(8)]],
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    qwen4_qsa_attention_gqa_share_f32<true>(
+        args, q, raw_gate, key_cache, value_cache, selected_blocks,
+        selected_counts, visible_tokens, out, scratch, group, tid, lane, sg,
+        nsg);
+}
+
+kernel void kernel_qwen4_qsa_attention_gqa_share_f32_legacy(
+        constant qwen4_qsa_attention_args &args [[buffer(0)]],
+        device const float *q [[buffer(1)]],
+        device const float *raw_gate [[buffer(2)]],
+        device const ushort *key_cache [[buffer(3)]],
+        device const ushort *value_cache [[buffer(4)]],
+        device const uint *selected_blocks [[buffer(5)]],
+        device const uint *selected_counts [[buffer(6)]],
+        device const uint *visible_tokens [[buffer(7)]],
+        device float *out [[buffer(8)]],
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    qwen4_qsa_attention_gqa_share_f32<false>(
+        args, q, raw_gate, key_cache, value_cache, selected_blocks,
+        selected_counts, visible_tokens, out, scratch, group, tid, lane, sg,
+        nsg);
+}
+
 /* GQA tile-sharing matrix-core variant of the sparse QSA attention.
  *
  * Role-split organization (validated in speed-bench/gqa_mma_proto.metal):

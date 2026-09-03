@@ -1492,6 +1492,93 @@ static void test_model_q8_0_mpp_f32stage_rows(void) {
     free(allocation);
 }
 
+static void test_model_q8_0_bf16_mul_mm_rows(void) {
+    /* The OPT-IN tiled route for prefill-sized BF16-input batches (the PLE
+     * key/value tiles): DS4_QWEN4_Q8_0_BF16_MUL_MM=1 widens to F32 and
+     * runs the tiled tensor-core kernel_mul_mm_q8_0_f32 instead of the
+     * per-row scalar kernel.  out_dim 67 and the 33-row case exercise the
+     * bounds-checked variant; 8 rows stays below the route threshold and
+     * pins the scalar path's exact BF16 arithmetic (which is also the
+     * default for every row count with the opt-in flag unset — checked by
+     * the plain-path case in test_model_q8_0_paths).  The tiled kernel
+     * rounds dequantized weights and the widened activations to F16
+     * threadgroup tiles and accumulates F32, so the rows>=32 reference
+     * tolerance covers that rounding (the same class as the F32-input
+     * tiled fixture). */
+    enum { IN = 512 };
+    const size_t weight_offset = 4096u;
+    const uint32_t out_cases[] = {128u, 67u};
+    const uint32_t row_cases[] = {64u, 33u, 8u};
+    for (uint32_t oc = 0u; oc < 2u; oc++) {
+        const uint32_t out_dim = out_cases[oc];
+        const size_t weight_bytes =
+            (size_t)out_dim * (IN / 32u) * sizeof(test_block_q8_0);
+        const size_t model_size = weight_offset + weight_bytes + 256u;
+        void *allocation = NULL;
+        require_ok(posix_memalign(&allocation, 4096u,
+                                  align_size(model_size, 4096u)) == 0,
+                   "Q8_0 BF16 mul_mm model allocation");
+        memset(allocation, 0, align_size(model_size, 4096u));
+        uint8_t *model = allocation;
+        test_block_q8_0 *weights =
+            (test_block_q8_0 *)(model + weight_offset);
+        fill_q8_0_matrix(weights, out_dim, IN, 71u);
+        require_ok(ds4_gpu_set_model_map(model, model_size),
+                   "Q8_0 BF16 mul_mm model registration");
+        for (uint32_t rc = 0u; rc < 3u; rc++) {
+            const uint32_t rows = row_cases[rc];
+            require_ok(
+                setenv("DS4_QWEN4_Q8_0_BF16_MUL_MM",
+                       rows >= 32u ? "1" : "0", 1) == 0,
+                "Q8_0 BF16 mul_mm env");
+            float *input = malloc((size_t)rows * IN * sizeof(float));
+            uint16_t *input_bf16 =
+                malloc((size_t)rows * IN * sizeof(uint16_t));
+            float *rounded = malloc((size_t)rows * IN * sizeof(float));
+            float *expected = malloc((size_t)rows * out_dim * sizeof(float));
+            float *actual = malloc((size_t)rows * out_dim * sizeof(float));
+            require_ok(input && input_bf16 && rounded && expected && actual,
+                       "Q8_0 BF16 mul_mm host allocations");
+            for (uint32_t i = 0; i < rows * IN; i++) {
+                input[i] = cosf((float)(i + 11u) * 0.013f) * 0.4f;
+                input_bf16[i] = f32_to_bf16(input[i]);
+                rounded[i] = bf16_to_f32(input_bf16[i]);
+            }
+            q8_0_matmul_reference(expected, weights, rounded, IN, out_dim,
+                                  rows);
+            ds4_gpu_tensor *xb = tensor_from(
+                input_bf16, (size_t)rows * IN * sizeof(uint16_t));
+            ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(
+                (size_t)rows * out_dim * sizeof(float));
+            require_ok(xb && out, "Q8_0 BF16 mul_mm tensor allocation");
+            require_ok(ds4_gpu_qwen4_q8_0_matmul_model_bf16(
+                           out, model, model_size, weight_offset,
+                           xb, IN, out_dim, rows),
+                       "Q8_0 BF16 mul_mm dispatch");
+            require_ok(ds4_gpu_tensor_read(
+                           out, 0, actual,
+                           (size_t)rows * out_dim * sizeof(float)),
+                       "Q8_0 BF16 mul_mm readback");
+            char label[80];
+            snprintf(label, sizeof(label),
+                     "Qwen Q8_0 BF16 mul_mm out=%u rows=%u", out_dim, rows);
+            require_array_close(label, actual, expected,
+                                (size_t)rows * out_dim,
+                                rows >= 32u ? 2e-1f : 4e-4f, 4e-3f);
+            ds4_gpu_tensor_free(out);
+            ds4_gpu_tensor_free(xb);
+            free(actual);
+            free(expected);
+            free(rounded);
+            free(input_bf16);
+            free(input);
+        }
+        free(allocation);
+    }
+    require_ok(unsetenv("DS4_QWEN4_Q8_0_BF16_MUL_MM") == 0,
+               "Q8_0 BF16 mul_mm env clear");
+}
+
 static void test_model_bf16_matmul_rows(void) {
     /* Prefill-sized BF16 control projections (MoE router, GDN decay/beta)
      * route through the tiled tensor-core kernel_mul_mm_bf16_f32.  The
@@ -7417,6 +7504,7 @@ int main(void) {
     test_q8_0_matmul();
     test_model_q8_0_paths();
     test_model_q8_0_mul_mm_rows();
+    test_model_q8_0_bf16_mul_mm_rows();
     test_model_q8_0_mpp_rows();
     test_model_q8_0_mpp_f32stage_rows();
     test_model_bf16_matmul_rows();

@@ -10529,6 +10529,12 @@ int ds4_gpu_synchronize(void) {
     return ds4_gpu_finish_command_buffer(cb, 1, "synchronize");
 }
 
+/* Widening scratch for the BF16-input tiled dense dispatch
+ * (ds4_gpu_qwen4_q8_0_matmul_model_bf16); grows to the largest prefill
+ * tile seen and is dropped at cleanup. */
+static id<MTLBuffer> g_qwen4_bf16_widen_scratch = nil;
+static uint64_t g_qwen4_bf16_widen_scratch_bytes = 0;
+
 void ds4_gpu_stage_profile_report(void) {
     if (!ds4_gpu_stage_profile_enabled()) return;
     fprintf(stderr,
@@ -10589,6 +10595,8 @@ void ds4_gpu_cleanup(void) {
         }
         g_selected_readback_event = nil;
         g_selected_readback_event_value = 0;
+        g_qwen4_bf16_widen_scratch = nil;
+        g_qwen4_bf16_widen_scratch_bytes = 0;
         [g_transient_buffers removeAllObjects];
         ds4_gpu_stream_expert_pread_pool_shutdown();
         ds4_gpu_stream_expert_cache_clear_all(1);
@@ -46512,9 +46520,108 @@ int ds4_gpu_qwen4_q8_0_matmul_model_bf16(
         uint64_t inner = 0;
         id<MTLBuffer> weights = ds4_gpu_qwen4_wrap_q8_0(
             model_map, model_size, weight_offset, in_dim, out_dim, &inner);
+        if (!weights) return 0;
+        /* OPT-IN tiled route for prefill-sized BF16-input batches (the PLE
+         * key/value tiles): DS4_QWEN4_Q8_0_BF16_MUL_MM=1 widens the BF16
+         * activations to F32 and runs the shared tiled tensor-core kernel;
+         * DS4_QWEN4_Q8_0_BF16_MUL_MM_MIN_ROWS (default 32) keeps decode and
+         * verifier rows on the scalar kernel either way.  Parsed per call
+         * so fixtures can toggle the path within one process.  The
+         * incumbent scalar kernel's grid assigns one simdgroup per output
+         * row per token, so every token re-reads the whole weight matrix —
+         * 13 GB of weight traffic per 512-row key tile where the 32-row
+         * tiled grid reads ~0.4 GB (measured: the stage drops 263 -> 26 ms
+         * per 8K chunk, ~10x).  The widening itself is lossless (BF16 ->
+         * F32 -> F16 tiles round nothing the scalar path kept), but the
+         * tiled kernel's F16 weight-tile rounding plus MMA accumulation
+         * order measure a 16K-prefill logits delta of 0.130 mean / 0.957
+         * max versus the scalar authority — above this branch's accepted
+         * 0.074-0.083 / 0.55-0.66 drift budget (greedy stays identical for
+         * 128 tokens; top-1 argmax unchanged) — so the route ships opt-in
+         * for study rather than as the default. */
+        const char *raw_bf16_mm = getenv("DS4_QWEN4_Q8_0_BF16_MUL_MM");
+        const bool bf16_mul_mm =
+            raw_bf16_mm && strcmp(raw_bf16_mm, "1") == 0;
+        const uint64_t bf16_mm_min_rows = ds4_gpu_env_u64(
+            "DS4_QWEN4_Q8_0_BF16_MUL_MM_MIN_ROWS", 32u, 0u, UINT32_MAX);
+        if (bf16_mul_mm && n_rows >= bf16_mm_min_rows &&
+            (in_dim % 32u) == 0u) {
+            const uint64_t x_elements = (uint64_t)n_rows * in_dim;
+            id<MTLComputePipelineState> widen = (x_elements & 3u) == 0u
+                ? ds4_gpu_get_pipeline("kernel_qwen4_bf16_widen_f32") : nil;
+            if (widen && g_qwen4_bf16_widen_scratch &&
+                g_qwen4_bf16_widen_scratch_bytes <
+                    x_elements * sizeof(float)) {
+                g_qwen4_bf16_widen_scratch = nil;
+                g_qwen4_bf16_widen_scratch_bytes = 0;
+            }
+            if (widen && !g_qwen4_bf16_widen_scratch) {
+                const uint64_t x_bytes = x_elements * sizeof(float);
+                g_qwen4_bf16_widen_scratch = [g_device
+                    newBufferWithLength:x_bytes
+                                options:MTLResourceStorageModeShared];
+                g_qwen4_bf16_widen_scratch_bytes =
+                    g_qwen4_bf16_widen_scratch ? x_bytes : 0u;
+            }
+            if (widen && g_qwen4_bf16_widen_scratch) {
+                const bool bc_out =
+                    (out_dim % 64u) != 0u || (n_rows % 32u) != 0u;
+                id<MTLComputePipelineState> tiled =
+                    ds4_gpu_get_mul_mm_pipeline(
+                        "kernel_mul_mm_q8_0_f32", false, bc_out);
+                if (tiled) {
+                    int owned = 0;
+                    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+                    if (!cb) return 0;
+                    id<MTLComputeCommandEncoder> enc =
+                        ds4_gpu_compute_encoder(cb);
+                    if (!enc) return 0;
+                    enc.label = @"Qwen Q8_0 projection with BF16 activations";
+                    const uint32_t vec4s = (uint32_t)(x_elements / 4u);
+                    [enc setComputePipelineState:widen];
+                    [enc setBytes:&vec4s length:sizeof(vec4s) atIndex:2];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(x)
+                            offset:ds4_gpu_tensor_offset(x) atIndex:0];
+                    [enc setBuffer:g_qwen4_bf16_widen_scratch offset:0
+                            atIndex:1];
+                    [enc dispatchThreads:MTLSizeMake(vec4s, 1u, 1u)
+                         threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
+                    /* The batch encoder may be concurrent: order the
+                     * matmul's scratch reads after the widen's writes. */
+                    id<MTLResource> widen_resources[] = {
+                        g_qwen4_bf16_widen_scratch,
+                    };
+                    [enc memoryBarrierWithResources:widen_resources
+                                              count:1u];
+                    [enc setComputePipelineState:tiled];
+                    ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(
+                        in_dim, out_dim, n_rows,
+                        (uint64_t)(in_dim / 32u) * 34u);
+                    [enc setBytes:&args length:sizeof(args) atIndex:0];
+                    [enc setBuffer:weights offset:(NSUInteger)inner atIndex:1];
+                    [enc setBuffer:g_qwen4_bf16_widen_scratch offset:0
+                            atIndex:2];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                            offset:ds4_gpu_tensor_offset(out) atIndex:3];
+                    [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u)
+                                          atIndex:0];
+                    [enc insertDebugSignpost:
+                        @"Qwen Q8_0 BF16-input tensor matmul"];
+                    [enc dispatchThreadgroups:MTLSizeMake(
+                            (n_rows + 31u) / 32u,
+                            (out_dim + 63u) / 64u,
+                            1u)
+                         threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+                    ds4_gpu_end_compute_encoder(cb, enc);
+                    return ds4_gpu_finish_command_buffer(
+                        cb, owned,
+                        "Qwen Q8_0 projection with BF16 activations");
+                }
+            }
+        }
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
             "kernel_qwen4_q8_0_bf16");
-        if (!weights || !pipeline) return 0;
+        if (!pipeline) return 0;
         ds4_gpu_qwen4_q8_0_args args = {in_dim, out_dim, n_rows};
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);

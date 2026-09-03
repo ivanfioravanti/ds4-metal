@@ -219,6 +219,25 @@ kernel void kernel_qwen4_q8_0_f32_rows8(
     if (token0 + 7u < args.n_rows) out[((ulong)token0 + 7u) * args.out_dim + out_row] = sum1.w;
 }
 
+/* Widen a BF16 activation block to F32 rows (four elements per thread)
+ * so the standard tiled dense dispatch can serve BF16-staged inputs —
+ * the SSD double-buffered PLE embedding — at prefill row counts.  The
+ * widening is lossless; the subsequent kernel's F16 tile staging is the
+ * same operand-rounding class as every other dense prefill projection. */
+kernel void kernel_qwen4_bf16_widen_f32(
+        device const uint2 *src [[buffer(0)]],
+        device float4 *dst [[buffer(1)]],
+        constant uint &vec4s [[buffer(2)]],
+        uint tindex [[thread_position_in_grid]]) {
+    if (tindex >= vec4s) return;
+    const uint2 raw = src[tindex];
+    dst[tindex] = float4(
+        qwen4_bf16_to_f32((ushort)(raw.x & 0xFFFFu)),
+        qwen4_bf16_to_f32((ushort)(raw.x >> 16)),
+        qwen4_bf16_to_f32((ushort)(raw.y & 0xFFFFu)),
+        qwen4_bf16_to_f32((ushort)(raw.y >> 16)));
+}
+
 kernel void kernel_qwen4_q8_0_bf16(
         constant qwen4_q8_0_args &args [[buffer(0)]],
         device const block_q8_0  *weights [[buffer(1)]],

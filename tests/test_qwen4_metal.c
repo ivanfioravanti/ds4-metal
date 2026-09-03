@@ -5710,6 +5710,310 @@ static void test_qsa_attention_gqa_mma(void) {
     free(q);
 }
 
+/* CPU reference for the gathered QSA attention with exact scalar-kernel
+ * semantics (F32 Q, BF16 cache expanded, F32 softmax and PV), shared by
+ * the TensorOps t2d fixture passes. */
+static void qsa_attention_cpu_reference(
+        const float *q, const float *gate, const uint16_t *key,
+        const uint16_t *value, const uint32_t *selected,
+        const uint32_t *counts, const uint32_t *visible,
+        uint32_t queries, float *expected) {
+    enum { Q_HEADS = 24, KV_HEADS = 2, DIM = 256, TOP_K = 512, RATIO = 4 };
+    for (uint32_t query = 0; query < queries; query++) {
+        const uint32_t complete = visible[query] / RATIO;
+        const uint32_t blocks =
+            counts[query] < complete ? counts[query] : complete;
+        if (blocks > TOP_K) exit(1);
+        uint32_t tokens[TOP_K * RATIO + RATIO - 1u];
+        uint32_t token_count = 0;
+        for (uint32_t rank = 0; rank < blocks; rank++)
+            for (uint32_t item = 0; item < RATIO; item++) {
+                const uint32_t token =
+                    selected[(size_t)query * TOP_K + rank] * RATIO + item;
+                if (token < visible[query]) tokens[token_count++] = token;
+            }
+        for (uint32_t token = complete * RATIO; token < visible[query];
+             token++)
+            tokens[token_count++] = token;
+
+        for (uint32_t head = 0; head < Q_HEADS; head++) {
+            const uint32_t kv_head = head / (Q_HEADS / KV_HEADS);
+            float *scores = malloc(token_count * sizeof(*scores));
+            require_ok(scores != NULL, "QSA t2d reference scores");
+            float maximum = -INFINITY;
+            for (uint32_t rank = 0; rank < token_count; rank++) {
+                float dot = 0.0f;
+                const size_t qbase =
+                    ((size_t)query * Q_HEADS + head) * DIM;
+                const size_t kbase =
+                    ((size_t)tokens[rank] * KV_HEADS + kv_head) * DIM;
+                for (uint32_t dim = 0; dim < DIM; dim++)
+                    dot = fmaf(q[qbase + dim],
+                               bf16_to_f32(key[kbase + dim]), dot);
+                scores[rank] = dot / sqrtf((float)DIM);
+                if (scores[rank] > maximum) maximum = scores[rank];
+            }
+            float sum = 0.0f;
+            for (uint32_t rank = 0; rank < token_count; rank++)
+                sum += expf(scores[rank] - maximum);
+            const size_t out_base =
+                ((size_t)query * Q_HEADS + head) * DIM;
+            if (token_count == 0) {
+                for (uint32_t dim = 0; dim < DIM; dim++)
+                    expected[out_base + dim] = 0.0f;
+                free(scores);
+                continue;
+            }
+            for (uint32_t dim = 0; dim < DIM; dim++) {
+                float result = 0.0f;
+                for (uint32_t rank = 0; rank < token_count; rank++) {
+                    const size_t vbase =
+                        ((size_t)tokens[rank] * KV_HEADS + kv_head) * DIM;
+                    result = fmaf(expf(scores[rank] - maximum) / sum,
+                                  bf16_to_f32(value[vbase + dim]), result);
+                }
+                expected[out_base + dim] =
+                    result / (1.0f + expf(-gate[out_base + dim]));
+            }
+            free(scores);
+        }
+    }
+}
+
+/* GQA tile-sharing Metal-4 TensorOps (matmul2d) attention: the fp32-P
+ * cooperative-tensor kernel.  The only operand rounding versus the
+ * scalar kernel is Q -> F16 once per (query, KV head) group (measured
+ * non-binding by the Q-split probe) — K/V convert losslessly from BF16
+ * and the softmax probabilities stay fp32 with exact fp32 cooperative
+ * accumulation — so the fixture checks against the EXACT CPU reference
+ * at fixture magnitudes with rounding-scale tolerances, and at
+ * production magnitudes (score spread ~+-20) with the F16-Q envelope.
+ * It also cross-checks the scalar kernel and proves observable
+ * engagement (the route must perturb some outputs). */
+static void test_qsa_attention_gqa_t2d(void) {
+    enum {
+        QUERIES = 40,
+        CACHE_CAP = 2051,
+        Q_HEADS = 24,
+        KV_HEADS = 2,
+        DIM = 256,
+        TOP_K = 512,
+        RATIO = 4,
+    };
+    const size_t query_count = (size_t)QUERIES * Q_HEADS * DIM;
+    const size_t cache_count = (size_t)CACHE_CAP * KV_HEADS * DIM;
+    const size_t selected_count = (size_t)QUERIES * TOP_K;
+    float *q = malloc(query_count * sizeof(*q));
+    float *gate = malloc(query_count * sizeof(*gate));
+    uint16_t *key = malloc(cache_count * sizeof(*key));
+    uint16_t *value = malloc(cache_count * sizeof(*value));
+    uint32_t *selected = malloc(selected_count * sizeof(*selected));
+    uint32_t *counts = malloc((size_t)QUERIES * sizeof(*counts));
+    uint32_t *visible = malloc((size_t)QUERIES * sizeof(*visible));
+    float *expected = malloc(query_count * sizeof(*expected));
+    float *actual = malloc(query_count * sizeof(*actual));
+    float *scalar = malloc(query_count * sizeof(*scalar));
+    require_ok(q && gate && key && value && selected && counts && visible &&
+                   expected && actual && scalar,
+               "QSA GQA T2D host allocation");
+
+    for (size_t i = 0; i < query_count; i++) {
+        q[i] = 0.0025f *
+            (float)((int)((i * 29u + i / DIM * 7u + 11u) % 97u) - 48);
+        gate[i] = 0.03125f *
+            (float)((int)((i * 13u + i / DIM * 5u + 3u) % 33u) - 16);
+    }
+    for (size_t i = 0; i < cache_count; i++) {
+        key[i] = f32_to_bf16(
+            0.00175f * (float)((int)((i * 31u + 5u) % 113u) - 56));
+        value[i] = f32_to_bf16(
+            0.00225f * (float)((int)((i * 19u + 9u) % 109u) - 54));
+    }
+    for (uint32_t query = 0; query < QUERIES; query++) {
+        for (uint32_t rank = 0; rank < TOP_K; rank++)
+            selected[(size_t)query * TOP_K + rank] =
+                (query * 131u + rank * 37u + 19u) % 512u;
+    }
+    /* Boundary cases first, then deterministic mixed profiles. */
+    visible[0] = 7u;    counts[0] = 1u;
+    visible[1] = 2047u; counts[1] = 511u;
+    visible[2] = 2051u; counts[2] = 512u;
+    visible[3] = 3u;    counts[3] = 0u;   /* tail-only selection */
+    visible[4] = 2u;    counts[4] = 0u;
+    visible[5] = 0u;    counts[5] = 0u;   /* zero selection */
+    for (uint32_t query = 6; query < QUERIES; query++) {
+        visible[query] = 17u + (query * 173u) % 2051u;
+        counts[query] = (query * 61u + 7u) % (TOP_K + 1u);
+    }
+
+    qsa_attention_cpu_reference(q, gate, key, value, selected, counts,
+                                visible, QUERIES, expected);
+
+    ds4_gpu_tensor *q_t = tensor_from(q, query_count * sizeof(*q));
+    ds4_gpu_tensor *gate_t = tensor_from(gate, query_count * sizeof(*gate));
+    ds4_gpu_tensor *key_t = tensor_from(key, cache_count * sizeof(*key));
+    ds4_gpu_tensor *value_t =
+        tensor_from(value, cache_count * sizeof(*value));
+    ds4_gpu_tensor *selected_t =
+        tensor_from(selected, selected_count * sizeof(*selected));
+    ds4_gpu_tensor *counts_t =
+        tensor_from(counts, (size_t)QUERIES * sizeof(*counts));
+    ds4_gpu_tensor *visible_t =
+        tensor_from(visible, (size_t)QUERIES * sizeof(*visible));
+    ds4_gpu_tensor *actual_t =
+        ds4_gpu_tensor_alloc(query_count * sizeof(*actual));
+    ds4_gpu_tensor *scalar_t =
+        ds4_gpu_tensor_alloc(query_count * sizeof(*scalar));
+    require_ok(actual_t && scalar_t, "QSA GQA T2D output allocation");
+
+    /* The route is default-on for prefill-sized batches; force it
+     * explicitly so the fixture proves the kernel regardless of the
+     * machine's Metal-4 capability default. */
+    const char *prior_raw = getenv("DS4_QWEN4_QSA_GQA_T2D");
+    char *prior = prior_raw ? strdup(prior_raw) : NULL;
+    require_ok(!prior_raw || prior, "QSA GQA T2D environment copy");
+    const char *rows_raw = getenv("DS4_QWEN4_QSA_GQA_T2D_MIN_ROWS");
+    char *rows_prior = rows_raw ? strdup(rows_raw) : NULL;
+    require_ok(!rows_raw || rows_prior, "QSA GQA T2D min-rows copy");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_T2D", "1", 1) == 0,
+               "QSA GQA T2D enable");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_T2D_MIN_ROWS", "8", 1) == 0,
+               "QSA GQA T2D min-rows lower");
+    require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                   actual_t, q_t, gate_t, key_t, value_t, selected_t,
+                   counts_t, visible_t, QUERIES, CACHE_CAP, Q_HEADS,
+                   KV_HEADS, DIM, TOP_K, RATIO),
+               "QSA GQA T2D dispatch");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_T2D", "0", 1) == 0,
+               "QSA GQA T2D scalar fallback");
+    require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                   scalar_t, q_t, gate_t, key_t, value_t, selected_t,
+                   counts_t, visible_t, QUERIES, CACHE_CAP, Q_HEADS,
+                   KV_HEADS, DIM, TOP_K, RATIO),
+               "QSA GQA T2D scalar dispatch");
+    require_ok(prior
+                   ? setenv("DS4_QWEN4_QSA_GQA_T2D", prior, 1) == 0
+                   : unsetenv("DS4_QWEN4_QSA_GQA_T2D") == 0,
+               "QSA GQA T2D environment restore");
+    require_ok(rows_prior
+                   ? setenv("DS4_QWEN4_QSA_GQA_T2D_MIN_ROWS", rows_prior, 1)
+                   : unsetenv("DS4_QWEN4_QSA_GQA_T2D_MIN_ROWS") == 0,
+               "QSA GQA T2D min-rows restore");
+    free(rows_prior);
+    require_ok(ds4_gpu_tensor_read(actual_t, 0, actual,
+                                   query_count * sizeof(*actual)) &&
+                   ds4_gpu_tensor_read(scalar_t, 0, scalar,
+                                       query_count * sizeof(*scalar)),
+               "QSA GQA T2D readback");
+    /* Observable engagement: the F16 Q staging must perturb some
+     * outputs; a silently-undispatched route is byte-identical. */
+    {
+        uint64_t changed = 0;
+        for (size_t i = 0; i < query_count; i++)
+            if (actual[i] != scalar[i]) changed++;
+        require_ok(changed > query_count / 16u,
+                   "QSA GQA T2D observable engagement");
+    }
+    require_array_close("Qwen QSA GQA T2D attention vs scalar kernel",
+                        actual, scalar, query_count, 2e-3f, 2e-2f);
+    require_array_close("Qwen QSA GQA T2D attention vs CPU reference",
+                        actual, expected, query_count, 2e-3f, 2e-2f);
+
+    /* Production-magnitude pass: q/k/v scaled so the gathered score
+     * spread reaches the +-20 class; the tolerance admits the F16-Q
+     * rounding envelope at that spread (P stays fp32, so this must sit
+     * far inside the failed F16-MMA variant's class). */
+    for (size_t i = 0; i < query_count; i++) {
+        q[i] *= 12.0f;
+        gate[i] *= 12.0f;
+    }
+    for (size_t i = 0; i < cache_count; i++) {
+        const float kf = bf16_to_f32(key[i]);
+        key[i] = f32_to_bf16(kf * 12.0f);
+        const float vf = bf16_to_f32(value[i]);
+        value[i] = f32_to_bf16(vf * 12.0f);
+    }
+    qsa_attention_cpu_reference(q, gate, key, value, selected, counts,
+                                visible, QUERIES, expected);
+    ds4_gpu_tensor_free(q_t);
+    ds4_gpu_tensor_free(gate_t);
+    ds4_gpu_tensor_free(key_t);
+    ds4_gpu_tensor_free(value_t);
+    q_t = tensor_from(q, query_count * sizeof(*q));
+    gate_t = tensor_from(gate, query_count * sizeof(*gate));
+    key_t = tensor_from(key, cache_count * sizeof(*key));
+    value_t = tensor_from(value, cache_count * sizeof(*value));
+    require_ok(q_t && gate_t && key_t && value_t,
+               "QSA GQA T2D scaled upload");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_T2D", "1", 1) == 0,
+               "QSA GQA T2D enable (scaled)");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_T2D_MIN_ROWS", "8", 1) == 0,
+               "QSA GQA T2D min-rows lower (scaled)");
+    require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                   actual_t, q_t, gate_t, key_t, value_t, selected_t,
+                   counts_t, visible_t, QUERIES, CACHE_CAP, Q_HEADS,
+                   KV_HEADS, DIM, TOP_K, RATIO),
+               "QSA GQA T2D dispatch (scaled)");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_T2D", "0", 1) == 0,
+               "QSA GQA T2D scalar fallback (scaled)");
+    require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                   scalar_t, q_t, gate_t, key_t, value_t, selected_t,
+                   counts_t, visible_t, QUERIES, CACHE_CAP, Q_HEADS,
+                   KV_HEADS, DIM, TOP_K, RATIO),
+               "QSA GQA T2D scalar dispatch (scaled)");
+    require_ok(prior
+                   ? setenv("DS4_QWEN4_QSA_GQA_T2D", prior, 1) == 0
+                   : unsetenv("DS4_QWEN4_QSA_GQA_T2D") == 0,
+               "QSA GQA T2D environment restore (scaled)");
+    require_ok(rows_prior
+                   ? setenv("DS4_QWEN4_QSA_GQA_T2D_MIN_ROWS", rows_prior, 1)
+                   : unsetenv("DS4_QWEN4_QSA_GQA_T2D_MIN_ROWS") == 0,
+               "QSA GQA T2D min-rows restore (scaled)");
+    require_ok(ds4_gpu_tensor_read(actual_t, 0, actual,
+                                   query_count * sizeof(*actual)) &&
+                   ds4_gpu_tensor_read(scalar_t, 0, scalar,
+                                       query_count * sizeof(*scalar)),
+               "QSA GQA T2D readback (scaled)");
+    require_array_close("Qwen QSA GQA T2D production magnitudes vs scalar",
+                        actual, scalar, query_count, 5e-2f, 2e-1f);
+    require_array_close(
+        "Qwen QSA GQA T2D production magnitudes vs CPU reference",
+        actual, expected, query_count, 5e-2f, 2e-1f);
+    {
+        double t2d_mean = 0.0;
+        for (size_t i = 0; i < query_count; i++)
+            t2d_mean += fabs((double)actual[i] - (double)scalar[i]);
+        t2d_mean /= (double)query_count;
+        printf("Qwen QSA GQA T2D drift vs scalar mean=%.3e\n", t2d_mean);
+        /* The F16-MMA closure measured 2.6e-4-class mean drift with the
+         * F16 P-tile rounding present; with P fp32 the mean must stay
+         * in the same rounding family (Q-F16 only). */
+        require_ok(t2d_mean < 3e-4,
+                   "QSA GQA T2D mean drift out of family");
+    }
+
+    ds4_gpu_tensor_free(scalar_t);
+    ds4_gpu_tensor_free(actual_t);
+    ds4_gpu_tensor_free(visible_t);
+    ds4_gpu_tensor_free(counts_t);
+    ds4_gpu_tensor_free(selected_t);
+    ds4_gpu_tensor_free(value_t);
+    ds4_gpu_tensor_free(key_t);
+    ds4_gpu_tensor_free(gate_t);
+    ds4_gpu_tensor_free(q_t);
+    free(prior);
+    free(scalar);
+    free(actual);
+    free(expected);
+    free(visible);
+    free(counts);
+    free(selected);
+    free(value);
+    free(key);
+    free(gate);
+    free(q);
+}
+
 static void test_qsa_streaming_topk(void) {
     enum {
         QUERIES = 5,
@@ -6634,6 +6938,7 @@ int main(void) {
     test_qsa_sparse_attention();
     test_qsa_probability_cache_exact();
     test_qsa_attention_gqa_mma();
+    test_qsa_attention_gqa_t2d();
     test_qsa_streaming_topk();
     test_qsa_streaming_topk_merge_select();
     test_qsa_streaming_topk_score_mm();

@@ -49542,14 +49542,51 @@ int ds4_gpu_qwen4_qsa_attention_bf16(
         const bool gqa_mma_path = gqa_mma_enabled &&
             queries >= gqa_mma_min_rows &&
             query_heads / kv_heads == 12u && head_dim == 256u && ratio == 4u;
-        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
-            gqa_mma_path
-                ? (gqa_mma_qsplit
-                       ? "kernel_qwen4_qsa_attention_gqa_mma_qsplit_f32"
-                       : "kernel_qwen4_qsa_attention_gqa_mma_f32")
-                : (prob_cache_enabled
-                       ? "kernel_qwen4_qsa_attention_bf16_f32"
-                       : "kernel_qwen4_qsa_attention_bf16_f32_legacy"));
+        /* GQA tile-sharing Metal-4 TensorOps (matmul2d) route: the
+         * fp32-P cooperative-tensor kernel that holds the model's
+         * quality class (the historical F16 MMA failed on the F16
+         * P-tile rounding; see kernel_qwen4_qsa_attention_gqa_t2d_f32).
+         * Default ON wherever the Metal-4 tensor route is enabled and
+         * the batch is prefill-sized; DS4_QWEN4_QSA_GQA_T2D=0 restores
+         * the scalar kernel (the deliberate M=1 exact-arithmetic
+         * authority for decode and verifier rows stays scalar via
+         * DS4_QWEN4_QSA_GQA_T2D_MIN_ROWS, default 32). */
+        const char *gqa_t2d = getenv("DS4_QWEN4_QSA_GQA_T2D");
+        bool gqa_t2d_enabled = !(gqa_t2d && strcmp(gqa_t2d, "0") == 0);
+        if (gqa_t2d && strcmp(gqa_t2d, "1") == 0)
+            gqa_t2d_enabled = true;
+        uint32_t gqa_t2d_min_rows = 32u;
+        const char *gqa_t2d_rows = getenv("DS4_QWEN4_QSA_GQA_T2D_MIN_ROWS");
+        if (gqa_t2d_rows) {
+            const long parsed = strtol(gqa_t2d_rows, NULL, 0);
+            if (parsed >= 0 && parsed <= 65536L)
+                gqa_t2d_min_rows = (uint32_t)parsed;
+        }
+        const bool gqa_t2d_path =
+            gqa_t2d_enabled && !gqa_mma_path &&
+            ds4_gpu_metal4_tensor_route_enabled() &&
+            queries >= gqa_t2d_min_rows &&
+            query_heads / kv_heads == 12u && head_dim == 256u &&
+            ratio == 4u && top_k == 512u;
+        const char *kernel_name =
+            gqa_t2d_path
+                ? "kernel_qwen4_qsa_attention_gqa_t2d_f32"
+                : (gqa_mma_path
+                       ? (gqa_mma_qsplit
+                              ? "kernel_qwen4_qsa_attention_gqa_mma_qsplit_f32"
+                              : "kernel_qwen4_qsa_attention_gqa_mma_f32")
+                       : (prob_cache_enabled
+                              ? "kernel_qwen4_qsa_attention_bf16_f32"
+                              : "kernel_qwen4_qsa_attention_bf16_f32_legacy"));
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline(kernel_name);
+        if (!pipeline && gqa_t2d_path) {
+            /* Kernel absent (pre-tensor toolchain): fall back. */
+            pipeline = ds4_gpu_get_pipeline(
+                prob_cache_enabled
+                    ? "kernel_qwen4_qsa_attention_bf16_f32"
+                    : "kernel_qwen4_qsa_attention_bf16_f32_legacy");
+        }
         if (!pipeline) return 0;
         /* The fused attention kernel stages per-simdgroup output partials
          * plus two combine rows; keep the older score-sheet size as a floor
@@ -49573,6 +49610,17 @@ int ds4_gpu_qwen4_qsa_attention_bf16(
         if (gqa_mma_path &&
             gqa_mma_bytes > scratch_floats * sizeof(float))
             scratch_floats = (gqa_mma_bytes + sizeof(float) - 1u) /
+                             sizeof(float);
+        /* GQA T2D scratch: 16x256 Q (half) + 32x256 K (half, overlaid
+         * post-QK by the 128x32 fp32 V chunk) + 16x32 S/P (float) +
+         * 32 selections + 16x2 stats + 16 factors + 16 votes. */
+        const uint64_t gqa_t2d_bytes =
+            (uint64_t)16u * 256u * 2u + (uint64_t)32u * 256u * 2u +
+            (uint64_t)16u * 32u * 4u + 32u * 4u + 16u * 2u * 4u +
+            16u * 4u + 16u * 4u;
+        if (gqa_t2d_path &&
+            gqa_t2d_bytes > scratch_floats * sizeof(float))
+            scratch_floats = (gqa_t2d_bytes + sizeof(float) - 1u) /
                              sizeof(float);
         const NSUInteger scratch_bytes =
             (NSUInteger)scratch_floats * sizeof(float);
@@ -49606,11 +49654,13 @@ int ds4_gpu_qwen4_qsa_attention_bf16(
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         if (!enc) return 0;
-        enc.label = gqa_mma_path
-            ? @"Qwen sparse QSA attention GQA MMA"
-            : (prob_cache_enabled
-                   ? @"Qwen sparse QSA attention"
-                   : @"Qwen sparse QSA attention legacy");
+        enc.label = gqa_t2d_path
+            ? @"Qwen sparse QSA attention GQA T2D"
+            : (gqa_mma_path
+                   ? @"Qwen sparse QSA attention GQA MMA"
+                   : (prob_cache_enabled
+                          ? @"Qwen sparse QSA attention"
+                          : @"Qwen sparse QSA attention legacy"));
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:ds4_gpu_tensor_buffer(q)
@@ -49637,9 +49687,12 @@ int ds4_gpu_qwen4_qsa_attention_bf16(
         }
         [enc setThreadgroupMemoryLength:scratch_bytes atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(
-                 queries, gqa_mma_path ? kv_heads : query_heads, 1)
+                 queries,
+                 (gqa_mma_path || gqa_t2d_path) ? kv_heads : query_heads, 1)
              threadsPerThreadgroup:MTLSizeMake(
-                 gqa_mma_path ? 192u : 256u, 1, 1)];
+                 gqa_t2d_path ? 128u
+                     : (gqa_mma_path ? 192u : 256u),
+                 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(
             cb, owned, "Qwen sparse QSA attention");

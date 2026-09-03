@@ -977,11 +977,104 @@ ms/layer), and the concrete backlog (F16 S tile, pf hoisting,
 one-pass softmax, double-buffered staging) for whoever returns with a
 precision budget that admits F16 weights.
 
+THE CLOSURE IS REOPENED AND LANDED (2026-09-03, M5 Max, Metal-4
+TensorOps).  The M5 precision correction (item 9) supplied the lever
+the F16 closure lacked: `matmul2d` with THREADGROUP-STAGED fp32
+cooperative tensors lowers to exact fp32 FMA, so the P matrix — the
+binding failure — can stay fp32 while the matmul machinery feeds the
+Neural Accelerator units.  `kernel_qwen4_qsa_attention_gqa_t2d_f32`
+(metal/qwen4.metal, DEFAULT ON wherever the Metal-4 tensor route is
+enabled at prefill batch sizes; `DS4_QWEN4_QSA_GQA_T2D=0` restores the
+scalar kernel and `DS4_QWEN4_QSA_GQA_T2D_MIN_ROWS`, default 32, keeps
+decode and verifier rows on the scalar exact-arithmetic authority)
+runs one 128-thread threadgroup per (query, KV head): the 12 query
+heads (padded to M=16) share every gathered K/V tile, QK^T and PV run
+as cooperative matmuls over threadgroup-staged tiles, and the 12x
+gather-traffic cut of tile sharing finally pays.  PRECISION DESIGN
+(constrained by three probe findings in speed-bench/t2d_probe.metal:
+with a cooperative-tensor destination both input types must MATCH, so
+a mixed fp32-P / half-V PV pair is inexpressible; the fp32-staged
+matmul is exact at these shapes — rel 3.6e-7 vs double on M5 — while
+half/half measures 3.3e-4; and the destination store wants extents
+(N, M) with strides {1, N} for plain [m][n] row-major): the softmax
+probabilities and both PV operands are fp32 — exact products, exact
+accumulate — and only the QK operands stage as half: K converts
+losslessly BF16->F16 and Q rounds F16 once per group, the residual the
+Q-split probe already measured non-binding.  The all-fp32 twin
+(gqa_t2d_exact in speed-bench/gqa_mma_proto.metal) differs from the
+shipped split by 0.0e+00 to 6.8e-07 across fixture magnitudes while
+costing 2.3x (213.9 vs 87.1 ms/layer standalone), so the split is the
+production choice.  Structure notes: 32-token tiles, the Q tile
+(16x256 half) and K tile (32x256 half, gathered with 128-bit uint4
+loads — the scalar-ushort gather cost 68 ms/layer by itself) stay
+resident with the QK contraction as ONE K=256 matmul2d, S and P share
+one buffer element-for-element (the softmax overwrites each scaled
+score by its probability in place, 8 threads per row with
+simd_shuffle row reductions), the fp32 V chunks (16 KB, [dim][token])
+overlay the dead K tile, the O accumulators live in cooperative-tensor
+registers across the whole tile loop with the rare running-max rescale
+applied in registers through `get_multidimensional_index`
+(ids[0] = n = dim, ids[1] = m = head), and the threadgroup totals
+27008 B against the 32768 B M5 limit.  MEASURED (M5 Max, standard
+pack, qsa-prefill-bench 8192 rows): gathered attention 158.1 -> 89.6
+ms/layer (x12 = 1897 -> 1075 ms per 8K chunk), with the F16-MMA kernel
+at 121.5-123.4 on this machine for reference (quality-failed class).
+Fixtures: `test_qsa_attention_gqa_t2d` pins the kernel against the
+exact CPU reference and the scalar kernel at fixture magnitudes
+(7.3e-06) and production magnitudes (score spread ~+-20: max 0.0265,
+MEAN drift 7.7e-05 — the failed F16-MMA variant measured 3.08e-04 mean
+under the same fixture — plus an observable-engagement check).
+End-to-end quality on the exact-checkpoint fixture (100 cases,
+score_official, ctx 4096): target MAE 0.037750 -> 0.037878 (+0.000127,
+far inside the 0.002-0.005 accepted budget; the failed F16 route was
++0.0137), avg NLL +0.000284, top-1 rate -0.0004 (one rounding-scale
+argmax flip), top-logprob coverage identical.  16K logits delta vs the
+kill switch: whole-vocab mean 0.298 / max 2.15, top-20 rms 0.558 —
+well inside the accepted A/B/C route family (top-k logit rms
+1.55-1.87, max delta 6.2-8.3); the 16K+128 greedy anchor diverges at
+token 1 on a narrative near-tie with both continuations fluent
+(accepted-class divergence; the OFF anchor reproduces the prior
+defaults).  Decode unchanged (route gated off below 32 queries; the
+M=1 path is untouched).
+
+End-to-end ds4-bench sweep (same recipe as the config A/B/C table:
+8192-row chunks, 32768-token interval frontiers on tripled
+promessi_sposi, 64-token greedy decode, back-to-back ON-then-OFF pair
+under identical conditions; single pass per arm):
+
+```text
+frontier            32K    64K    96K   128K   160K   192K   224K  262078
+prefill ON  tok/s   1321   1257   1206   1178   1127   1122   1088    1048
+prefill OFF tok/s   1034   1005    980    941    927    919    909     877
+ON gain             +28%   +25%   +23%   +25%   +22%   +22%   +20%    +20%
+decode  ON  tok/s  39.1   38.8   38.5   37.4   36.5   36.6   36.3    35.3
+decode  OFF tok/s  38.5   37.7   39.0   36.3   36.6   36.1   35.5    34.6
+```
+
+The whole-262078-token frontier at 1048 tok/s moves this M5 Max past
+the M3 Ultra's 1010-1025 record band: the long-context deficit was the
+gathered-attention term, not the scan.  Post-change stage attribution
+at the fresh-chunk geometry (qsa-prefill-bench 8192 rows, defaults):
+routed MoE 29.1, gathered attention 89.6 (was 158.1), streaming top-k
+13.2, GDN R4 12.1, dense q8 11.0 ms/layer — the gathered attention
+drops from the largest attention-side stage to roughly the dense
+family's per-layer weight, and the remaining prefill budget is again
+MoE-dominated.
+
 Two probes used by this work are kept as inert scaffolds:
 `speed-bench/sg_layout_probe.metal` and `speed-bench/sg_layout_probe.m`
 print the per-thread element mapping of `simdgroup_matrix` (it is not
 stable across compilations, so kernels must not index
-`thread_elements()` directly).
+`thread_elements()` directly).  The matmul2d reopen added a third:
+`speed-bench/t2d_probe.metal` and `speed-bench/t2d_probe.m` pin the
+cooperative-tensor operand/store layout conventions at the attention
+shapes (LEFT [m][k] and RIGHT [n][k] k-contiguous, destination store
+through (N, M) extents with strides {1, N}), the operand-type-match
+static_assert, the exactness classes (fp32-staged exact, half/half
+binary16-class), and the raw chunked-matmul rates — rebuild with
+`cc -O2 -std=c99 -framework Foundation -framework Metal -o
+speed-bench/t2d_probe speed-bench/t2d_probe.m` and run from the repo
+root.
 
 The experimental Apple Neural Engine runtime that this branch once
 carried (`ds4_ane.m`, its transport kernels, diagnostics, and the

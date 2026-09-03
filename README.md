@@ -306,12 +306,15 @@ kernels, `DS4_QWEN4_NO_IDX_SELECT=1` the argsort top-k and
 `--batched-session N` keeps N sessions resident; their decode steps run one
 after another rather than as one grouped batch, so it buys concurrency, not
 throughput. Thinking is on by default with the model's `xhigh` reasoning
-instruction; the server's `qwen3.8-flash-next-chat` alias disables it and
-`qwen3.8-flash-next-reasoner` forces it. Tool calls use the model's native
-`<tool_call><function=...><parameter=...>` format in both the server and the
-agent. Disk KV checkpoints and live prefix reuse work as for the other models;
-the recurrent state travels with the checkpoint, so a session cannot be rewound
-to an arbitrary earlier position and a shorter prompt is prefilled again.
+instruction; `reasoning_effort` `low`, `medium` or `xhigh` selects the model
+card's levels (`chat_template_kwargs` with `enable_thinking` and
+`reasoning_effort` is accepted too), the server's `qwen3.8-flash-next-chat`
+alias disables thinking and `qwen3.8-flash-next-reasoner` forces it. Tool
+calls use the model's native `<tool_call><function=...><parameter=...>` format
+in both the server and the agent. Disk KV checkpoints and live prefix reuse
+work as for the other models; the recurrent state travels with the checkpoint,
+so a session cannot be rewound to an arbitrary earlier position and a shorter
+prompt is prefilled again.
 
 The model's native window is 262144 tokens. For longer prompts set
 `DS4_QWEN4_YARN_FACTOR=4`, which

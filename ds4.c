@@ -40719,6 +40719,8 @@ static void chat_push_bos_sequence(const ds4_vocab *vocab, token_vec *out) {
 
 const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode) {
     switch (mode) {
+    case DS4_THINK_LOW:
+    case DS4_THINK_MEDIUM:
     case DS4_THINK_HIGH: return "Reasoning Effort: High";
     case DS4_THINK_MAX:  return "Reasoning Effort: Max";
     case DS4_THINK_NONE: return NULL;
@@ -40740,13 +40742,17 @@ static void chat_push_think_prefix(const ds4_vocab *vocab,
     }
 }
 
-/* Qwen3.8 ChatML.  Thinking on renders the template's default xhigh
- * reasoning instruction into the system turn and opens <think>; thinking off
- * closes an empty think block, as the reference template does. */
+/* Qwen3.8 ChatML.  Thinking on renders the template's reasoning instruction
+ * for the effort level (xhigh by default, low, none for medium) into the
+ * system turn and opens <think>; thinking off closes an empty think block, as
+ * the reference template does. */
 static const char *DS4_QWEN4_REASONING_XHIGH =
     "Reasoning effort is set to xhigh. Please think carefully through the task, "
     "validate key assumptions, consider plausible alternatives, and prioritize "
     "correctness, consistency, and clarity in the final answer.";
+static const char *DS4_QWEN4_REASONING_LOW =
+    "Reasoning effort is set to low. Keep your thinking brief and focused, "
+    "moving directly to the conclusion without unnecessary elaboration.";
 
 static void qwen4_chat_open(const ds4_vocab *vocab, const char *role, token_vec *out) {
     token_vec_push(out, vocab->im_start_id);
@@ -56141,7 +56147,7 @@ static void ds4_linux_graph_backend_set_oom_score(ds4_backend backend) {
 }
 
 bool ds4_think_mode_enabled(ds4_think_mode mode) {
-    return mode == DS4_THINK_HIGH || mode == DS4_THINK_MAX;
+    return mode != DS4_THINK_NONE;
 }
 
 const char *ds4_think_mode_name(ds4_think_mode mode) {
@@ -56149,6 +56155,8 @@ const char *ds4_think_mode_name(ds4_think_mode mode) {
     case DS4_THINK_NONE: return "none";
     case DS4_THINK_HIGH: return "high";
     case DS4_THINK_MAX:  return "max";
+    case DS4_THINK_LOW:  return "low";
+    case DS4_THINK_MEDIUM: return "medium";
     }
     return "unknown";
 }
@@ -67216,6 +67224,8 @@ const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode) {
     switch (mode) {
     case DS4_THINK_HIGH:
     case DS4_THINK_MAX:  return DS4_QWEN4_REASONING_XHIGH;
+    case DS4_THINK_LOW:  return DS4_QWEN4_REASONING_LOW;
+    case DS4_THINK_MEDIUM: return NULL;   /* the template sets no instruction for medium */
     case DS4_THINK_NONE: return NULL;
     }
     return NULL;

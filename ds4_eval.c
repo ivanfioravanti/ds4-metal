@@ -4210,6 +4210,19 @@ int main(int argc, char **argv) {
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
         .distributed = cfg.dist,
     };
+    /* The eval harness samples every token (default temperature 1.0) and
+     * evals it one at a time, so the greedy speculative executor never
+     * runs here.  A loaded MTP sidecar only adds the per-token drafter
+     * history pass (~13 percent decode overhead measured on M5 Max);
+     * warn instead of silently paying it. */
+    if (cfg.mtp_path && cfg.mtp_path[0] && cfg.mtp_draft_tokens > 1) {
+        fprintf(stderr,
+                "ds4-eval: note: --mtp-draft has no effect in this harness "
+                "(tokens are sampled one at a time; speculative decoding "
+                "never engages) — the MTP sidecar only adds the per-token "
+                "drafter-history overhead.  Use ds4-server --mtp-draft for "
+                "speculative decoding.\n");
+    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-eval: %s\n", dist_err);

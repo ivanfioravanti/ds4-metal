@@ -1648,6 +1648,16 @@ The verify pass prices every row at ~7.7 ms and the M5's acceptance on
 counting is near-perfect at every depth, which is exactly why deeper
 drafts keep paying here longer than on the M3.
 
+One harness boundary measured while closing the session: `ds4-eval`
+generates by sampling each token (default temperature 1.0) through the
+one-token-at-a-time eval loop, so the greedy speculative executor never
+runs there — passing `--mtp-model/--mtp-draft` to `ds4-eval` fires zero
+speculative cycles and only adds the per-token drafter-history pass
+(measured 39.3 -> 44.1 s wall on two questions, +12 percent, identical
+outputs; zero `Qwen MTP timing` lines in the log).  ds4-eval now prints a
+note when it sees those flags; speculative decoding is a `ds4-server
+--mtp-draft` feature.
+
 ## Integration status
 
 Pack conversion, trusted-local loading, single-base Metal mapping, adaptive

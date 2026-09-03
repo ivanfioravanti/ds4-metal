@@ -283,24 +283,19 @@ because an importance matrix collected with llama.cpp never sees them. The
 `hc_=f16` override keeps the hyper-connection mixers at F16: the Q8_0 base
 type would requantize them, and DS4's Q8_0 prefill GEMM is several times
 slower than its F16 one on their shapes, which halved prefill speed. On the
-same 256-token text the mean KL against the 8-bit reference is 5e-3 for Q8,
-1.6e-2 for Q4K, 2.1e-2 for MXFP4, 8e-2 for Q2K and 1e-1 for IQ2 even with a
-standard calibration corpus, so Q2K is the better two-bit choice unless the
-last 5 GB matter. All need a Mac with more unified memory than the file
-size. On an M3 Ultra the Q8 file
-decodes at about 46 tokens per second, the smaller tiers at about 48-51, and
-MTP lifts greedy decoding to about 58. With a temperature above zero MTP
-accepts drafts that match the greedy token, like the GLM path, which skews
-sampled output toward the greedy choice; `--mtp-exact-sampling` keeps the
-exact sampling distribution and still decodes at about 48 tokens per second
-against 50 opportunistic and 44 without MTP. The serve script passes it.
-Prefill runs in 8192-token chunks (`DS4_QWEN4_PREFILL_CHUNK` overrides; the
-transient buffers scale with it, about 12 GB at 8192): on an M3 Ultra the Q8
-file prefills at about 1000 tokens per second up to 64k of context and 860 at
-256k, the Q4K file at about 900 and 860, with decode flat at 39-43 tokens per
-second over the whole range. Two switches restore earlier paths for A/B
-checks, `DS4_QWEN4_NO_FUSE=1` (unfused decode kernels) and
-`DS4_QWEN4_NO_IDX_SELECT=1` (the argsort top-k), and `DS4_QWEN4_TIMING=1`
+same 256-token text Q8 stays closest to the 8-bit reference, then Q4K,
+MXFP4, Q2K and IQ2 (even with a standard calibration corpus), so Q2K is the
+better two-bit choice unless the last 5 GB matter. All need a Mac with more
+unified memory than the file size. MTP speeds up greedy decoding. With a
+temperature above zero MTP accepts drafts that match the greedy token, like
+the GLM path, which skews sampled output toward the greedy choice;
+`--mtp-exact-sampling` keeps the exact sampling distribution at a smaller
+speedup. The serve script passes it. Prefill runs in 8192-token chunks
+(`DS4_QWEN4_PREFILL_CHUNK` overrides; the transient buffers scale with it,
+about 12 GB at 8192). Two switches restore earlier paths for A/B
+checks, `DS4_QWEN4_NO_FUSE=1` (unfused decode kernels),
+`DS4_QWEN4_NO_IDX_SELECT=1` (the argsort top-k) and `DS4_QWEN4_NO_ATTN_MM=1`
+(the per-token attention kernel for prefill batches), and `DS4_QWEN4_TIMING=1`
 prints stage timings.
 
 ```sh
@@ -326,9 +321,8 @@ The model's native window is 262144 tokens. For longer prompts set
 `DS4_QWEN4_YARN_FACTOR=4` (or `DS4_YARN=4` with the serve script), which
 applies the static YaRN scaling from the model card, up to about 1M tokens;
 use a factor of 2 for 512k. A 369k-token two-needle prompt is answered
-correctly this way (about 490 tokens per second of prefill, 35 of decode at
-that length). Static YaRN costs a little accuracy on short prompts, so leave
-it off otherwise.
+correctly this way. Static YaRN costs a little accuracy on short prompts, so
+leave it off otherwise.
 
 Images go through the model's Qwen3-VL vision tower. Pass llama.cpp's mmproj
 file (`ggml-org/Qwen3.8-Flash-Next-GGUF` ships a Q8_0 one, or run

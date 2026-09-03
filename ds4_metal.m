@@ -47169,6 +47169,7 @@ enum {
     QWEN4_K_ATTN_MERGE_NPT8,
     QWEN4_K_ATTN_MERGE_NPT4,
     QWEN4_K_ATTN_MERGE_NPT1,
+    QWEN4_K_ATTN_MM,
     QWEN4_K_MOE_MID,
     QWEN4_K_MOE_DOWN,
     QWEN4_K_MOE_REDUCE,
@@ -47219,6 +47220,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_attn_merge_npt8",
     "kernel_qwen4_attn_merge_npt4",
     "kernel_qwen4_attn_merge_npt1",
+    "kernel_qwen4_attn_mm",
     "kernel_qwen4_moe_mid",
     "kernel_qwen4_moe_down",
     "kernel_qwen4_moe_reduce",
@@ -47614,7 +47616,7 @@ int ds4_gpu_qwen4_idx_score_tensor(
     }
     if (n_tokens > 2u && n_idx_head == 4u && idx_dim == 128u) {
         return qwen4_dispatch(QWEN4_K_IDX_SCORE_MM, &args, sizeof(args), b, 3,
-                              MTLSizeMake((n_blocks + 31) / 32, (n_tokens + 7) / 8, 1), MTLSizeMake(128, 1, 1), 0);
+                              MTLSizeMake((n_blocks + 63) / 64, (n_tokens + 15) / 16, 1), MTLSizeMake(128, 1, 1), 0);
     }
     return qwen4_dispatch(QWEN4_K_IDX_SCORE, &args, sizeof(args), b, 3,
                           MTLSizeMake((n_blocks + 127) / 128, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
@@ -47708,6 +47710,11 @@ int ds4_gpu_qwen4_attn_decode_tensor(
         if (!qwen4_bind_tensor(&b[7], part, part_bytes, "attn partials")) return 0;
     } else {
         b[7] = b[6];
+    }
+    if (n_splits == 1 && n_tokens > 2u && head_dim == 256u && n_head / n_head_kv <= 16u &&
+        getenv("DS4_QWEN4_NO_ATTN_MM") == NULL) {
+        return qwen4_dispatch(QWEN4_K_ATTN_MM, &args, sizeof(args), b, 7,
+                              MTLSizeMake(n_head_kv, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
     }
     const uint32_t npt = head_dim / 32u;
     const int kd = npt == 8u ? QWEN4_K_ATTN_DECODE_NPT8 : npt == 4u ? QWEN4_K_ATTN_DECODE_NPT4 :

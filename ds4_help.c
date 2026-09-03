@@ -182,6 +182,9 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         if (tool == DS4_HELP_EVAL || tool == DS4_HELP_BENCH) {
             opt(fp, c, "--mtp-model FILE", "External MTP or DSpark support GGUF.");
         }
+        if (tool == DS4_HELP_BENCH) {
+            opt(fp, c, "--mtp-draft N", "Enable Qwen MTP speculative decode with this draft width, 1..16. Default: 1 (sidecar loaded, no speculation).");
+        }
         if (tool == DS4_HELP_EVAL) {
             opt(fp, c, "--mtp-draft N", "Maximum Qwen autoregressive MTP draft tokens, 1..16. Default: 1");
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");

@@ -39,6 +39,7 @@ typedef struct {
     const char *model_path;
     const char *ple_path;
     const char *mtp_path;
+    int mtp_draft_tokens;
     const char *vision_path;
     const char *prompt_path;
     const char *chat_prompt_path;
@@ -279,6 +280,13 @@ static bench_config parse_options(int argc, char **argv) {
             c.ple_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-model")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp-draft")) {
+            const long v = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (v < 1 || v > 16) {
+                fprintf(stderr, "ds4-bench: --mtp-draft must be between 1 and 16\n");
+                exit(2);
+            }
+            c.mtp_draft_tokens = (int)v;
         } else if (!strcmp(arg, "--vision")) {
             c.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dspark")) {
@@ -774,6 +782,7 @@ int main(int argc, char **argv) {
         .model_path = cfg.model_path,
         .ple_path = cfg.ple_path,
         .mtp_path = cfg.mtp_path,
+        .mtp_draft_tokens = cfg.dspark ? 0 : cfg.mtp_draft_tokens,
         .vision_path = cfg.vision_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
@@ -915,7 +924,8 @@ int main(int argc, char **argv) {
     const bool distributed =
         cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR ||
         cfg.tp.role == DS4_TP_LEADER;
-    const bool speculative = cfg.dspark && ds4_engine_mtp_draft_tokens(engine) > 1;
+    const bool speculative = ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        (cfg.dspark || (cfg.mtp_path && cfg.mtp_path[0]));
     if (cfg.dspark && !speculative) {
         fprintf(stderr, "ds4-bench: DSpark support model did not enable speculative decoding\n");
         if (out != stdout) fclose(out);
@@ -926,7 +936,8 @@ int main(int argc, char **argv) {
     }
     if (speculative) {
         fprintf(stderr,
-                "ds4-bench: DSpark enabled with draft width %d; frontier restoration uses session snapshots\n",
+                "ds4-bench: speculative decoding enabled (%s) with draft width %d; frontier restoration uses session snapshots\n",
+                cfg.dspark ? "DSpark" : "Qwen MTP",
                 ds4_engine_mtp_draft_tokens(engine));
     }
     ds4_session_snapshot snap = {0};
@@ -1062,12 +1073,12 @@ int main(int argc, char **argv) {
                     toks, (int)(sizeof(toks) / sizeof(toks[0])),
                     err, sizeof(err));
                 if (ntok < 0) {
-                    fprintf(stderr, "ds4-bench: DSpark decode at frontier %d failed: %s\n", frontier, err);
+                    fprintf(stderr, "ds4-bench: speculative decode at frontier %d failed: %s\n", frontier, err);
                     rc = 1;
                     break;
                 }
                 if (ntok == 0) {
-                    fprintf(stderr, "ds4-bench: DSpark decode at frontier %d accepted no tokens\n", frontier);
+                    fprintf(stderr, "ds4-bench: speculative decode at frontier %d accepted no tokens\n", frontier);
                     rc = 1;
                     break;
                 }

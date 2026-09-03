@@ -1174,6 +1174,155 @@ were prefill-shaped standalone benches). The removal history and all
 ANE measurements remain recorded in QWEN38_PERF_HANDOFF.md items 3, 9,
 and 16-17.
 
+### Session twenty-two: long-context decay attribution, GDN prefill width, dense-projection audit (M3 Ultra)
+
+THE LONG-CONTEXT DECAY IS NOW FULLY ATTRIBUTED (2026-09-03, standard
+Q4_0-routed pack, DS4_METAL_GPU_STAGE_PROFILE + DS4_QWEN4_PROFILE on the
+full 32K-through-262078 sweep, 31 per-chunk GPU stage tables plus the
+qsa-prefill-bench long-context model).  The profiled sweep reproduced the
+decay (1218 -> 1025 tok/s, -15.8 percent; decode 27-29 under the flush
+cost as documented) and the GPU stays ~100 percent busy at every
+frontier: per-chunk GPU busy grows 6698 -> 8049 ms while chunk wall grows
+by the same ~1.3 s, so there is NO hidden PLE, I/O, scheduling, or paging
+term (the PLE SSD pread wait is flat ~196 ms/chunk and fully hidden
+behind layer 0 at every context).  Growth decomposition of the +1351 ms
+per 8192-row chunk, first chunk (cache_pos=0) versus last (245760):
+
+```text
+stage                                fresh    last    delta   share
+QSA streaming score+bitonic top-k     73.5  1046.7    +973    72%   linear in visible blocks
+gathered QSA attention               735.6   895.0    +159    12%   causal ramp -> full 2048
+dense Q8_0 family                   2500.0  2600.9    +101     7.5% \  synchronized ~+4% step at
+routed Q4_0 grouped matmul           2113.4  2195.8     +82     6%   /  cache ~147K, oscillating
+GDN R4 + prep + remainder              379     391      +12     1%  /  (see below)
+```
+
+The gathered-attention term saturates by ~64K (every query selects its
+full 2048-token budget; the bench's default geometry already models it).
+The dense/MoE/GDN step is NOT context-structural: all three families sit
+flat (2490/2110/346 ms) through cache_pos 139264, then step together at
+~147K — roughly 2.5 minutes into sustained full-power load — and
+oscillate afterward (a dip back to 2582 at 196608); eight back-to-back
+fixed-work qsa-prefill-bench runs measure dead-flat dense/MoE (21.78-21.81
+and 40.70-40.74 ms).  The signature — synchronized across unrelated
+kernel families, uniform ~3.5-4 percent per dispatch, non-monotone —
+matches the sustained-load clock envelope, not a capacity or paging
+effect; recorded as machine condition, not a kernel target.
+
+The scan, the one kernel-level term, was attacked a third time and found
+at its floor for this organization.  At the 65536-visible-block geometry
+(DS4_BENCH_QSA_VISIBLE_BLOCKS=65000) the stage measures 91.6 ms/layer
+split 46.3 scoring + 43.7 merging (DS4_QWEN4_QSA_TOPK_ABLATE); the scorer
+runs the simdgroup-matrix MM kernel at ~12 TFLOP/s effective (near the
+wall).  Two byte-identical-by-construction merge variants were built,
+measured NEUTRAL within the +/-0.8 ms run noise at both the long and
+fresh geometries, and reverted: (a) the initial threadgroup load of
+[512,2048) is dead in both the fast path (overwritten before read) and
+the full-sort fallback (rebuilt from global before read) — cutting it
+halves the merge's tile-score global reads but measured 43.7 -> 42.9;
+(b) replacing the ten-stage bitonic merge tail (eleven threadgroup
+barriers per query tile) with a rank-select scatter (binary-search merge
+ranks against the other sorted span, one barrier, unique-key total order
+so the top-512 is algorithm-independent) measured 43.0 vs 43.2
+alternating A/B.  Conclusion: the merge-select kernel's cost is its
+fixed per-dispatch work (the 512-candidate global round-trip per query
+tile, the survivor filter, atomics, launch overhead), not its loads or
+its sort network; the next lever is organizational (cross-query
+candidate sharing or a hierarchical prefilter), out of bounded scope.
+
+TWO gqa_share MICRO-OPTS MEASURED NEGATIVE AND REVERTED (the
+kernel_qwen4_qsa_attention_gqa_share_f32 probes): (1) exp-skip — in the
+online softmax, whichever arm loses the max comparison subtracts the
+running max from itself, so its exp() is exactly 1.0f and skipping the
+multiplies is bit-identical (fixture-confirmed 0/245760 at both
+magnitudes) — but the simdgroup-uniform branch measured 70.0 -> 85.6
+ms/layer (+22 percent): the kernel sits on the HPERG=3 occupancy cliff
+and the branch costs more than the saved SFU work.  (2) An explicit
+software pipeline prefetching the next valid rank's K/V uint4 pair —
+91.4 ms/layer (+31 percent, register pressure past the same cliff) AND
+not bit-identical under fast math (30154/245760 mismatched at 3.7e-9
+max: the restructured loop contracts the dot/FMA chain differently).
+The lesson mirrors the HPERG sweep: the kernel is L2-bandwidth-bound
+with its loads already overlapped by the compiler; any added register or
+control-flow pressure loses 20-30 percent.  Do not retry without new
+organization-level evidence.
+
+GDN PREFILL-WIDTH SWEEP LANDED (commit 1a790da): the BF16-state
+recurrence's R was tuned at decode shapes, so the rows-per-thread /
+threadgroup-height space was swept at the prefill geometry
+(qsa-prefill-bench 8192 rows, DS4_BENCH_GDN_ROWS and the existing
+DS4_QWEN4_GDN_SIMDGROUPS):
+
+```text
+ms/layer     simdgroups=1   =2    =4    =8
+R4               9.82      9.95  9.05  11.06
+R2              14.04     13.93  12.93  12.43
+R1              21.58     19.63  18.13  17.60
+```
+
+R4 wins at every height — at prefill lengths the t-loop's k/q load
+amortization over R rows dominates the extra parallelism of narrower
+variants, inverting the decode-tuned intuition (the R1/R2 BF16-state
+kernels stay in-tree for study, matching the fp32 precedent).  The one
+win is threadgroup HEIGHT: four simdgroups per threadgroup at R4
+measures 9.95 -> 9.05 ms/layer (-9 percent) at 8192 rows and 2.71 ->
+2.49 at 2048, going neutral-to-worse at verify-sized rows (0.29 -> 0.30
+at 16), so the dispatch now row-gates the default: n_tokens >= 1024
+uses 4 simdgroups, smaller batches keep 2, and
+DS4_QWEN4_GDN_SIMDGROUPS still overrides both.  The kernel has no
+threadgroup memory or barriers, so the height change only regroups
+threads and outputs are byte-identical; test_gdn_length gained a
+BF16-state cross-R parity block at lengths {1,5,17,2048,8192} (outputs
+tolerance-pinned at the fp32 R-sweep class — fast-math contraction
+differs per R instantiation — and final states byte-pinned).
+
+DENSE-PROJECTION AUDIT (commit 9eede07): the per-chunk inventory of
+every dense Q8_0 dispatch at prefill — the "Qwen model Q8_0 projection"
+family is exactly 504 command buffers per chunk: GDN qkv and z (36
+each), QSA query+gate / k / v / index (12 each; query+gate already one
+dispatch), shared gate / up / down (48 each), HC up 4x48 and HC down
+48; already-fused families cover GDN out+HC-write, QSA output+HC-write,
+the shared router+gated add, and the SwiGLU epilogue.  The audit's one
+actionable finding is a routing hole, not a fusion pair: the PLE
+key/value projections (the only BF16-activation Q8_0 consumers, 32
+dispatches per chunk over the 512-token SSD staging tiles) dispatch the
+scalar kernel_qwen4_q8_0_bf16 at every row count — one simdgroup per
+output row per TOKEN, so every token re-reads the whole weight matrix
+(~13 GB per 512-row key tile against ~0.4 GB for the 32-row tiled
+grid).  The stage measured 263.4 ms of a 6.7 s chunk (3.9 percent GPU
+busy).  The fix lands OPT-IN:
+DS4_QWEN4_Q8_0_BF16_MUL_MM=1 (default off) widens the BF16 activations
+with a lossless kernel_qwen4_bf16_widen_f32 and dispatches the shared
+tiled kernel_mul_mm_q8_0_f32 (memory-barriered through the possibly
+concurrent batch encoder; DS4_QWEN4_Q8_0_BF16_MUL_MM_MIN_ROWS, default
+32, keeps decode and verifier rows on the scalar kernel either way).
+MEASURED with the route on: 263.4 -> 26.5 ms per 8K chunk (10x, ~237
+ms, ~+3.4 percent fresh-chunk prefill).  It ships opt-in because the
+drift gate FAILED this branch's stated budget: 16K-prefill
+whole-vocab logits delta versus the scalar authority 0.130 mean / 0.957
+max against the 0.074-0.083 / 0.55-0.66 envelope (for scale, the
+accepted T2D route measured 0.298/2.15; the rejected F16-MMA attention
+1.21/11.1); top-1 argmax unchanged and greedy identical for 128 tokens
+at 16K context, and with the flag unset the 16K logits dump equals the
+scalar baseline BYTE FOR BYTE (pinned by re-run).  Fixture:
+test_model_q8_0_bf16_mul_mm_rows (rows 64/33 x out 128/67 through the
+tiled path at the F16-rounding tolerance class, rows 8 on the scalar
+path, toggled via the env in one process).  Owner can flip the default
+after weighing a 0.13-mean logit drift against +3.4 percent prefill.
+The remaining same-input pairs are REPORTED ONLY — GDN qkv+z, QSA
+k/v/index, shared gate+up, and the GDN decay/beta BF16 controls each
+read the same [rows x 2560] activation through separate dispatches, and
+fusing any of them needs a two-weight-range tiled kernel (a new matmul
+variant; the tiles themselves are at the 22 TFLOP/s wall and are
+explicitly out of scope); the avoided re-reads total ~12 GB per 8K
+chunk, a ~1.5-2 percent ceiling against the compute-bound family.
+
+Clean verification sweep at HEAD (same recipe, nothing else on the
+GPU): prefill 1217 -> 1066 tok/s across the frontiers, decode 31.3-33.5
+— at or above the 1161 -> 953 / 30-32 reference band on every frontier
+(the tail margin is mostly session variance plus the GDN height win;
+same-session stage comparisons above are the honest deltas).
+
 ## Official-reference quality baseline
 
 100 continuations collected from OpenRouter `qwen/qwen3.8-flash`

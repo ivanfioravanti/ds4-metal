@@ -26,6 +26,8 @@ typedef enum {
     DS4_THINK_NONE,
     DS4_THINK_HIGH,
     DS4_THINK_MAX,
+    DS4_THINK_LOW,      /* Qwen3.8 reasoning_effort low/medium; other models render them as HIGH */
+    DS4_THINK_MEDIUM,
 } ds4_think_mode;
 
 typedef enum {

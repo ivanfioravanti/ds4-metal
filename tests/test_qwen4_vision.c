@@ -1,11 +1,11 @@
-/* Dump the Qwen3.8 vision tower output for one image so a Python reference
- * can compare it: test_qwen4_vision MMPROJ IMAGE OUT [min_tokens max_tokens] */
-#include <stdio.h>
-#include <stdlib.h>
+/* Dump the Qwen3.8 vision tower output for one image; tests/qwen4_vision_ref.py
+ * compares it against the HF vision model */
 #include "ds4.h"
 
-/* ds4.c diagnostic: run the vision tower from an mmproj GGUF alone and write the
- * merged embeddings (u32 tokens, dim, grid rows, grid cols, then floats) */
+#include <stdio.h>
+#include <stdlib.h>
+
+/* ds4.c: writes u32 tokens, dim, grid rows, grid cols, then the merged embeddings as floats */
 int ds4_qwen4_vision_dump(const char *vision_path, const char *image_path, const char *out_path,
                           uint32_t min_image_tokens, uint32_t max_image_tokens);
 

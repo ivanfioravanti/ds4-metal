@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Regenerate ds4_qwen4_unicode.inc: codepoint classes for the Qwen3.8
-("qwen35") pre-tokenizer regex, taken from the `regex` module so they match
-the HF tokenizers pattern exactly.  The tables follow the module's Unicode
-version (the committed header records it), so regenerate with a current
-`regex` release (2025 or later, Unicode 16).
+"""Regenerate ds4_qwen4_unicode.inc, the codepoint classes of the Qwen3.8
+("qwen35") pre-tokenizer regex, from the `regex` module's Unicode tables.
+Use a current `regex` release; the generated header records its version.
+
 Usage: python gen_qwen4_unicode.py > ../ds4_qwen4_unicode.inc
 """
 import sys

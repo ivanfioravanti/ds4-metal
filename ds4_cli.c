@@ -1391,6 +1391,8 @@ static void tokens_remove(ds4_tokens *dst, int pos, int n) {
 
 static const char *repl_glm_reasoning_effort_text(ds4_think_mode mode) {
     switch (mode) {
+    case DS4_THINK_LOW:
+    case DS4_THINK_MEDIUM:
     case DS4_THINK_HIGH: return "Reasoning Effort: High";
     case DS4_THINK_MAX:  return "Reasoning Effort: Max";
     case DS4_THINK_NONE: return NULL;

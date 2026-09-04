@@ -1,32 +1,21 @@
 #!/usr/bin/env python3
 """Convert a Qwen3.8-Flash-Next (qwen4_exp) HF checkpoint into a DS4 GGUF.
 
-Wraps llama.cpp's conversion package (default checkout ~/repo/llama.cpp), so
-the file keeps the upstream `qwen4exp` schema (tensor names, metadata keys,
-tiled GDN value heads, folded Gemma norms), and adds the DS4 policy on top:
+Wraps llama.cpp's conversion package, so the file keeps the upstream
+`qwen4exp` schema, and adds the MTP block as the trailing blk.<n_layer>
+(nextn.* tensors plus `qwen4exp.nextn_predict_layers`); --no-mtp leaves it
+out for stock llama.cpp.  Norms, conv kernels, ssm_a, dt biases and the
+routers stay F32; the other tensor types follow the options below.
 
-  - The MTP draft block is exported as the trailing block blk.<n_layer>
-    with llama.cpp PR #27836 naming: nextn.enorm / nextn.hnorm /
-    nextn.eh_proj (= [fc_embedding | fc_hidden]) / nextn.hc_head_{norm,down,up}
-    plus the block's regular layer tensors, and `qwen4exp.nextn_predict_layers`.
-    --no-mtp leaves it out, which is what stock llama.cpp can load.
-  - Tensor types: 2D projections follow --outtype (q8_0 runs on Metal; f32 is
-    for the CPU reference path).  Hyper-connection mixers use --hc-type,
-    routed experts --experts (down_exps falls back to --experts-down when the
-    640-wide rows cannot take a 256-block type), the n-gram table --ngram.
-    Norms, conv kernels, ssm_a, dt biases and the router stay F32.
-
-The output is written to <out>.incomplete and atomically renamed.
-
-Usage:
-  ~/repo/llama.cpp/.venv/bin/python qwen4_exp_convert.py \\
-      --src <hf_snapshot_dir> --out <file.gguf> [--outtype q8_0|f32]
-      [--experts q8_0|mxfp4|q4_k] [--ngram q8_0|mxfp4|q4_0] [--no-mtp]
+Needs a llama.cpp master checkout (--llama-cpp or $LLAMA_CPP) and a Python
+with torch, safetensors and transformers.  The output is written to
+<out>.incomplete and renamed when complete.
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 from pathlib import Path
@@ -59,7 +48,6 @@ def main() -> None:
     sys.path.insert(0, os.path.join(args.llama_cpp, "gguf-py"))
     sys.path.insert(0, args.llama_cpp)
 
-    import logging
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
 
     import torch
@@ -156,7 +144,6 @@ def main() -> None:
                     or new_name.startswith("output_hc_"):
                 return hc_t
             if new_name.endswith((".indexer.q_proj.weight", ".indexer.k_proj.weight")):
-                # the indexer picks blocks, so its 20M parameters stay at the released precision
                 return indexer_t
             if self.match_model_tensor_name(new_name, T.FFN_GATE_INP, bid):
                 return Q.F32

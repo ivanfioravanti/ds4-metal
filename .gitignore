@@ -31,9 +31,9 @@
 /tests/test_q4k_dot
 /tests/test_sampling
 /tests/test_glm53_kda
-/tests/test_qwen4_host
-/tests/test_qwen4_spec
-/tests/test_qwen4_metal
+/tests/test_qwen4_kernels
+/tests/test_qwen4_vision
+/tests/test_deepseek4_vision_image
 *.o
 *.dSYM/
 __pycache__/
@@ -43,6 +43,3 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
-/speed-bench/gqa_mma_proto
-/speed-bench/hc_chain_proto_bench
-/speed-bench/qsa_prefill_bench

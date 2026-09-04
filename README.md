@@ -3,12 +3,9 @@
 </p>
 
 **DwarfStar** is a small native inference engine optimized first for
-**DeepSeek V4 Flash**. It also supports **GLM 5.2 and 5.3**, **GLM 5.3 Flash**, and,
-on very high-memory machines, **DeepSeek V4 PRO**. The
-`qwen3.8-flash-next-q4` branch additionally contains the versioned
-**Qwen3.8-Flash-Next Q4** standard-block (`Q4_K`/`Q8_0`/`Q4_1`) fast-pack
-loader and Metal integration described in
-[QWEN38_FLASH_NEXT.md](QWEN38_FLASH_NEXT.md). It is self-contained and
+**DeepSeek V4 Flash** (including the experimental vision model).
+It also supports **GLM 5.2 and 5.3**, **GLM 5.3 Flash**, and,
+on very high-memory machines, **DeepSeek V4 PRO**. It is self-contained and
 deliberately narrow, not a general GGUF runner. Model loading, prompt rendering,
 tool calls, KV state, the HTTP server, and the coding agent are built and tested together.
 The repository also includes tools and data for GGUF, imatrix, quality, and speed.
@@ -27,6 +24,12 @@ other contributors.
 Model support is intentionally opportunistic. The project follows the best open
 weights for useful local machine sizes, especially 128 GB laptops and 512 GB
 workstations. A model may be removed when a better replacement arrives.
+
+The project has first class support for SSD streaming of weights, so it is
+possible to run models bigger than RAM while often still getting decent
+performances, and even running very large models (like the full GLM 5.3 or DeepSeek v4 PRO)
+on systems with just 128GB of RAM at a slower speed, but fast enough for
+QA-style chats.
 
 # So, what can I do with this software?
 
@@ -96,8 +99,6 @@ next sections.
   vector generation, and usage.
 - [speed-bench/README.md](speed-bench/README.md): benchmark commands, charts,
   and CSV generation.
-- [QWEN38_FLASH_NEXT.md](QWEN38_FLASH_NEXT.md): Qwen3.8-Flash-Next Q4 pack,
-  loader, adaptive prefill, native-kernel tests, and integration status.
 - [tests/test-vectors/README.md](tests/test-vectors/README.md): official
   continuation vectors used for regression checks.
 
@@ -214,6 +215,129 @@ For ROCm packages, GTT configuration and the reproducible ROCm 10.0 container bu
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 `./ds4-server --help` for the full flag list.
+
+## DeepSeek V4 Flash Vision Experimental
+
+Vision-Exp is a separate DeepSeek checkpoint, not the 0731 text model. It uses
+a matching language GGUF and a 0.9 GiB vision encoder. The Q2 model is the
+recommended version for 96 and 128 GB systems:
+
+```sh
+./download_model.sh ds4f-vision-q2
+./ds4 --vision gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf
+```
+
+Use `/read image.png` in the interactive CLI. The same `--vision` option gives
+`ds4-agent` its `view_image` tool and enables image input through `ds4-server`.
+PNG and JPEG are supported. The Q2 path is validated on Metal, single-GPU CUDA
+including DGX Spark, and ROCm. Larger `ds4f-vision-q2-q4` and
+`ds4f-vision-mxfp4` downloads are also available.
+
+Vision-Exp has its own DSpark checkpoint. Do not use the 0731 support model:
+
+```sh
+./download_model.sh ds4f-vision-dspark
+./ds4 --vision gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf --dspark \
+  --mtp-model gguf/DeepSeek-V4-Flash-Vision-Exp-DSpark-support.gguf
+```
+
+## Qwen3.8 Flash Next
+
+Qwen3.8-Flash-Next (`qwen4exp` in GGUF terms) runs on its own Metal graph:
+36 gated delta-net layers and 12 gated GQA layers with the QSA block-sparse
+indexer, four-stream hyper-connections, the hashed per-layer n-gram table,
+512-expert MoE with a shared expert, and the built-in MTP block. Use the
+converter in `gguf-tools/` on the Hugging Face checkpoint (the stock
+`ggml-org` Q8_0 GGUF also loads once its two parts are merged with
+`llama-gguf-split --merge`):
+
+```sh
+python gguf-tools/qwen4_exp_convert.py --src /path/to/Qwen3.8-Flash-Next \
+  --out gguf/Qwen3.8-Flash-Next-Q8.gguf --outtype q8_0            # about 192 GB
+python gguf-tools/qwen4_exp_convert.py --src /path/to/Qwen3.8-Flash-Next \
+  --out gguf/Qwen3.8-Flash-Next-MXFP4.gguf --outtype q8_0 --experts mxfp4  # about 126 GB
+llama-quantize --allow-requantize --tensor-type hc_=f16 --tensor-type ffn_gate_exps=Q4_K \
+  --tensor-type ffn_up_exps=Q4_K --tensor-type per_layer_token_embd=Q4_0 \
+  gguf/Qwen3.8-Flash-Next-Q8.gguf gguf/Qwen3.8-Flash-Next-Q4K.gguf Q8_0  # about 124 GB
+llama-quantize --allow-requantize --tensor-type hc_=f16 --tensor-type ffn_gate_exps=Q2_K \
+  --tensor-type ffn_up_exps=Q2_K --tensor-type ffn_down_exps=MXFP4 \
+  --tensor-type per_layer_token_embd=Q4_0 \
+  gguf/Qwen3.8-Flash-Next-Q8.gguf gguf/Qwen3.8-Flash-Next-Q2K.gguf Q8_0   # about 83 GB
+llama-quantize --imatrix imatrix.gguf --allow-requantize --tensor-type hc_=f16 \
+  --tensor-type blk.48.ffn_gate_exps=MXFP4 --tensor-type blk.48.ffn_up_exps=MXFP4 \
+  --tensor-type ffn_gate_exps=IQ2_XXS --tensor-type ffn_up_exps=IQ2_XXS \
+  --tensor-type ffn_down_exps=MXFP4 --tensor-type per_layer_token_embd=Q4_0 \
+  gguf/Qwen3.8-Flash-Next-Q8.gguf gguf/Qwen3.8-Flash-Next-IQ2.gguf Q8_0   # about 77 GB
+```
+
+The Q8 file keeps every weight at 8 bits except the QSA indexer projections,
+which stay at the released BF16 (20M parameters; an 8-bit indexer measured
+0.2% worse teacher-forced NLL), and matches the mlx-lm 8-bit reference to a
+mean KL of 5e-3 on teacher-forced text; the MXFP4 file keeps
+the routed experts in native MXFP4 blocks, the Q4K file requantizes the
+expert gate/up projections to Q4_K, and the two-bit tiers take them to Q2_K
+or (with an importance matrix from `llama-imatrix`) IQ2_XXS while the 640-wide
+expert down projections, too narrow for 256-value blocks, go to MXFP4. The
+first matching `--tensor-type` wins, and the MTP block's experts stay MXFP4
+because an importance matrix collected with llama.cpp never sees them. The
+`hc_=f16` override keeps the hyper-connection mixers at F16: the Q8_0 base
+type would requantize them, and DS4's Q8_0 prefill GEMM is several times
+slower than its F16 one on their shapes, which halved prefill speed. On the
+same 256-token text Q8 stays closest to the 8-bit reference, then Q4K,
+MXFP4, Q2K and IQ2 (even with a standard calibration corpus), so Q2K is the
+better two-bit choice unless the last 5 GB matter. All need a Mac with more
+unified memory than the file size. MTP speeds up greedy decoding. With a
+temperature above zero MTP accepts drafts that match the greedy token, like
+the GLM path, which skews sampled output toward the greedy choice;
+`--mtp-exact-sampling` keeps the exact sampling distribution at a smaller
+speedup. The serve script passes it. Prefill runs in 8192-token chunks
+(`DS4_QWEN4_PREFILL_CHUNK` overrides; the transient buffers scale with it,
+about 12 GB at 8192). Two switches restore earlier paths for A/B
+checks, `DS4_QWEN4_NO_FUSE=1` (unfused decode kernels),
+`DS4_QWEN4_NO_IDX_SELECT=1` (the argsort top-k) and `DS4_QWEN4_NO_ATTN_MM=1`
+(the per-token attention kernel for prefill batches), and `DS4_QWEN4_TIMING=1`
+prints stage timings.
+
+```sh
+./ds4 -m gguf/Qwen3.8-Flash-Next-Q8.gguf --ctx 32768
+./ds4 -m gguf/Qwen3.8-Flash-Next-Q8.gguf --mtp --temp 0
+./ds4-server -m gguf/Qwen3.8-Flash-Next-Q8.gguf --ctx 65536 --kv-disk-dir ~/.ds4/server-kv
+./ds4-server -m gguf/Qwen3.8-Flash-Next-Q8.gguf --vision gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf
+./ds4-agent -m gguf/Qwen3.8-Flash-Next-MXFP4.gguf
+DS4_TIER=Q4K DS4_HOST=127.0.0.1 ./serve-qwen4.sh   # server with MTP, disk KV and vision
+```
+
+`--batched-session N` keeps N sessions resident; their decode steps run one
+after another rather than as one grouped batch, so it buys concurrency, not
+throughput. Thinking is on by default with the model's `xhigh` reasoning instruction;
+the server's `qwen3.8-flash-next-chat` alias disables it and
+`qwen3.8-flash-next-reasoner` forces it. Tool calls use the model's native
+`<tool_call><function=...><parameter=...>` format in both the server and the
+agent. Disk KV checkpoints and live prefix reuse work as for the other models;
+the recurrent state travels with the checkpoint, so a session cannot be rewound
+to an arbitrary earlier position and a shorter prompt is prefilled again.
+
+The model's native window is 262144 tokens. For longer prompts set
+`DS4_QWEN4_YARN_FACTOR=4` (or `DS4_YARN=4` with the serve script), which
+applies the static YaRN scaling from the model card, up to about 1M tokens;
+use a factor of 2 for 512k. A 369k-token two-needle prompt is answered
+correctly this way. Static YaRN costs a little accuracy on short prompts, so
+leave it off otherwise.
+
+Images go through the model's Qwen3-VL vision tower. Pass llama.cpp's mmproj
+file (`ggml-org/Qwen3.8-Flash-Next-GGUF` ships a Q8_0 one, or run
+`convert_hf_to_gguf.py --mmproj --outtype f16` on the checkpoint) with
+`--vision` and send `image_url` parts as usual. Each image is resized to
+multiples of 32 pixels within 64 to 1024 tokens (`DS4_QWEN4_IMAGE_MAX_TOKENS`
+raises the cap), encoded on the GPU in well under a second, and takes the
+model's 3D rope positions; live KV reuse keys on the image fingerprints. The
+F16 mmproj reproduces the Hugging Face tower to a cosine of 1.0000
+(`tests/qwen4_exp/vision_ref.py`); the Q8_0 one stays above 0.999 on average.
+
+Metal only for now. The Metal graph accepts Q8_0, Q4_0, F16, BF16 and F32
+dense weights, Q8_0/MXFP4/Q4_0/Q4_K/Q2_K/IQ2_XXS experts, F16/F32/Q8_0
+hyper-connection mixers and a Q8_0/Q4_0/MXFP4/F16/F32 n-gram table. Multi-node tensor
+parallelism is not implemented yet.
 
 ## GLM 5.3 Flash
 
@@ -370,6 +494,11 @@ Run it with the normal sampling defaults:
 ```
 
 `--mtp-model` supplies the support GGUF, while `--dspark` selects the DSpark runtime.
+Measured on a MacBook Pro M5 Max with the Q2 Flash model fully resident
+(README prose prompt, 128-token context): plain decode 46.5 t/s, DSpark
+36-44 t/s depending on the confidence threshold (30-55% of draft tokens
+accepted; every verified draft row re-streams its routed experts, about a
+third of a token's cost). Expect gains only on highly predictable text.
 The default confidence threshold is `0.6` on Metal and `0.7` on CUDA and ROCm.
 It prunes suffixes that are unlikely to repay their verification cost.
 `--dspark-confidence 0` forces fixed five-token blocks and is intended for
@@ -861,6 +990,78 @@ layer per stage (`--tensor-parallel-token-prefill` selects a slower
 token-by-token prefill that exactly matches the single-machine arithmetic).
 The split graph is deterministic, but its changed floating-point reduction
 order is not generally byte-identical to single-machine execution.
+
+### Running DeepSeek V4 Flash across two 128 GB MacBooks
+
+The same mode runs DeepSeek V4 Flash (145 GB in the MXFP4 recipe, which does
+not fit one 128 GB Mac without SSD streaming). Each Mac keeps its half of the
+routed experts resident (~77 GiB) plus the replicated dense weights; the
+per-layer exchanges are 16 KB and ride as single RDMA messages.
+
+One-time setup per boot, on **both** machines (as for GLM above):
+
+```sh
+sudo sysctl iogpu.wired_limit_mb=120000
+sudo ifconfig en1 inet 10.99.0.2/30 alias     # machine A (coordinator), its Thunderbolt member interface
+sudo ifconfig en6 inet 10.99.0.1/30 alias     # machine B (worker)
+rdma_ctl status                               # "enabled" on both
+```
+
+Both machines need the same tree, the same commit, and the model at the same
+relative path. Start the worker in a terminal that stays open (an interactive
+`ssh -tt` session is fine; a detached `nohup` worker cannot reach the
+coordinator on macOS), then the coordinator; the worker retries until the
+coordinator listens. Do not probe the coordinator's port with `nc` or `curl`
+while it waits: it accepts the probe as the worker and fails.
+
+```sh
+MODEL=gguf/DeepSeek-V4-Flash-Vision-Exp-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out.gguf
+VISION=gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf   # omit --vision for the text-only model
+
+# Machine B: worker.
+./ds4 -m "$MODEL" --vision "$VISION" --tensor-parallel --role worker \
+  --coordinator 10.99.0.2 9911 --transport rdma --rdma-device rdma_en6 --rdma-gid-index 1
+
+# Machine A: coordinator, interactive chat (use /read photo.png to send an image).
+./ds4 -m "$MODEL" --vision "$VISION" --tensor-parallel --role coordinator \
+  --listen 10.99.0.2 9911 --transport rdma --rdma-device rdma_en1 --rdma-gid-index 1 -c 8192
+```
+
+The text-only `DeepSeek-V4-Flash-0731-MXFP4Experts-...-chat-v2-mxfp4.gguf`
+file has the same layers and tensor types and runs identically. Other
+quantization recipes (IQ2, Q4_K experts) run too, but the fastest paths gate
+on MXFP4 experts with Q8 attention and shared-expert tensors.
+
+Measured on two M5 Max 128 GB MacBooks over Thunderbolt 5 (MXFP4 recipe,
+README prompt):
+
+| | two Macs, tensor parallel | one Mac, SSD streaming |
+|---|---|---|
+| decode, 128-token context | ~47-48 t/s | ~11 t/s |
+| decode, 2048-token context | ~48 t/s | |
+| prefill | ~250 t/s at 128 tokens, ~850 t/s at 2048 | ~10 t/s |
+| startup | ~10 s per Mac (pins its shard) | |
+| DSpark (`--dspark`) | slower than plain decode here (30-40 t/s: each draft row re-streams its experts) | |
+
+Things that cost speed on the coordinator: a remote screen-sharing session
+or an animated wallpaper (the display compositor takes GPU time from the
+decode, up to 10%), and anything else using the GPU. Benchmark with the
+screen idle. The first run after swapping roles between the two Macs can fail
+at the first prefill round with `timeout waiting for bulk RDMA round`; start
+both again.
+
+The fast paths are on by default; environment variables exist to opt out
+for diagnosis (set them on both machines): `DS4_TP_DISABLE_POLL_GATES=1`
+(shared-event gates instead of the poll gates), `DS4_TP_DISABLE_GATE_PREFETCH=1`,
+`DS4_TP_STATIC_SHARED_SPLIT=1` (fixed shared-expert halves instead of the
+per-token GPU-decided split), `DS4_TP_DISABLE_FLAG_FOLD=1`,
+`DS4_METAL_DISABLE_KV_NORM_DEFER=1`, `DS4_METAL_DISABLE_M5_ROUTER_PROJECT_SELECT_FUSE=1`,
+`DS4_TP_DISABLE_RDMA_WARMUP=1`, `DS4_METAL_DISABLE_MXFP4_MM_ID_MPP=1` (simdgroup
+instead of TensorOps routed-expert prefill GEMMs), `DS4_METAL_DISABLE_QUEUE_KEEPALIVE=1`
+(no idle keepalive on the Metal command queue: the first command buffer after
+~3 s of GPU idleness then starts 600-800 ms late). `DS4_TP_GATE_PROFILE=1` prints per-gate wait
+statistics on each rank at exit; `DS4_METAL_ENCODER_TIMELINE=<file>` writes
+a per-kernel GPU timeline (`misc/tp_tools/tl_analyze.py` reads it).
 
 ## Tensor Parallelism across CUDA GPUs
 
@@ -1729,6 +1930,33 @@ current scale, `/steer 0` disables it, and `/steer F` sets a value from `-100`
 to `100` for subsequent tokens. The existing KV cache is kept. Live changes
 are currently limited to local sessions, not distributed inference or network
 tensor parallelism.
+
+## Conversation Prefixes
+
+`ds4` and `ds4-agent` can preload a conversation with `--prefix-file FILE`.
+The file contains complete `USER:` / `ASSISTANT:` pairs:
+
+```text
+USER: Write terse answers.
+This line is still part of the user turn.
+ASSISTANT: Understood.
+USER: Return code without an introduction.
+ASSISTANT: I will return only the code.
+```
+
+A marker starts a new turn only at the beginning of a line. The prefix must
+start with `USER:`, alternate roles, and end with `ASSISTANT:`. It is rendered
+with the model's chat template and prefilled before the live prompt.
+
+```sh
+./ds4 --prefix-file prefix.txt
+./ds4-agent --prefix-file prefix.txt
+```
+
+This can also overcome refusal behavior. For example, when a multi-turn prefix
+shows the assistant writing exploits as part of computer-security work, most
+models will comply with the next computer-security requests. The effect is
+studied in *Many-shot Jailbreaking*.
 
 ## Test Vectors
 

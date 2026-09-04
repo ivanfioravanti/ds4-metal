@@ -104,6 +104,14 @@ struct ds4_metal_args_dsv4_router_select_one {
     uint32_t hash_rows;
 };
 
+struct ds4_metal_args_dsv4_router_select_visual {
+    uint32_t hash_rows;
+    uint32_t vocab_size;
+    uint32_t n_tokens;
+    uint32_t has_bias;
+    uint32_t hash_mode;
+};
+
 struct ds4_metal_args_glm_router_select_one {
     uint32_t n_expert;
     uint32_t n_expert_used;
@@ -4925,6 +4933,60 @@ kernel void kernel_dsv4_router_finalize_one(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
+/* Vision-Exp uses score-based visual routing even in the first three layers,
+ * where ordinary text rows use a token-id hash table. One threadgroup owns a
+ * row so the image/text decision is uniform across all barriers. */
+kernel void kernel_dsv4_router_select_visual_batch(
+        constant ds4_metal_args_dsv4_router_select_visual & args,
+        device const float *probs,
+        device const float *bias,
+        device const float *visual_bias,
+        device const int32_t *hash,
+        device const int32_t *tokens,
+        device int32_t *selected,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint row [[threadgroup_position_in_grid]]) {
+    if (tid >= 256u || row >= args.n_tokens) return;
+
+    const int32_t token = tokens[row];
+    const bool image = token >= 0 && (uint32_t)token >= args.vocab_size;
+    device int32_t *out = selected + (uint64_t)row * 6u;
+    if (args.hash_mode && !image) {
+        const uint hash_row = token >= 0 && (uint32_t)token < args.hash_rows
+            ? (uint32_t)token : 0u;
+        if (tid < 6u) out[tid] = hash[(uint64_t)hash_row * 6u + tid];
+        return;
+    }
+
+    threadgroup float *scores = scratch;
+    threadgroup int32_t *indices = (threadgroup int32_t *)(scratch + 256u);
+    const float p = probs[(uint64_t)row * 256u + tid];
+    scores[tid] = p + (image ? visual_bias[tid]
+                             : (args.has_bias ? bias[tid] : 0.0f));
+    indices[tid] = (int32_t)tid;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint k = 2u; k <= 256u; k <<= 1u) {
+        for (uint j = k >> 1u; j > 0u; j >>= 1u) {
+            const uint other = tid ^ j;
+            if (other > tid) {
+                const bool descending = (tid & k) == 0u;
+                const int32_t a = indices[tid];
+                const int32_t b = indices[other];
+                const float sa = scores[(uint)a];
+                const float sb = scores[(uint)b];
+                if ((descending && sa < sb) || (!descending && sa > sb)) {
+                    indices[tid] = b;
+                    indices[other] = a;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    if (tid < 6u) out[tid] = indices[tid];
+}
+
 // M3 decode specialization for the non-hash one-token router. Scores and ids
 // stay in registers. Intra-SIMD bitonic stages use shuffle-xor; the six stages
 // that cross 32-lane SIMD groups exchange through alternating threadgroup
@@ -6810,6 +6872,127 @@ kernel void kernel_dsv4_tp_flag_set(
     if (tid == 0) {
         atomic_store_explicit(&flag, value, memory_order_relaxed);
     }
+}
+
+// Poll-gate flag with a payload checksum: the CPU sees the flag word as soon
+// as its cache line is written back at command-buffer completion, which can
+// precede the rest of the partial's lines. Publishing an integer checksum of
+// the partial lets the service thread verify the payload in memory before it
+// posts the RDMA send, instead of waiting for the (much later) completion
+// status. Integer sums are order-independent, so the value is exact.
+kernel void kernel_dsv4_tp_flag_set_checked(
+        device atomic_uint & flag,
+        device atomic_uint & check,
+        constant uint & value,
+        device const uint * payload,
+        constant uint & words,
+        threadgroup uint * shmem [[threadgroup(0)]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    uint sum = 0u;
+    for (uint i = tid; i < words; i += 256u) sum += payload[i];
+    sum = simd_sum(sum);
+    if (tiisg == 0) shmem[sgitg] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint total = 0u;
+        for (uint s = 0; s < 8u; s++) total += shmem[s];
+        atomic_store_explicit(&check, total ^ (value * 0x9E3779B9u), memory_order_relaxed);
+        atomic_store_explicit(&flag, value, memory_order_relaxed);
+    }
+}
+
+// Fused local FFN sum + checked poll-gate flag.  out = a + b for n words
+// (the rank's FFN partial in its slab slot); every threadgroup adds the
+// integer sum of the words it stored to a device accumulator and the
+// last-arriving threadgroup publishes the checksum and the flag.  Integer
+// sums are order independent, so the checksum equals the one
+// kernel_dsv4_tp_flag_set_checked would compute over the same payload, and
+// the gate loses one kernel.  ctl[0] counts arrivals, ctl[1] accumulates;
+// the last arriver resets both for the next use of the slot.
+kernel void kernel_dsv4_add2_f32_tp_flag_checked(
+        constant uint & n,
+        device const float * a,
+        device const float * b,
+        device float * out,
+        device atomic_uint & flag,
+        device atomic_uint & check,
+        constant uint & value,
+        device atomic_uint * ctl,
+        constant uint & ntg,
+        threadgroup uint * shmem [[threadgroup(0)]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint tgid [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint i = tgid * 256u + tid;
+    uint w = 0u;
+    if (i < n) {
+        const float v = a[i] + b[i];
+        out[i] = v;
+        w = as_type<uint>(v);
+    }
+    w = simd_sum(w);
+    if (tiisg == 0) shmem[sgitg] = w;
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint s = 0u;
+        for (uint k = 0; k < 8u; k++) s += shmem[k];
+        atomic_fetch_add_explicit(&ctl[1], s, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid == 0) {
+        const uint old = atomic_fetch_add_explicit(&ctl[0], 1u, memory_order_relaxed);
+        if (old + 1u == ntg) {
+            const uint total = atomic_exchange_explicit(&ctl[1], 0u, memory_order_relaxed);
+            atomic_store_explicit(&ctl[0], 0u, memory_order_relaxed);
+            atomic_store_explicit(&check, total ^ (value * 0x9E3779B9u), memory_order_relaxed);
+            atomic_store_explicit(&flag, value, memory_order_relaxed);
+        }
+    }
+}
+
+// Tensor-parallel poll gate: waits for the service thread's release of gate
+// `value` without parking the command buffer on a shared event, which costs
+// tens of microseconds of GPU idle per gate on Apple silicon. A running
+// kernel never observes an external write to a cache line it already read
+// (the L2 copy stays stale until the command buffer ends), so every probe
+// reads a line this command buffer has not touched: the region is consumed
+// front to back, 32 lines per simdgroup probe, with growing pauses between
+// rounds. The gate is always the first work of its command buffer, so the
+// whole region is fresh. 8192 lines cover roughly 600 ms before `status`
+// reports a timeout, which the service thread reports at the next gate.
+kernel void kernel_dsv4_tp_poll_release(
+        device const uint * region,
+        constant uint & value,
+        constant uint & nlines,
+        device uint * status,
+        uint tid [[thread_index_in_threadgroup]]) {
+    const uint rounds = nlines / 32u;
+    float spin = 1.0f;
+    for (uint r = 0; r < rounds; r++) {
+        const uint line = r * 32u + tid;
+        const uint x = region[line * 32u];
+        const uint hit = (x == value) ? line : 0xffffffffu;
+        const uint first = simd_min(hit);
+        if (first != 0xffffffffu) {
+            if (tid == 0) status[0] = first;
+            return;
+        }
+        uint pause = 0u;
+        if (r >= 160u) pause = 375000u;      /* ~5 ms   x 96 rounds */
+        else if (r >= 96u) pause = 150000u;  /* ~2 ms   x 64 rounds */
+        else if (r >= 64u) pause = 20000u;   /* ~270 us x 32 rounds */
+        else if (r >= 32u) pause = 1200u;    /* ~16 us  x 32 rounds */
+        else if (r >= 16u) pause = 150u;     /* ~2 us   x 16 rounds */
+        for (uint i = 0; i < pause; i++) {
+            spin = fma(spin, 1.000001f, 0.000001f);
+            spin = fma(spin, 1.000001f, -0.000001f);
+        }
+    }
+    if (tid == 0) status[0] = 0xffffffffu;
+    if (spin == 0.0f) status[1] = 0u; /* keeps the pause loop alive */
 }
 
 // Ratio-4 compressor pooling without materializing the [n_comp, 8, head_dim]

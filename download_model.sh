@@ -32,8 +32,8 @@ GLM53_Q2_FILE="GLM-5.3-Flash-Q2.gguf"
 GLM53_Q4_FILE="GLM-5.3-Flash-Q4_K.gguf"
 GLM53_FP8_FILE="GLM-5.3-Flash-FP8.gguf"
 GLM53_VISION_FILE="GLM-5.3-Flash-Vision-Encoder.gguf"
-QWEN38_Q4K_FILE="Qwen3.8-Flash-Next-Q4KImatrix-qwen4exp-pleext.gguf"
-QWEN38_Q4K_MTP_FILE="Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf"
+QWEN38_Q4K_FILE="Qwen3.8-Flash-Next-Q4KImatrixExperts-MXFP4Down-BF16Emb-BF16Control-Q8GDN-Q8QSA-Q8Shared-Q8Out.gguf"
+QWEN38_Q4K_MTP_FILE="Qwen3.8-Flash-Next-Q4KImatrixExperts-MXFP4Down-BF16Emb-BF16Control-Q8GDN-Q8QSA-Q8Shared-Q8Out-MTP.gguf"
 QWEN38_PLE_FILE="Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -174,7 +174,7 @@ Targets:
        with --vision; this target does not update ./ds4flash.gguf.
 
   qwen38-q4k
-       Qwen3.8-Flash-Next DS4 Q4_K imatrix build (qwen4exp schema): the base
+       Qwen3.8-Flash-Next DS4 Q4_K imatrix build: the base
        GGUF, the MTP speculative-decoding variant, and the external PLE
        n-gram sidecar — about 180 GB on disk together. Routed gate/up
        experts are imatrix Q4_K, routed down MXFP4, dense Q8_0. Both GGUFs

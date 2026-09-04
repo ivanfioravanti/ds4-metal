@@ -1862,6 +1862,18 @@ kernel void kernel_qwen4_moe_build_lists(
 /* dequantize 8 consecutive values (quarter q of 32-wide block b of a row) */
 template <typename D>
 static inline void qwen4_mm_stage8(device const char *row, uint b, uint q, uint type, threadgroup D *dst) {
+    if (type == 2) {
+        /* q4_0: 18-byte blocks of 32 (f16 scale, 16 nibble bytes; low nibbles first) */
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)b * 18);
+        const float d = (float)(*(device const half *)blk);
+        device const uchar *qs = blk + 2 + (q & 1u) * 8;
+        const bool hi = q >= 2;
+        for (uint i = 0; i < 8; i++) {
+            const uint nib = hi ? (qs[i] >> 4) : (qs[i] & 0xFu);
+            dst[i] = (D)(d * ((float)nib - 8.0f));
+        }
+        return;
+    }
     if (type == 12) {
         const uint sb = b / 8, group = b % 8, l = q * 8;
         device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 144);

@@ -2025,3 +2025,22 @@ first answer:
 The DwarfStar logo was designed by hand by Salvatore Sanfilippo, made more
 graphical with AI, and manually reworked by Ben Gnomino, whose human touch made
 it rock.
+
+## Qwen3.8 Flash Next (campaign branch merge)
+
+This branch carries the qwen4-exp engine adoption merge. The native fast-pack
+qwen4 engine developed during the campaign is superseded; its history, notes
+and performance handoff live in [QWEN38_FLASH_NEXT.md](QWEN38_FLASH_NEXT.md)
+and [QWEN38_PERF_HANDOFF.md](QWEN38_PERF_HANDOFF.md), and its source is kept
+in-tree (`ds4_qwen4.c`/`ds4_qwen4.h`, unreferenced by the build).
+
+The canonical runtime model is the Q4_K-imatrix `pleext` build run with the
+external PLE sidecar, for example:
+
+```
+./ds4 -m Qwen3.8-Flash-Next-Q4KImatrix-qwen4exp-pleext.gguf \
+      --ple Qwen3.8-Flash-Next-PLE-Q4_1.gguf --metal
+```
+
+Models still in the old fast-pack format can be converted with
+`gguf-tools/qwen4_pack_to_qwen4exp.py` and then run the same way.

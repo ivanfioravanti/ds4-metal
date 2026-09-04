@@ -924,6 +924,10 @@ typedef struct {
 
 static ds4_qwen4_ple_hash g_ds4_qwen4_ple;
 
+/* True while a Qwen3.8 PLE n-gram sidecar (--ple) owns w->ple_embd: the
+ * tensor lives in a separate CPU-only mapping, never in a Metal view. */
+static bool g_ds4_ple_sidecar;
+
 static bool ds4_model_is_glm53(void) {
     return DS4_MODEL_VARIANT == DS4_VARIANT_GLM53;
 }
@@ -2275,6 +2279,7 @@ enum {
     DS4_TENSOR_F32      = 0,
     DS4_TENSOR_F16      = 1,
     DS4_TENSOR_Q4_0     = 2,
+    DS4_TENSOR_Q4_1     = 3,
     DS4_TENSOR_Q8_0     = 8,
     DS4_TENSOR_Q2_K     = 10,
     DS4_TENSOR_Q4_K     = 12,
@@ -2304,7 +2309,7 @@ typedef struct {
     uint64_t bytes;
 } ds4_tensor;
 
-typedef struct {
+typedef struct ds4_model {
     int fd;
     const uint8_t *map;
     uint64_t size;
@@ -2318,6 +2323,10 @@ typedef struct {
 
     ds4_kv *kv;
     ds4_tensor *tensors;
+
+    /* Qwen3.8 external PLE n-gram sidecar (--ple): when set, w->ple_embd
+     * lives in this CPU-only mapping and PLE reads resolve to it. */
+    struct ds4_model *ple_model;
 } ds4_model;
 
 static uint64_t scalar_value_size(uint32_t type) {
@@ -5242,7 +5251,8 @@ static void tensor_expect_qwen4_expert_layout(
         const ds4_tensor *t, uint64_t d0, uint64_t d1, uint64_t d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
     if (!tensor_is_routed_expert_type(t->type) &&
-        t->type != DS4_TENSOR_F16 && t->type != DS4_TENSOR_F32) {
+        t->type != DS4_TENSOR_F16 && t->type != DS4_TENSOR_F32 &&
+        t->type != DS4_TENSOR_Q4_0) {
         fprintf(stderr, "ds4: routed expert tensor %.*s has unsupported type %u\n",
                 (int)t->name.len, t->name.ptr, t->type);
         exit(1);
@@ -5278,7 +5288,8 @@ static void weights_validate_qwen4_layout(
     if (w->ple_embd) {
         const uint32_t t = w->ple_embd->type;
         if (t != DS4_TENSOR_F32 && t != DS4_TENSOR_F16 && t != DS4_TENSOR_Q8_0 &&
-            t != DS4_TENSOR_MXFP4 && t != DS4_TENSOR_Q4_0) {
+            t != DS4_TENSOR_MXFP4 && t != DS4_TENSOR_Q4_0 &&
+            !(t == DS4_TENSOR_Q4_1 && g_ds4_ple_sidecar)) {
             fprintf(stderr, "ds4: per_layer_token_embd has unsupported type %u\n", t);
             exit(1);
         }
@@ -7494,9 +7505,12 @@ static void weights_bind(
         w->token_embd = model_find_tensor(m, "token_embd.weight");
     }
     if (ds4_model_is_qwen4()) {
-        w->ple_embd = require_token_embd ?
+        /* An external --ple sidecar owns the table: the inline tensor is
+         * optional in the main GGUF and ple.weight wins either way. */
+        w->ple_embd = (require_token_embd && !m->ple_model) ?
             required_tensor(m, "per_layer_token_embd.weight") :
             model_find_tensor(m, "per_layer_token_embd.weight");
+        if (m->ple_model) w->ple_embd = required_tensor(m->ple_model, "ple.weight");
     }
     weights_bind_output(w, m, require_output, optional_output);
 
@@ -8015,7 +8029,9 @@ static void model_map_span_vec_include_output(ds4_model_map_span_vec *spans, con
     model_map_span_vec_include_one(spans, w->output_hc_norm);
     model_map_span_vec_include_one(spans, w->output_hc_down);
     model_map_span_vec_include_one(spans, w->output_hc_up);
-    model_map_span_vec_include_one(spans, w->ple_embd);
+    /* A --ple sidecar tensor lives in its own CPU-only mapping; never fold
+     * its span into the main model's residency map. */
+    if (!g_ds4_ple_sidecar) model_map_span_vec_include_one(spans, w->ple_embd);
 }
 
 static int model_map_span_cmp(const void *a, const void *b) {
@@ -39570,6 +39586,7 @@ struct ds4_engine {
     ds4_model model;
     ds4_model mtp_model;
     ds4_model vision_model;
+    ds4_model ple_model;
     ds4_vocab vocab;
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
@@ -54620,8 +54637,11 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
     }
     if (w->ple_embd->type != DS4_TENSOR_F32 && w->ple_embd->type != DS4_TENSOR_F16 &&
         w->ple_embd->type != DS4_TENSOR_Q8_0 && w->ple_embd->type != DS4_TENSOR_Q4_0 &&
-        w->ple_embd->type != DS4_TENSOR_MXFP4) {
-        fprintf(stderr, "ds4: Qwen3.8 Metal graph needs a F32/F16/Q8_0/Q4_0/MXFP4 n-gram table\n");
+        w->ple_embd->type != DS4_TENSOR_MXFP4 &&
+        !(w->ple_embd->type == DS4_TENSOR_Q4_1 && g_ds4_ple_sidecar)) {
+        fprintf(stderr,
+                "ds4: Qwen3.8 Metal graph needs a F32/F16/Q8_0/Q4_0/MXFP4 n-gram table "
+                "(or a Q4_1 --ple sidecar)\n");
         return false;
     }
     if (DS4_N_NEXTN_PREDICT != 0) {
@@ -55117,7 +55137,8 @@ static void qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
         uint32_t rows[DS4_MAX_PLE_HEADS];
         qwen4_ple_step(tokens[t], g->ple_prev, rows);
         for (uint32_t h = 0; h < DS4_N_PLE_HEADS; h++) {
-            qwen4_ref_row(m, w->ple_embd, rows[h], row + (uint64_t)t * E + (uint64_t)h * DS4_N_PLE_HEAD_DIM);
+            qwen4_ref_row(m->ple_model ? m->ple_model : m, w->ple_embd, rows[h],
+                          row + (uint64_t)t * E + (uint64_t)h * DS4_N_PLE_HEAD_DIM);
         }
         if (t == 0 && g->snap_after_first) {
             memcpy(g->snap_ple_prev, g->ple_prev, sizeof(g->ple_prev));
@@ -55185,7 +55206,6 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         }
         QWEN4_PROF(0);
         if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, T);
-        QWEN4_PROF(1);
         if (ok) {
             ok = ds4_qwen4_layer_is_linear(il) ? qwen4_graph_linear(g, m, l, il, T)
                                                : qwen4_graph_attention(g, m, l, il, pos0, T);
@@ -55196,7 +55216,6 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         QWEN4_PROF(4);
         if (ok) ok = qwen4_graph_moe(g, m, l, T);   /* the reduce folds the combine in */
         QWEN4_PROF(5);
-        if (!ok) fprintf(stderr, "ds4: Qwen3.8 forward failed in layer %u\n", il);
     }
     if (prof_on && ++prof_calls % 4 == 0) {
         fprintf(stderr, "ds4: Qwen3.8 prefill stage ms/chunk (T=%u, avg of 4): "
@@ -62796,6 +62815,21 @@ static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row,
         }
         break;
     }
+    case DS4_TENSOR_Q4_1: {
+        const uint64_t blocks = n / 32u;
+        const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 20u;
+        for (uint64_t b = 0; b < blocks; b++, p += 20u) {
+            uint16_t dh, mh;
+            memcpy(&dh, p, sizeof(dh));
+            memcpy(&mh, p + 2, sizeof(mh));
+            const float d = f16_to_f32(dh), mv = f16_to_f32(mh);
+            for (uint32_t j = 0; j < 16u; j++) {
+                out[b * 32u + j] = d * (float)(p[4 + j] & 0x0fu) + mv;
+                out[b * 32u + 16u + j] = d * (float)(p[4 + j] >> 4) + mv;
+            }
+        }
+        break;
+    }
     case DS4_TENSOR_Q4_K: {
         const uint64_t blocks = n / 256u;
         const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 144u;
@@ -63034,7 +63068,9 @@ static void qwen4_ref_ple(const ds4_model *m, const ds4_weights *w, const ds4_la
     qwen4_ple_step(token, st->ple_prev, rows);
 
     float *emb = xmalloc(E * sizeof(float));
-    for (uint32_t h = 0; h < n_heads; h++) qwen4_ref_row(m, w->ple_embd, rows[h], emb + (uint64_t)h * hd);
+    for (uint32_t h = 0; h < n_heads; h++)
+        qwen4_ref_row(m->ple_model ? m->ple_model : m, w->ple_embd, rows[h],
+                      emb + (uint64_t)h * hd);
 
     float *key = xmalloc(hc_dim * sizeof(float));
     float *keyn = xmalloc(hc_dim * sizeof(float));
@@ -63434,6 +63470,85 @@ static void qwen4_dump_f32(const char *path, const float *v, uint64_t n) {
  * streams, DS4_QWEN4_MTP_OUT the [n-1][vocab] teacher-forced MTP drafts. */
 static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab,
                                   const ds4_weights *weights, const ds4_tokens *prompt, bool metal) {
+    /* DS4_QWEN4_FT_LIST=<file>: batch mode.  Each line is
+     * "<comma ids>\t<out path>"; every sequence runs through the Metal graph
+     * (prefill all-rows logits, the production kernel path) and its
+     * [n][vocab] f32 logits are written to the path.  One model load covers
+     * the whole list. */
+    const char *ft_list = getenv("DS4_QWEN4_FT_LIST");
+    if (ft_list && ft_list[0]) {
+#ifndef DS4_NO_GPU
+        if (!metal || !getenv("DS4_QWEN4_GPU")) {
+            fprintf(stderr, "ds4: DS4_QWEN4_FT_LIST needs --metal with DS4_QWEN4_GPU set\n");
+            return 1;
+        }
+        FILE *lf = fopen(ft_list, "r");
+        if (!lf) {
+            fprintf(stderr, "ds4: cannot open DS4_QWEN4_FT_LIST %s\n", ft_list);
+            return 1;
+        }
+        ds4_qwen4_gpu_graph *g = xcalloc(1, sizeof(*g));
+        if (!qwen4_graph_alloc(g, weights, 8192u, 128u, false)) {
+            free(g);
+            fclose(lf);
+            return 1;
+        }
+        char *line = xmalloc(65536);
+        int *lseq = xmalloc(4096 * sizeof(int));
+        float *out = xmalloc((size_t)4096 * DS4_N_VOCAB * sizeof(float));
+        while (fgets(line, 65536, lf)) {
+            char *tab = strchr(line, '\t');
+            if (!tab) continue;
+            *tab = '\0';
+            char *out_path = tab + 1;
+            out_path[strcspn(out_path, "\r\n")] = '\0';
+            uint32_t ln = qwen4_parse_token_list(line, lseq, 4096);
+            if (ln == 0) continue;
+            qwen4_graph_reset(g);
+            /* "<prompt ids>|<target ids>": prefill the prompt in one chunk
+             * (the production path), then teacher-force the targets one at a
+             * time; out receives one [vocab] row per target position. */
+            char *bar = strchr(line, '|');
+            uint32_t p_len = ln;
+            if (bar) {
+                *bar = '\0';
+                p_len = qwen4_parse_token_list(line, lseq, 4096);
+                ln = qwen4_parse_token_list(bar + 1, lseq + p_len, 4096 - p_len);
+                if (p_len == 0 || ln == 0) continue;
+            }
+            bool fok = qwen4_graph_forward_tokens(g, model, weights, lseq, p_len,
+                                                  out, false);
+            for (uint32_t t = 0; t + 1u < ln && fok; t++) {
+                fok = qwen4_graph_forward_tokens(g, model, weights, lseq + p_len + t, 1u,
+                                                 out + (uint64_t)(t + 1u) * DS4_N_VOCAB, false);
+            }
+            if (!fok) {
+                fprintf(stderr, "ds4: FT_LIST forward failed (%u tokens)\n", ln);
+                free(out); free(lseq); free(line);
+                qwen4_graph_free(g); free(g); fclose(lf);
+                return 1;
+            }
+            FILE *of = fopen(out_path, "wb");
+            if (!of || fwrite(out, sizeof(float), (size_t)ln * DS4_N_VOCAB, of) != (size_t)ln * DS4_N_VOCAB) {
+                fprintf(stderr, "ds4: FT_LIST write failed: %s\n", out_path);
+                if (of) fclose(of);
+                free(out); free(lseq); free(line);
+                qwen4_graph_free(g); free(g); fclose(lf);
+                return 1;
+            }
+            fclose(of);
+            printf("ft_list %u tokens -> %s\n", ln, out_path);
+            fflush(stdout);
+        }
+        free(out); free(lseq); free(line);
+        qwen4_graph_free(g); free(g); fclose(lf);
+        return 0;
+#else
+        (void)model; (void)vocab; (void)weights; (void)prompt; (void)metal;
+        fprintf(stderr, "ds4: DS4_QWEN4_FT_LIST needs GPU support\n");
+        return 1;
+#endif
+    }
     int *seq = xmalloc(4096 * sizeof(int));
     uint32_t n_seq = 0;
     const char *seq_env = getenv("DS4_QWEN4_FT_TOKENS");
@@ -65994,6 +66109,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->model.fd = -1;
     e->mtp_model.fd = -1;
     e->vision_model.fd = -1;
+    e->ple_model.fd = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
     e->glm_mtp = opt->glm_mtp;
@@ -66207,6 +66323,41 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     "ds4: expert profile/hotlist is Metal-only for now; ignoring for %s backend\n",
                     ds4_backend_name(e->backend));
         }
+    }
+    if (opt->ple_path && opt->ple_path[0]) {
+        if (!ds4_model_is_qwen4()) {
+            fprintf(stderr, "ds4: --ple is only supported for Qwen3.8-Flash-Next models\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        /* CPU-only private mapping: the PLE gather runs on the host, so the
+         * sidecar never joins a Metal view or the main residency map. */
+        model_open(&e->ple_model, opt->ple_path, false, true);
+        const ds4_tensor *ple_t = model_find_tensor(&e->ple_model, "ple.weight");
+        if (!ple_t) {
+            fprintf(stderr, "ds4: --ple sidecar %s has no ple.weight tensor\n",
+                    opt->ple_path);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (ple_t->ndim != 2 || ple_t->dim[0] != DS4_N_PLE_HEAD_DIM ||
+            ple_t->dim[1] < g_ds4_qwen4_ple.n_rows) {
+            fprintf(stderr,
+                    "ds4: --ple sidecar ple.weight layout [%" PRIu64 ", %" PRIu64 "] does not "
+                    "cover %u x %" PRIu64 " hash rows\n",
+                    ple_t->dim[0], ple_t->dim[1], DS4_N_PLE_HEAD_DIM,
+                    g_ds4_qwen4_ple.n_rows);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        e->model.ple_model = &e->ple_model;
+        g_ds4_ple_sidecar = true;
+        fprintf(stderr,
+                "ds4: PLE sidecar table: %s (ple.weight [%u, %" PRIu64 "], CPU-only)\n",
+                opt->ple_path, DS4_N_PLE_HEAD_DIM, ple_t->dim[1]);
     }
     weights_bind(&e->weights,
                  &e->model,
@@ -67927,6 +68078,9 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_threads_shutdown();
     if (e->mtp_model.map) model_close(&e->mtp_model);
     if (e->vision_model.map) model_close(&e->vision_model);
+    e->model.ple_model = NULL;
+    g_ds4_ple_sidecar = false;
+    if (e->ple_model.map) model_close(&e->ple_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
     if (e->shared_prefill_workspace_ready) {

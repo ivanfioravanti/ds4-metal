@@ -12117,6 +12117,49 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
     free(visible);
 }
 
+/* After a successful tool-call turn on the OpenAI chat API, remember a visible
+ * checkpoint that ends at the canonical assistant-turn boundary WITHOUT the
+ * hidden reasoning.  Chat clients commonly replay the transcript without
+ * reasoning_content, so the exact-token and raw-DSML replay paths can never
+ * match after a tool-call turn and every following request pays a full
+ * re-prefill of the diverged tail (observed as ~44k tokens, ~65 s per tool
+ * turn on Qwen3.8-Flash-Next).  The remembered prefix is what such a client
+ * renders byte-for-byte: the next request keeps the entire live KV state
+ * (hidden reasoning included, because thinking_live_visible_prefix_prompt()
+ * builds the effective prompt from the exact live token history and only
+ * tokenizes the new tool-response suffix).  Clients that do replay reasoning
+ * never byte-match this prefix and keep the existing exact-replay and
+ * disk-cache fallbacks; any mismatch therefore degrades to today's behavior. */
+static bool remember_qwen_tool_turn_visible_checkpoint(server *s, server_slot *slot,
+                                                       job *j, const char *ctx,
+                                                       const char *finish,
+                                                       const char *content,
+                                                       const char *reasoning,
+                                                       const tool_calls *calls) {
+    if (!s || !slot || !j || !calls || calls->len == 0) return false;
+    if (j->req.kind != REQ_CHAT || j->req.image_count != 0) return false;
+    if (j->req.api == API_RESPONSES || j->req.api == API_ANTHROPIC) return false;
+    if (j->req.model_syntax != SERVER_MODEL_SYNTAX_QWEN) return false;
+    if (!j->req.prompt_text || !j->req.prompt_text[0]) return false;
+    if (!calls->raw_tool_text || !calls->raw_tool_text[0]) return false;
+    if (!finish || strcmp(finish, "tool_calls") != 0) return false;
+
+    char *suffix = build_qwen_assistant_suffix(&j->req, content, reasoning,
+                                               false, calls);
+    if (!suffix) return false;
+    buf visible = {0};
+    buf_puts(&visible, j->req.prompt_text);
+    buf_puts(&visible, suffix);
+    thinking_live_remember(s, slot, visible.ptr ? visible.ptr : "");
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: qwen tool-turn visible checkpoint remembered ctx=%s live=%d visible=%zu",
+               ctx, ds4_session_pos(slot->session),
+               visible.ptr ? strlen(visible.ptr) : 0);
+    buf_free(&visible);
+    free(suffix);
+    return true;
+}
+
 /* After a successful tool-call finish, make the live checkpoint match what the
  * next request will render.  Usually that is just the exact DSML remembered by
  * tool id.  If a client sends a tool call without an id we know, the fallback
@@ -13588,7 +13631,13 @@ decode_again:
                                      parsed_reasoning, &parsed_calls);
         thinking_live_clear(s, slot);
     } else if (parsed_calls.len) {
-        thinking_live_clear(s, slot);
+        if (!remember_qwen_tool_turn_visible_checkpoint(
+                s, slot, j, ctx_span, final_finish,
+                parsed_content ? parsed_content : "",
+                parsed_reasoning, &parsed_calls))
+        {
+            thinking_live_clear(s, slot);
+        }
     } else if (!parsed_calls.len &&
                should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
         remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,

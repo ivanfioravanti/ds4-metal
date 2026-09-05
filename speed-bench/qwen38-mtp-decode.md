@@ -9,6 +9,16 @@ The model was `Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf`, with
 Metal, `--ctx 8192 --temp 0 --nothink --mtp --mtp-timing`. The candidate used
 default settings, with no tuning environment variables.
 
+The later [262K comparison](qwen38-262k-compare.md) found identical prefill
+logits but numerical drift and some different continuations in long target-only
+decode. The short MTP checks below do not establish whole-engine numerical or
+task-quality parity at long context.
+
+The subsequent [non-MTP optimization](qwen38-nonmtp-decode.md) corrects the
+Q4_K accumulation order and restores all 896 recorded FP32 decode vectors
+through 262K to the original engine's values. It includes a fresh MTP regression
+check; the measurements below describe the earlier `af4195c` implementation.
+
 ## Results
 
 Three interleaved repetitions per prompt, alternating run order. Each executable

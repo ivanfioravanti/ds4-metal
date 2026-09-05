@@ -311,8 +311,20 @@ checks, set `DS4_QWEN4_NO_MTP_BATCH=1`, `DS4_QWEN4_NO_HC_PAIR=1`,
 `DS4_QWEN4_NO_GDN_R4=1` (decode only), or `DS4_QWEN4_NO_Q4K_MID=1`.
 The GDN verification layout uses eight SIMD groups on M3 Ultra;
 `DS4_QWEN4_GDN_NSG` overrides the decode group count from 1 to 8.
+`DS4_QWEN4_Q4K_MID_NSG` selects 1 to 8 SIMD groups for Q4_K gate/up
+(default 2).
 See [the MTP decode benchmark](speed-bench/qwen38-mtp-decode.md) for measurements
-and reproduction commands.
+and reproduction commands. The [earlier 262K comparison](speed-bench/qwen38-262k-compare.md)
+found decode drift in the previous Q4_K optimization. The current gate/up kernel
+preserves the original accumulation order and matches all 896 recorded FP32
+decode logit vectors through 262K; see the [non-MTP benchmark](speed-bench/qwen38-nonmtp-decode.md)
+for performance, numerical checks, and their limits.
+
+The trunk submits commands after two layers to overlap GPU execution with host
+encoding; `DS4_QWEN4_FLUSH_LAYER=0` restores one submission. On M3 Ultra, MoE
+prefill launches use tile caps of 8, 16, and 32 at batch sizes below 4096, from
+4096, and from 8192 tokens. `DS4_QWEN4_MOE_MID_TILES` and
+`DS4_QWEN4_MOE_DOWN_TILES` override these caps from 1 to 32.
 
 `--batched-session N` keeps N sessions resident; their decode steps run one
 after another rather than as one grouped batch, so it buys concurrency, not

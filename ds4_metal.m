@@ -47822,10 +47822,13 @@ int ds4_gpu_qwen4_moe_mid_tensor(
         b[6] = b[1];
     }
     const bool q4k = weight_type == 12u && getenv("DS4_QWEN4_NO_Q4K_MID") == NULL;
-    const uint32_t rows_per_tg = q4k ? 4u : 8u;
-    return qwen4_dispatch(q4k ? QWEN4_K_MOE_MID_Q4K : QWEN4_K_MOE_MID, &args, sizeof(args), b, 7,
+    const uint32_t nsg = q4k ?
+        (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_Q4K_MID_NSG", 2u, 1u, 8u) : 4u;
+    const uint32_t rows_per_tg = 2u * nsg;
+    const int kernel = q4k ? QWEN4_K_MOE_MID_Q4K : QWEN4_K_MOE_MID;
+    return qwen4_dispatch(kernel, &args, sizeof(args), b, 7,
                           MTLSizeMake((ff_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
-                          MTLSizeMake(q4k ? 64u : 128u, 1, 1), 0);
+                          MTLSizeMake(32u * nsg, 1, 1), 0);
 }
 
 int ds4_gpu_qwen4_moe_down_tensor(
@@ -47924,9 +47927,14 @@ int ds4_gpu_qwen4_moe_build_lists_tensor(
                           MTLSizeMake(1, 1, 1), MTLSizeMake(512, 1, 1), 0);
 }
 
-static uint32_t qwen4_moe_mm_tiles(uint32_t n_tokens) {
+static uint32_t qwen4_moe_mm_tiles(uint32_t n_tokens, const char *env_name) {
     uint32_t tiles = (n_tokens + 31u) / 32u;
-    return tiles > 8u ? 8u : tiles;
+    /* Spread large routed batches over more independent tiles on M3 Ultra.
+     * Each tile keeps the same K loop and accumulation order. */
+    const uint32_t default_cap = ds4_gpu_device_name_contains("M3 Ultra") ?
+        (n_tokens >= 8192u ? 32u : n_tokens >= 4096u ? 16u : 8u) : 8u;
+    const uint32_t cap = (uint32_t)ds4_gpu_env_u64(env_name, default_cap, 1u, 32u);
+    return tiles > cap ? cap : tiles;
 }
 
 int ds4_gpu_qwen4_moe_mm_mid_tensor(
@@ -47936,7 +47944,7 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
         uint32_t in_dim, uint32_t ff_dim, uint32_t list_cap) {
     const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, in_dim);
     const uint64_t expert_bytes = (uint64_t)row_bytes * ff_dim;
-    const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens);
+    const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens, "DS4_QWEN4_MOE_MID_TILES");
     qwen4_moe_mm_args args = { n_tokens, n_slots, n_out, in_dim, ff_dim, weight_type, row_bytes, list_cap,
                                expert_bytes, n_expert, tiles, 0, 0 };
     qwen4_bind b[6];
@@ -47962,7 +47970,7 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
         uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap) {
     const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, ff_dim);
     const uint64_t expert_bytes = (uint64_t)row_bytes * out_dim;
-    const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens);
+    const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens, "DS4_QWEN4_MOE_DOWN_TILES");
     qwen4_moe_mm_args args = { n_tokens, n_slots, n_out, ff_dim, out_dim, weight_type, row_bytes, list_cap,
                                expert_bytes, n_expert, tiles, 0, 0 };
     qwen4_bind b[5];

@@ -1780,8 +1780,10 @@ kernel void kernel_qwen4_moe_mid(
     }
 }
 
-/* Reuse the tuned Q4_K gate/up dot: input blocks are loaded once for both
- * projections and two output rows. Route weights remain in moe_reduce. */
+/* Q4_K gate/up input reuse with the original qwen4_row_dot lane mapping
+ * and accumulation order.  Each lane still visits every block in order and
+ * adds its eight elements individually; only independent rows/projections
+ * are interleaved.  Two output rows per SIMD group. */
 kernel void kernel_qwen4_moe_mid_q4k(
         constant ds4_metal_args_qwen4_moe & args,
         device const char *gate_base,
@@ -1792,33 +1794,75 @@ kernel void kernel_qwen4_moe_mid_q4k(
         device const char *sh_gate,
         device const char *sh_up,
         uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort3 ntg [[threads_per_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     const uint slot = tgpig.y, tok = tgpig.z;
     const uint n_out = args.n_slots + args.has_shared;
-    if (slot >= n_out || tok >= args.n_tokens) return;
-    if (slot < args.n_slots) {
-        ds4_metal_glm_routed_moe_args a = {};
-        a.n_total_expert = args.n_total_expert;
-        a.n_expert_used = args.n_slots;
-        a.n_tokens = args.n_tokens;
-        a.in_dim = args.in_dim;
-        a.mid_dim = args.out_rows;
-        a.mid_token_stride = (uint64_t)n_out * args.out_rows;
-        a.gate_row_bytes = a.up_row_bytes = args.row_bytes;
-        a.gate_expert_bytes = a.up_expert_bytes = args.expert_bytes;
-        const uint64_t selected_off = (uint64_t)tok * args.n_slots + slot;
-        glm_q4_K_pair_swiglu_simd_f32_impl<2, false>(a, gate_base, up_base, x, nullptr, mid, nullptr,
-                tgpig, slot, tok, selected_off, selected[selected_off], tiisg, sgitg);
-    } else {
-        const uint row0 = (tgpig.x * 2u + (uint)sgitg) * 2u;
-        device const float *xt = x + (uint64_t)tok * args.in_dim;
+    const uint row0 = (tgpig.x * (ntg.x / 32) + (uint)sgitg) * 2u;
+    if (row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;
+    device const float *xt = x + (uint64_t)tok * args.in_dim;
+    const uint64_t mid_base = ((uint64_t)tok * n_out + slot) * args.out_rows;
+    if (slot == args.n_slots) {
         for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) {
             const uint64_t off = (uint64_t)r * args.shared_row_bytes;
             const float g = qwen4_row_dot(sh_gate + off, xt, args.shared_type, args.in_dim, tiisg);
             const float u = qwen4_row_dot(sh_up + off, xt, args.shared_type, args.in_dim, tiisg);
-            if (tiisg == 0) mid[((uint64_t)tok * n_out + slot) * args.out_rows + r] = qwen4_silu(g) * u;
+            if (tiisg == 0) mid[mid_base + r] = qwen4_silu(g) * u;
         }
+        return;
+    }
+
+    const int32_t expert = selected[(uint64_t)tok * args.n_slots + slot];
+    if (expert < 0 || (uint)expert >= args.n_total_expert) {
+        if (tiisg == 0) {
+            for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) mid[mid_base + r] = 0.0f;
+        }
+        return;
+    }
+    const uint64_t ebase = (uint64_t)(uint)expert * args.expert_bytes;
+    const uint nb = args.in_dim / 256;
+    const uint group = tiisg / 4, l = (tiisg % 4) * 8;
+    const uint shift = (group & 1u) * 4u;
+    float sumg[2] = {0.0f, 0.0f}, sumu[2] = {0.0f, 0.0f};
+    for (uint ib = 0; ib < nb; ib++) {
+        device const float *yp = xt + ib * 256 + group * 32 + l;
+        float y[8];
+        for (uint i = 0; i < 8; i++) y[i] = yp[i];
+        for (uint r = 0; r < 2u && row0 + r < args.out_rows; r++) {
+            const uint64_t off = ebase + (uint64_t)(row0 + r) * args.row_bytes + (uint64_t)ib * 144;
+            device const uchar *bg = (device const uchar *)(gate_base + off);
+            device const uchar *bu = (device const uchar *)(up_base + off);
+            const float dg = (float)(*(device const half *)bg);
+            const float dmg = (float)(*(device const half *)(bg + 2));
+            const float du = (float)(*(device const half *)bu);
+            const float dmu = (float)(*(device const half *)(bu + 2));
+            device const uchar *scg = bg + 4;
+            device const uchar *scu = bu + 4;
+            uint sg, mg, su, mu;
+            if (group < 4) {
+                sg = scg[group] & 63u; mg = scg[group + 4] & 63u;
+                su = scu[group] & 63u; mu = scu[group + 4] & 63u;
+            } else {
+                sg = (scg[group + 4] & 0xFu) | ((scg[group - 4] & 0xC0u) >> 2);
+                mg = (scg[group + 4] >> 4) | ((scg[group] & 0xC0u) >> 2);
+                su = (scu[group + 4] & 0xFu) | ((scu[group - 4] & 0xC0u) >> 2);
+                mu = (scu[group + 4] >> 4) | ((scu[group] & 0xC0u) >> 2);
+            }
+            const float dsg = dg * (float)sg, dmin_g = dmg * (float)mg;
+            const float dsu = du * (float)su, dmin_u = dmu * (float)mu;
+            device const uchar *qg = bg + 16 + (group >> 1) * 32 + l;
+            device const uchar *qu = bu + 16 + (group >> 1) * 32 + l;
+            for (uint i = 0; i < 8; i++) {
+                sumg[r] += (dsg * (float)((qg[i] >> shift) & 0xFu) - dmin_g) * y[i];
+                sumu[r] += (dsu * (float)((qu[i] >> shift) & 0xFu) - dmin_u) * y[i];
+            }
+        }
+    }
+    for (uint r = 0; r < 2u && row0 + r < args.out_rows; r++) {
+        const float g = simd_sum(sumg[r]);
+        const float u = simd_sum(sumu[r]);
+        if (tiisg == 0) mid[mid_base + row0 + r] = qwen4_silu(g) * u;
     }
 }
 

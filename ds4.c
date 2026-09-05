@@ -55171,6 +55171,17 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         const char *tv = getenv("DS4_QWEN4_TIMING");
         timing = tv ? (atoi(tv) >= 2 ? 2 : 1) : 0;
     }
+    /* Start the GPU while the host encodes the rest of the trunk. The
+     * command queue preserves layer order; zero restores one submission. */
+    uint32_t flush_layer = timing != 2 && n_trunk > 2u ? 2u : 0u;
+    const char *flush_env = getenv("DS4_QWEN4_FLUSH_LAYER");
+    if (timing != 2 && flush_env && flush_env[0]) {
+        char *end = NULL;
+        const unsigned long layer = strtoul(flush_env, &end, 10);
+        if (end != flush_env && *end == '\0' && layer < n_trunk) {
+            flush_layer = (uint32_t)layer;
+        }
+    }
     const double t0 = timing ? now_sec() : 0.0;
     qwen4_graph_stage_inputs(g, m, w, tokens, T);
     const double t1 = timing ? now_sec() : 0.0;
@@ -55216,6 +55227,10 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         QWEN4_PROF(4);
         if (ok) ok = qwen4_graph_moe(g, m, l, T);   /* the reduce folds the combine in */
         QWEN4_PROF(5);
+        /* Submit this prefix while the host encodes the remaining layers.
+         * Flush keeps the same ordered queue and retains pending buffers;
+         * end_commands below waits for both batches before inputs are reused. */
+        if (ok && il + 1u == flush_layer) ok = ds4_gpu_flush_commands() != 0;
     }
     if (prof_on && ++prof_calls % 4 == 0) {
         fprintf(stderr, "ds4: Qwen3.8 prefill stage ms/chunk (T=%u, avg of 4): "

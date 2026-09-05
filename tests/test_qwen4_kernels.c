@@ -1370,6 +1370,197 @@ static void test_moe(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, uint32
     test_moe_types(a, NE, slots, E, F, T, wtype, wtype ? 8u : 0u);
 }
 
+static void check_exact_f32(const char *what, const float *got, const float *ref, uint64_t n) {
+    for (uint64_t i = 0; i < n; i++) {
+        uint32_t gb, rb;
+        memcpy(&gb, got + i, sizeof(gb));
+        memcpy(&rb, ref + i, sizeof(rb));
+        /* Integer bits keep the finite check valid under -ffast-math. */
+        if ((gb & 0x7f800000u) == 0x7f800000u ||
+            (rb & 0x7f800000u) == 0x7f800000u || gb != rb) {
+            fprintf(stderr, "%s: non-exact value at %llu: got %.9g (0x%08x), ref %.9g (0x%08x)\n",
+                    what, (unsigned long long)i, got[i], gb, ref[i], rb);
+            exit(1);
+        }
+    }
+}
+
+/* Compare against the original per-row GPU kernel, not a second copy of the
+ * ordered implementation.  Ten Q4_K blocks per row exercise accumulation
+ * across blocks and the fixture's varied packed six-bit scales/minima. */
+static void test_q4k_ordered_exact(arena_t *a, uint32_t T, uint32_t F, bool shared) {
+    const uint32_t E = 2560, NE = 5, slots = 3, D = 64, guard = 16;
+    const uint32_t n_out = slots + (shared ? 1u : 0u);
+    const uint32_t shared_type = shared ? 8u : UINT32_MAX;
+    const bool downstream = F % 32u == 0u;
+    const uint64_t mid_n = (uint64_t)T * n_out * F, part_n = (uint64_t)T * n_out * D;
+    const char *env_names[] = {"DS4_QWEN4_NO_Q4K_MID", "DS4_QWEN4_Q4K_MID_NSG"};
+    char *saved_env[2];
+    for (uint32_t i = 0; i < 2; i++) {
+        const char *v = getenv(env_names[i]);
+        saved_env[i] = v ? strdup(v) : NULL;
+        require_ok(!v || saved_env[i] != NULL, "save ordered mid environment");
+    }
+    double *gate_w, *shadow;
+    const uint64_t gate_off = arena_q4_K(a, (uint64_t)NE * F, E, &gate_w, 0.05f);
+    const uint64_t up_off = arena_q4_K(a, (uint64_t)NE * F, E, &shadow, 0.05f); free(shadow);
+    uint64_t sg_off = 0, su_off = 0, down_off = 0, sd_off = 0;
+    if (shared) {
+        sg_off = arena_q8_0(a, F, E, &shadow, 0.05f); free(shadow);
+        su_off = arena_q8_0(a, F, E, &shadow, 0.05f); free(shadow);
+    }
+    if (downstream) {
+        down_off = arena_q8_0(a, (uint64_t)NE * D, F, &shadow, 0.05f); free(shadow);
+        if (shared) { sd_off = arena_q8_0(a, D, F, &shadow, 0.05f); free(shadow); }
+    }
+    float *x = rand_vec((uint64_t)T * E, 1.0f);
+    for (uint64_t i = 0; i < (uint64_t)T * E; i++) x[i] *= i % 7u == 0u ? 8.0f : i % 7u == 1u ? 0.125f : 1.0f;
+    /* Ensure that the first selected gate takes the negative sigmoid branch. */
+    double first_gate = 0.0;
+    for (uint32_t i = 0; i < E; i++) first_gate += gate_w[i] * x[i];
+    require_ok(first_gate != 0.0, "ordered mid negative gate fixture");
+    if (first_gate > 0.0) for (uint32_t i = 0; i < E; i++) x[i] = -x[i];
+    free(gate_w);
+    int32_t sel[6];
+    float weights[6], shared_gate[2] = {-1.75f, 2.25f};
+    for (uint32_t t = 0; t < T; t++) for (uint32_t s = 0; s < slots; s++) {
+        sel[t * slots + s] = (int32_t)((t * 3u + s * 2u) % NE);
+        weights[t * slots + s] = 0.125f * (float)(1u + t + s);
+    }
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * E);
+    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * slots * sizeof(int32_t));
+    require_ok(gsel && ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * slots * sizeof(int32_t)), "ordered mid selected");
+    ds4_gpu_tensor *gmid = upload(NULL, mid_n + guard);
+    ds4_gpu_tensor *gpart = downstream ? upload(NULL, part_n) : NULL;
+    ds4_gpu_tensor *gout = downstream ? upload(NULL, (uint64_t)T * D) : NULL;
+    ds4_gpu_tensor *gw = downstream ? upload(weights, (uint64_t)T * slots) : NULL;
+    ds4_gpu_tensor *gsg = downstream && shared ? upload(shared_gate, T) : NULL;
+    float *ref_mid = NULL, *ref_part = NULL, *ref_out = NULL;
+    const float sentinel = -1234.5f;
+    for (uint32_t nsg = 0; nsg <= 8; nsg++) {
+        if (nsg == 0) {
+            setenv(env_names[0], "1", 1);
+        } else {
+            char value[16];
+            snprintf(value, sizeof(value), "%u", nsg);
+            unsetenv(env_names[0]);
+            setenv(env_names[1], value, 1);
+        }
+        require_ok(ds4_gpu_tensor_fill_f32(gmid, sentinel, mid_n + guard), "ordered mid sentinel");
+        require_ok(ds4_gpu_qwen4_moe_mid_tensor(gmid, gx, gsel, a->base, a->size, gate_off, up_off, 12u,
+                                              NE, T, slots, E, F, sg_off, su_off, shared_type), "ordered mid dispatch");
+        float *got_mid = download(gmid, mid_n + guard);
+        for (uint64_t i = mid_n; i < mid_n + guard; i++) require_ok(got_mid[i] == sentinel, "ordered mid output guard");
+        char name[128];
+        snprintf(name, sizeof(name), "q4_K ordered T=%u F=%u shared=%u NSG=%u mid", T, F, shared, nsg);
+        if (nsg == 0) {
+            ref_mid = got_mid;
+            check_exact_f32(name, ref_mid, ref_mid, mid_n);
+        } else {
+            check_exact_f32(name, got_mid, ref_mid, mid_n + guard);
+            free(got_mid);
+        }
+        if (downstream) {
+            require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, down_off, 8u,
+                                                   NE, T, slots, F, D, sd_off, shared_type), "ordered mid downstream");
+            require_ok(ds4_gpu_qwen4_moe_reduce_tensor(gout, gpart, gw, gsg, NULL, NULL, NULL,
+                                                     T, slots, n_out, D, 0), "ordered mid reduce");
+            float *got_part = download(gpart, part_n), *got_out = download(gout, (uint64_t)T * D);
+            if (nsg == 0) { ref_part = got_part; ref_out = got_out; }
+            else {
+                snprintf(name, sizeof(name), "q4_K ordered T=%u shared=%u NSG=%u down", T, shared, nsg);
+                check_exact_f32(name, got_part, ref_part, part_n);
+                snprintf(name, sizeof(name), "q4_K ordered T=%u shared=%u NSG=%u reduce", T, shared, nsg);
+                check_exact_f32(name, got_out, ref_out, (uint64_t)T * D);
+                free(got_part); free(got_out);
+            }
+        }
+    }
+    printf("  q4_K ordered T=%u F=%u shared=%u: NSG 1..8 byte-exact mid%s\n",
+           T, F, shared, downstream ? ", down, reduce" : " (odd tail)");
+    for (uint32_t i = 0; i < 2; i++) {
+        if (saved_env[i]) setenv(env_names[i], saved_env[i], 1); else unsetenv(env_names[i]);
+        free(saved_env[i]);
+    }
+    free(ref_out); free(ref_part); free(ref_mid); free(x);
+    ds4_gpu_tensor_free(gsg); ds4_gpu_tensor_free(gw); ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gpart);
+    ds4_gpu_tensor_free(gmid); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gx);
+}
+
+/* Freeze the GPU-built routing lists across launch-cap comparisons.
+ * The hot expert spans 21 tiles, exceeding caps eight and sixteen, and
+ * the final 32-token tile contains only one token. */
+static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
+    const uint32_t T = 641, E = 256, F = 256, NE = 4, slots = 2, n_out = 3, list_cap = T + 7, guard = 16;
+    const uint64_t mid_n = (uint64_t)T * n_out * F, part_n = (uint64_t)T * n_out * E;
+    const char *env_names[] = {"DS4_QWEN4_MOE_MID_TILES", "DS4_QWEN4_MOE_DOWN_TILES"};
+    char *saved_env[2];
+    for (uint32_t i = 0; i < 2; i++) {
+        const char *v = getenv(env_names[i]);
+        saved_env[i] = v ? strdup(v) : NULL;
+        require_ok(!v || saved_env[i] != NULL, "save MoE tile caps environment");
+    }
+    double *shadow;
+    const uint64_t gate_off = arena_q4_K(a, (uint64_t)NE * F, E, &shadow, 0.05f); free(shadow);
+    const uint64_t up_off = arena_q4_K(a, (uint64_t)NE * F, E, &shadow, 0.05f); free(shadow);
+    const uint64_t down_off = arena_tier(a, down_type, (uint64_t)NE * E, F, &shadow); free(shadow);
+    float *x = rand_vec((uint64_t)T * E, 2.0f);
+    int32_t *sel = malloc((uint64_t)T * slots * sizeof(int32_t));
+    require_ok(sel != NULL, "MoE tile caps selection allocation");
+    for (uint32_t t = 0; t < T; t++) { sel[t * slots] = 0; sel[t * slots + 1] = (int32_t)(1u + t % 2u); }
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * E);
+    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * slots * sizeof(int32_t));
+    ds4_gpu_tensor *glists = ds4_gpu_tensor_alloc((uint64_t)NE * list_cap * sizeof(int32_t));
+    ds4_gpu_tensor *gcounts = ds4_gpu_tensor_alloc(NE * sizeof(int32_t));
+    require_ok(gsel && glists && gcounts && ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * slots * sizeof(int32_t)),
+               "MoE tile caps routing setup");
+    require_ok(ds4_gpu_qwen4_moe_build_lists_tensor(glists, gcounts, gsel, T, slots, NE, list_cap), "MoE tile caps frozen lists");
+    int32_t counts[4];
+    require_ok(ds4_gpu_tensor_read(gcounts, 0, counts, sizeof(counts)), "MoE tile caps counts read");
+    require_ok(counts[0] == (int32_t)T && counts[1] == (int32_t)((T + 1u) / 2u) && counts[2] == (int32_t)(T / 2u) && counts[3] == 0,
+               "MoE tile caps hot, partial, and empty experts");
+    ds4_gpu_tensor *gmid = upload(NULL, mid_n + guard);
+    ds4_gpu_tensor *gpart = upload(NULL, part_n + guard);
+    float *ref_mid = NULL, *ref_part = NULL;
+    const float sentinel = -1234.5f;
+    const uint32_t caps[] = {8, 1, 16, 32};
+    for (uint32_t mode = 0; mode < sizeof(caps) / sizeof(caps[0]); mode++) {
+        char value[16];
+        snprintf(value, sizeof(value), "%u", caps[mode]);
+        for (uint32_t i = 0; i < 2; i++) setenv(env_names[i], value, 1);
+        require_ok(ds4_gpu_tensor_fill_f32(gmid, sentinel, mid_n + guard) &&
+                   ds4_gpu_tensor_fill_f32(gpart, sentinel, part_n + guard), "MoE tile caps sentinels");
+        require_ok(ds4_gpu_qwen4_moe_mm_mid_tensor(gmid, gx, glists, gcounts, a->base, a->size, gate_off, up_off,
+                                                12u, NE, T, slots, n_out, E, F, list_cap), "MoE tile caps mid dispatch");
+        float *got_mid = download(gmid, mid_n + guard);
+        for (uint64_t i = mid_n; i < mid_n + guard; i++) require_ok(got_mid[i] == sentinel, "MoE tile caps mid tail guard");
+        for (uint32_t t = 0; t < T; t++) for (uint32_t f = 0; f < F; f++)
+            require_ok(got_mid[((uint64_t)t * n_out + slots) * F + f] == sentinel, "MoE tile caps reserved mid slot");
+        char name[128];
+        snprintf(name, sizeof(name), "MoE tile caps mid T=%u down=%u cap=%u", T, down_type, caps[mode]);
+        if (mode == 0) { ref_mid = got_mid; check_exact_f32(name, ref_mid, ref_mid, mid_n); }
+        else { check_exact_f32(name, got_mid, ref_mid, mid_n + guard); free(got_mid); }
+        require_ok(ds4_gpu_qwen4_moe_mm_down_tensor(gpart, gmid, glists, gcounts, a->base, a->size, down_off,
+                                                 down_type, NE, T, slots, n_out, F, E, list_cap), "MoE tile caps down dispatch");
+        float *got_part = download(gpart, part_n + guard);
+        for (uint64_t i = part_n; i < part_n + guard; i++) require_ok(got_part[i] == sentinel, "MoE tile caps down tail guard");
+        for (uint32_t t = 0; t < T; t++) for (uint32_t e = 0; e < E; e++)
+            require_ok(got_part[((uint64_t)t * n_out + slots) * E + e] == sentinel, "MoE tile caps reserved down slot");
+        snprintf(name, sizeof(name), "MoE tile caps down T=%u type=%u cap=%u", T, down_type, caps[mode]);
+        if (mode == 0) { ref_part = got_part; check_exact_f32(name, ref_part, ref_part, part_n); }
+        else { check_exact_f32(name, got_part, ref_part, part_n + guard); free(got_part); }
+    }
+    printf("  MoE tile caps T=%u Q4_K/%s: caps 1,16,32 byte-exact mid/down vs cap8\n",
+           T, down_type == 39u ? "mxfp4" : "q8_0");
+    for (uint32_t i = 0; i < 2; i++) {
+        if (saved_env[i]) setenv(env_names[i], saved_env[i], 1); else unsetenv(env_names[i]);
+        free(saved_env[i]);
+    }
+    free(ref_part); free(ref_mid); free(sel); free(x);
+    ds4_gpu_tensor_free(gpart); ds4_gpu_tensor_free(gmid); ds4_gpu_tensor_free(gcounts);
+    ds4_gpu_tensor_free(glists); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gx);
+}
+
 /* MTP input staging: cat rows [rms(e)*g_e | 0] and [0 | rms(R_s)*g_h_s]
  * (full-row or per-stream RMS), then R_out = proj[0] + proj[1+s]. */
 static void test_mtp(arena_t *a, uint32_t E, uint32_t hc) {
@@ -1827,6 +2018,12 @@ int main(void) {
     test_moe(&arena, 8, 10, 2560, 640, 1, 0u);
     test_moe(&arena, 32, 10, 64, 32, 3, 8u);
     test_moe(&arena, 32, 10, 64, 32, 3, 0u);
+    test_q4k_ordered_exact(&arena, 1, 640, true);
+    test_q4k_ordered_exact(&arena, 2, 640, false);
+    test_q4k_ordered_exact(&arena, 1, 641, false);
+    test_q4k_ordered_exact(&arena, 2, 641, true);
+    test_moe_mm_tiles_exact(&arena, 8u);
+    test_moe_mm_tiles_exact(&arena, 39u);
     printf("dense mm\n");
     test_dense_mm(&arena, 2560, 512, 37, 0u);
     test_dense_mm(&arena, 10240, 320, 33, 1u);

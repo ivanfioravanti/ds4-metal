@@ -303,6 +303,17 @@ kernels, `DS4_QWEN4_NO_IDX_SELECT=1` the argsort top-k and
 `DS4_QWEN4_NO_ATTN_MM=1` the per-token attention kernel for prefill batches;
 `DS4_QWEN4_TIMING=1` prints stage timings.
 
+MTP decode batches the accepted token's predictor history update with its next
+draft. Two-token hyper-connection mixers share weights, the 128-wide GDN scan
+processes four value rows per SIMD group, and Q4_K expert gate/up projections
+share input loads. These paths are enabled by default. For individual A/B
+checks, set `DS4_QWEN4_NO_MTP_BATCH=1`, `DS4_QWEN4_NO_HC_PAIR=1`,
+`DS4_QWEN4_NO_GDN_R4=1` (decode only), or `DS4_QWEN4_NO_Q4K_MID=1`.
+The GDN verification layout uses eight SIMD groups on M3 Ultra;
+`DS4_QWEN4_GDN_NSG` overrides the decode group count from 1 to 8.
+See [the MTP decode benchmark](speed-bench/qwen38-mtp-decode.md) for measurements
+and reproduction commands.
+
 `--batched-session N` keeps N sessions resident; their decode steps run one
 after another rather than as one grouped batch, so it buys concurrency, not
 throughput. Thinking is on by default with the model's `xhigh` reasoning

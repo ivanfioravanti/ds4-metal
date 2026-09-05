@@ -188,6 +188,55 @@ QWEN4_HC_MIX_INSTANCE(f16, qwen4_w_f16)
 QWEN4_HC_MIX_INSTANCE(f32, qwen4_w_f32)
 QWEN4_HC_MIX_INSTANCE(q8, qwen4_w_q8)
 
+/* Two-token MTP verification: reuse each up-projection weight for both
+ * rows, and activate the low-rank inputs once per threadgroup. */
+template <typename W>
+kernel void kernel_qwen4_hc_gate_mix_pair(
+        constant ds4_metal_args_qwen4_hc_gate_mix & args,
+        device const float *xn,
+        device const float *lo,
+        device const char *w_up,
+        device float *mixed,
+        threadgroup float2 *activated [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint E = args.n_embd, hc = args.n_hc, rank = args.n_rank;
+    const uint d = tgpig.x * (ntg.x / 32) + sgitg;
+    for (uint r = tid; r < rank; r += ntg.x) {
+        activated[r] = float2(qwen4_silu(lo[r] / (float)hc),
+                              qwen4_silu(lo[rank + r] / (float)hc));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (d >= E) return;
+    const uint s = tiisg / 8, lane = tiisg % 8;
+    const W w(w_up);
+    const uint64_t row = (uint64_t)(s * E + d) * rank;
+    float2 acc = 0.0f;
+    for (uint r = lane; r < rank; r += 8) acc += w.at(row + r) * activated[r];
+    acc += simd_shuffle_xor(acc, 1);
+    acc += simd_shuffle_xor(acc, 2);
+    acc += simd_shuffle_xor(acc, 4);
+    float2 v = float2(qwen4_sigmoid(acc.x) * xn[s * E + d],
+                      qwen4_sigmoid(acc.y) * xn[E * hc + s * E + d]);
+    v += simd_shuffle_xor(v, 8);
+    v += simd_shuffle_xor(v, 16);
+    if (tiisg == 0) {
+        mixed[d] = v.x / (float)hc;
+        mixed[E + d] = v.y / (float)hc;
+    }
+}
+
+#define QWEN4_HC_MIX_PAIR_INSTANCE(SUFFIX, W) \
+template [[host_name("kernel_qwen4_hc_gate_mix_pair_" #SUFFIX)]] \
+kernel void kernel_qwen4_hc_gate_mix_pair<W>(constant ds4_metal_args_qwen4_hc_gate_mix &, device const float *, \
+        device const float *, device const char *, device float *, threadgroup float2 *, uint3, ushort, ushort3, ushort, ushort);
+QWEN4_HC_MIX_PAIR_INSTANCE(f16, qwen4_w_f16)
+QWEN4_HC_MIX_PAIR_INSTANCE(f32, qwen4_w_f32)
+QWEN4_HC_MIX_PAIR_INSTANCE(q8, qwen4_w_q8)
+
 struct ds4_metal_args_qwen4_hc_combine {
     uint32_t n_tokens;
     uint32_t n_embd;
@@ -380,7 +429,7 @@ kernel void kernel_qwen4_gdn_scan(
     for (uint i = 0; i < npt; i++) srow[i] = s[i];
 }
 
-/* Prefill scan for head_dim 128: one simdgroup per (v-head, 4 consecutive dv
+/* Scan for head_dim 128: one simdgroup per (v-head, 4 consecutive dv
  * rows), so k/q/g/beta are loaded once per four state rows and the eight
  * reductions per token overlap.  Same math and state layout as above. */
 kernel void kernel_qwen4_gdn_scan_r4(
@@ -392,8 +441,10 @@ kernel void kernel_qwen4_gdn_scan_r4(
         device float       *out,
         device float       *snap_state,
         uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]]) {
-    const uint dv0 = tgpig.x * 4;
+    const uint dv0 = (tgpig.x * (ntg.x / 32) + sgitg) * 4;
     const uint h = tgpig.y;
     if (dv0 >= args.head_dim || h >= args.n_v_head) return;
     const uint D = 128, dk0 = tiisg * 4;
@@ -1532,7 +1583,7 @@ struct ds4_metal_args_qwen4_moe {
     uint32_t has_shared;
     uint32_t shared_type;
     uint32_t shared_row_bytes;
-    uint32_t pad0;
+    uint32_t n_total_expert;
 };
 
 /* dot of one quantized expert row with x, lanes split as in the K3 kernels:
@@ -1725,6 +1776,48 @@ kernel void kernel_qwen4_moe_mid(
         const float u = qwen4_row_dot(ub + off, xt, type, args.in_dim, tiisg);
         if (tiisg == 0) {
             mid[((uint64_t)tok * n_out + slot) * args.out_rows + r] = qwen4_silu(g) * u;
+        }
+    }
+}
+
+/* Reuse the tuned Q4_K gate/up dot: input blocks are loaded once for both
+ * projections and two output rows. Route weights remain in moe_reduce. */
+kernel void kernel_qwen4_moe_mid_q4k(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char *gate_base,
+        device const char *up_base,
+        device const int32_t *selected,
+        device const float *x,
+        device float *mid,
+        device const char *sh_gate,
+        device const char *sh_up,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint slot = tgpig.y, tok = tgpig.z;
+    const uint n_out = args.n_slots + args.has_shared;
+    if (slot >= n_out || tok >= args.n_tokens) return;
+    if (slot < args.n_slots) {
+        ds4_metal_glm_routed_moe_args a = {};
+        a.n_total_expert = args.n_total_expert;
+        a.n_expert_used = args.n_slots;
+        a.n_tokens = args.n_tokens;
+        a.in_dim = args.in_dim;
+        a.mid_dim = args.out_rows;
+        a.mid_token_stride = (uint64_t)n_out * args.out_rows;
+        a.gate_row_bytes = a.up_row_bytes = args.row_bytes;
+        a.gate_expert_bytes = a.up_expert_bytes = args.expert_bytes;
+        const uint64_t selected_off = (uint64_t)tok * args.n_slots + slot;
+        glm_q4_K_pair_swiglu_simd_f32_impl<2, false>(a, gate_base, up_base, x, nullptr, mid, nullptr,
+                tgpig, slot, tok, selected_off, selected[selected_off], tiisg, sgitg);
+    } else {
+        const uint row0 = (tgpig.x * 2u + (uint)sgitg) * 2u;
+        device const float *xt = x + (uint64_t)tok * args.in_dim;
+        for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) {
+            const uint64_t off = (uint64_t)r * args.shared_row_bytes;
+            const float g = qwen4_row_dot(sh_gate + off, xt, args.shared_type, args.in_dim, tiisg);
+            const float u = qwen4_row_dot(sh_up + off, xt, args.shared_type, args.in_dim, tiisg);
+            if (tiisg == 0) mid[((uint64_t)tok * n_out + slot) * args.out_rows + r] = qwen4_silu(g) * u;
         }
     }
 }

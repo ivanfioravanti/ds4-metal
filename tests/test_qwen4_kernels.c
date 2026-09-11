@@ -2077,7 +2077,12 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
             require_ok(got_mid[((uint64_t)t * n_out + slots) * F + f] == sentinel, "MoE tile caps reserved mid slot");
         char name[128];
         snprintf(name, sizeof(name), "MoE tile caps mid T=%u down=%u cap=%u", T, down_type, caps[mode]);
-        if (mode == 0) { ref_mid = got_mid; check_exact_f32(name, ref_mid, ref_mid, mid_n); }
+        if (mode == 0) {
+            ref_mid = got_mid; check_exact_f32(name, ref_mid, ref_mid, mid_n);
+            uint64_t h = 1469598103934665603ull;
+            for (uint64_t i = 0; i < mid_n; i++) { uint32_t u; memcpy(&u, &got_mid[i], 4); h = (h ^ u) * 1099511628211ull; }
+            printf("  MoE simdgroup mid (down=%u): hash=%016llx\n", down_type, (unsigned long long)h);
+        }
         else { check_exact_f32(name, got_mid, ref_mid, mid_n + guard); free(got_mid); }
         require_ok(ds4_gpu_qwen4_moe_mm_down_tensor(gpart, gmid, glists, gcounts, a->base, a->size, down_off,
                                                  down_type, NE, T, slots, n_out, F, E, list_cap), "MoE tile caps down dispatch");
@@ -2086,7 +2091,12 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
         for (uint32_t t = 0; t < T; t++) for (uint32_t e = 0; e < E; e++)
             require_ok(got_part[((uint64_t)t * n_out + slots) * E + e] == sentinel, "MoE tile caps reserved down slot");
         snprintf(name, sizeof(name), "MoE tile caps down T=%u type=%u cap=%u", T, down_type, caps[mode]);
-        if (mode == 0) { ref_part = got_part; check_exact_f32(name, ref_part, ref_part, part_n); }
+        if (mode == 0) {
+            ref_part = got_part; check_exact_f32(name, ref_part, ref_part, part_n);
+            uint64_t h = 1469598103934665603ull;
+            for (uint64_t i = 0; i < part_n; i++) { uint32_t u; memcpy(&u, &got_part[i], 4); h = (h ^ u) * 1099511628211ull; }
+            printf("  MoE simdgroup down (down=%u): hash=%016llx\n", down_type, (unsigned long long)h);
+        }
         else { check_exact_f32(name, got_part, ref_part, part_n + guard); free(got_part); }
     }
     {   /* 64-token gate/up tiles (with their 8/16/32-token tails) must match cap 8 */
@@ -2101,6 +2111,54 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
         free(got_mid);
         unsetenv("DS4_QWEN4_MOE_MID_NT");
         unsetenv("DS4_QWEN4_MOE_TAILS");
+    }
+    if (down_type == 39u) for (uint32_t nax = 1; nax <= 2; nax++) {
+        /* tensor-op tiles of 32 (1) and 64 (2) tokens: same operands, cooperative
+         * accumulation; bound the drift against the simdgroup tiles */
+        char nax_str[4]; snprintf(nax_str, sizeof(nax_str), "%u", nax);
+        for (uint32_t i = 0; i < 2; i++) setenv(env_names[i], "8", 1);
+        setenv("DS4_QWEN4_MOE_MM_NAX", nax_str, 1);
+        require_ok(ds4_gpu_tensor_fill_f32(gmid, sentinel, mid_n + guard) &&
+                   ds4_gpu_tensor_fill_f32(gpart, sentinel, part_n + guard), "MoE nax sentinels");
+        if (ds4_gpu_qwen4_moe_mm_mid_tensor(gmid, gx, glists, gcounts, a->base, a->size, gate_off, up_off,
+                                            12u, NE, T, slots, n_out, E, F, list_cap)) {
+            float *got_mid = download(gmid, mid_n + guard);
+            double worst = 0.0, scale = 0.0;
+            for (uint64_t i = 0; i < mid_n; i++) {
+                if (ref_mid[i] == sentinel) continue;
+                const double d = fabs((double)got_mid[i] - ref_mid[i]);
+                if (d > worst) worst = d;
+                if (fabs(ref_mid[i]) > scale) scale = fabs(ref_mid[i]);
+            }
+            for (uint64_t i = mid_n; i < mid_n + guard; i++) require_ok(got_mid[i] == sentinel, "MoE nax mid tail guard");
+            require_ok(worst <= 2e-3 * scale, "MoE nax mid within 2e-3 of the simdgroup tiles");
+            {
+                uint64_t h = 1469598103934665603ull;
+                for (uint64_t i = 0; i < mid_n; i++) { uint32_t u; memcpy(&u, &got_mid[i], 4); h = (h ^ u) * 1099511628211ull; }
+                printf("  MoE nax=%u mid: max|d|=%.3e (scale %.3e) hash=%016llx\n", nax, worst, scale, (unsigned long long)h);
+            }
+            require_ok(ds4_gpu_qwen4_moe_mm_down_tensor(gpart, gmid, glists, gcounts, a->base, a->size, down_off,
+                                                     down_type, NE, T, slots, n_out, F, E, list_cap), "MoE nax down dispatch");
+            float *got_part = download(gpart, part_n + guard);
+            worst = 0.0; scale = 0.0;
+            for (uint64_t i = 0; i < part_n; i++) {
+                if (ref_part[i] == sentinel) continue;
+                const double d = fabs((double)got_part[i] - ref_part[i]);
+                if (d > worst) worst = d;
+                if (fabs(ref_part[i]) > scale) scale = fabs(ref_part[i]);
+            }
+            for (uint64_t i = part_n; i < part_n + guard; i++) require_ok(got_part[i] == sentinel, "MoE nax down tail guard");
+            require_ok(worst <= 2e-3 * scale, "MoE nax down within 2e-3 of the simdgroup tiles");
+            {
+                uint64_t h = 1469598103934665603ull;
+                for (uint64_t i = 0; i < part_n; i++) { uint32_t u; memcpy(&u, &got_part[i], 4); h = (h ^ u) * 1099511628211ull; }
+                printf("  MoE nax=%u down: max|d|=%.3e (scale %.3e) hash=%016llx\n", nax, worst, scale, (unsigned long long)h);
+            }
+            free(got_mid); free(got_part);
+        } else {
+            printf("  MoE nax: tensor API unavailable, skipped\n");
+        }
+        unsetenv("DS4_QWEN4_MOE_MM_NAX");
     }
     printf("  MoE tile caps T=%u Q4_K/%s: caps 1,16,32 and 64-token gate/up tiles byte-exact mid/down vs cap8\n",
            T, down_type == 39u ? "mxfp4" : "q8_0");

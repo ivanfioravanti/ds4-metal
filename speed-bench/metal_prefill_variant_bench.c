@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,6 +35,7 @@ typedef struct {
     int prefill_chunk;
     int prefix_tokens;
     int initial_tokens;
+    bool tolerate_drift;     /* report drift statistics instead of failing on a logit mismatch */
     int warmup_tokens;
     int ctx;
     int repeats;
@@ -60,6 +62,7 @@ static void usage(FILE *fp, const char *argv0) {
             "  --prefill-chunk N      tokens per chunk (default: 4096)\n"
             "  --prefix-tokens N      final prefill length (default: 8192)\n"
             "  --initial-tokens N     untimed live prefix before appending to that length\n"
+            "  --tolerate-drift       report max/mean |delta|, top-1 agreement instead of failing on a mismatch\n"
             "  --warmup-tokens N      untimed tokens per variant (default: 32; min: 32)\n"
             "  --ctx N                session allocation (default: max lengths + 1)\n"
             "  --repeats N            alternating ABBA/BAAB pairs (default: 2)\n"
@@ -142,6 +145,8 @@ static bench_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--warmup-tokens")) {
             cfg.warmup_tokens = parse_int_arg(
                 need_arg(&i, argc, argv, arg), arg, DEFAULT_WARMUP_TOKENS);
+        } else if (!strcmp(arg, "--tolerate-drift")) {
+            cfg.tolerate_drift = true;
         } else if (!strcmp(arg, "--initial-tokens")) {
             cfg.initial_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg, 0);
         } else if (!strcmp(arg, "--ctx")) {
@@ -269,6 +274,26 @@ static uint32_t float_bits(float value) {
     return bits;
 }
 
+static bool g_tolerate_drift = false;
+
+/* Drift statistics over one full-vocabulary row: max and mean |delta|, the
+ * top-1 ids of both rows, and the reference top-1 margin (top-1 minus top-2). */
+static void report_drift(const float *reference, const float *observed, int vocab, size_t run) {
+    double max_d = 0.0, sum_d = 0.0;
+    int r0 = 0, o0 = 0, r1 = -1;
+    for (int i = 0; i < vocab; i++) {
+        const double d = fabs((double)reference[i] - (double)observed[i]);
+        if (d > max_d) max_d = d;
+        sum_d += d;
+        if (reference[i] > reference[r0]) { r1 = r0; r0 = i; }
+        else if (r1 < 0 || reference[i] > reference[r1]) r1 = i;
+        if (observed[i] > observed[o0]) o0 = i;
+    }
+    printf("run=%zu drift max_abs=%.6g mean_abs=%.6g top1_reference=%d top1_observed=%d top1_agree=%s reference_margin=%.6g\n",
+           run, max_d, sum_d / (double)vocab, r0, o0, r0 == o0 ? "yes" : "no",
+           r1 >= 0 ? (double)reference[r0] - (double)reference[r1] : 0.0);
+}
+
 static int compare_logits(
         const float *reference,
         const float *observed,
@@ -276,6 +301,7 @@ static int compare_logits(
         size_t       run) {
     const size_t bytes = (size_t)vocab * sizeof(reference[0]);
     if (memcmp(reference, observed, bytes) == 0) return 0;
+    if (g_tolerate_drift) { report_drift(reference, observed, vocab, run); return 0; }
 
     size_t first = SIZE_MAX;
     size_t differing = 0;
@@ -344,6 +370,7 @@ int main(int argc, char **argv) {
         {1, 0, 0, 1},
     };
     const bench_config cfg = parse_options(argc, argv);
+    g_tolerate_drift = cfg.tolerate_drift;
     char *text = read_text(cfg.prompt_path);
     if (!text) return 1;
     if (select_variant(&cfg, 0) != 0) {

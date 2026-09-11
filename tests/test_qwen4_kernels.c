@@ -228,7 +228,44 @@ static uint64_t arena_q4_K(arena_t *a, uint64_t rows, uint64_t cols, double **sh
     return off;
 }
 
+/* q4_K rows with dyadic dequantized values (d a power of two, mins 0), so
+ * d*sc*q is exactly representable in half and the weight-rounding share of
+ * the error vanishes; the residual is activation rounding plus accumulation */
+static uint64_t arena_q4_K_dyadic(arena_t *a, uint64_t rows, uint64_t cols, double **shadow) {
+    const uint64_t blocks = cols / 256;
+    const uint64_t off = arena_alloc(a, rows * blocks * 144u);
+    uint8_t *w = a->base + off;
+    *shadow = malloc(rows * cols * sizeof(double));
+    for (uint64_t r = 0; r < rows; r++) {
+        for (uint64_t b = 0; b < blocks; b++) {
+            uint8_t *blk = w + (r * blocks + b) * 144u;
+            const uint16_t dh = f32_to_f16(ldexpf(1.0f, -9));
+            const float dq = f16_to_f32(dh);
+            memcpy(blk, &dh, 2);
+            memcpy(blk + 2, &dh, 2);
+            uint8_t sc[8] = {0};
+            for (int g = 0; g < 8; g++) sc[g] = (uint8_t)(1 + (int)(31.0f * (0.5f * frand() + 0.5f)));
+            uint8_t *s = blk + 4;
+            memset(blk + 4, 0, 12);
+            for (int g = 0; g < 4; g++) s[g] = sc[g] & 63;
+            for (int g = 4; g < 8; g++) {
+                s[g + 4] = (uint8_t)(sc[g] & 0xF);
+                s[g - 4] |= (uint8_t)((sc[g] >> 4) << 6);
+            }
+            memset(blk + 16, 0, 128);
+            for (int g = 0; g < 8; g++) {
+                for (int j = 0; j < 32; j++) {
+                    const int q = (int)(15.0f * (0.5f * frand() + 0.5f));
+                    blk[16 + (g >> 1) * 32 + j] |= (uint8_t)(q << ((g & 1) * 4));
+                    (*shadow)[r * cols + b * 256 + g * 32 + j] = (double)dq * sc[g] * q;
+                }
+            }
+        }
+    }
+    return off;
+}
 static uint64_t arena_mxfp4(arena_t *a, uint64_t rows, uint64_t cols, double **shadow) {
+
     static const double values[16] = {0, .5, 1, 1.5, 2, 3, 4, 6, -0.0, -.5, -1, -1.5, -2, -3, -4, -6};
     const uint64_t blocks = cols / 32;
     const uint64_t off = arena_alloc(a, rows * blocks * 17u);
@@ -2032,17 +2069,18 @@ static void test_q4k_ordered_exact(arena_t *a, uint32_t T, uint32_t F, bool shar
 static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
     const uint32_t T = 641, E = 256, F = 256, NE = 4, slots = 2, n_out = 3, list_cap = T + 7, guard = 16;
     const uint64_t mid_n = (uint64_t)T * n_out * F, part_n = (uint64_t)T * n_out * E;
-    const char *env_names[] = {"DS4_QWEN4_MOE_MID_TILES", "DS4_QWEN4_MOE_DOWN_TILES"};
-    char *saved_env[2];
-    for (uint32_t i = 0; i < 2; i++) {
+    const char *env_names[] = {"DS4_QWEN4_MOE_MID_TILES", "DS4_QWEN4_MOE_DOWN_TILES", "DS4_QWEN4_MOE_MM_NAX"};
+    char *saved_env[3];
+    for (uint32_t i = 0; i < 3; i++) {
         const char *v = getenv(env_names[i]);
         saved_env[i] = v ? strdup(v) : NULL;
         require_ok(!v || saved_env[i] != NULL, "save MoE tile caps environment");
     }
-    double *shadow;
-    const uint64_t gate_off = arena_q4_K(a, (uint64_t)NE * F, E, &shadow, 0.05f); free(shadow);
-    const uint64_t up_off = arena_q4_K(a, (uint64_t)NE * F, E, &shadow, 0.05f); free(shadow);
-    const uint64_t down_off = arena_tier(a, down_type, (uint64_t)NE * E, F, &shadow); free(shadow);
+    setenv("DS4_QWEN4_MOE_MM_NAX", "0", 1);   /* caps/nt8 sections pin the simdgroup tiles */
+    double *gate_shadow, *up_shadow, *down_shadow;
+    const uint64_t gate_off = arena_q4_K(a, (uint64_t)NE * F, E, &gate_shadow, 0.05f);
+    const uint64_t up_off = arena_q4_K(a, (uint64_t)NE * F, E, &up_shadow, 0.05f);
+    const uint64_t down_off = arena_tier(a, down_type, (uint64_t)NE * E, F, &down_shadow);
     float *x = rand_vec((uint64_t)T * E, 2.0f);
     int32_t *sel = malloc((uint64_t)T * slots * sizeof(int32_t));
     require_ok(sel != NULL, "MoE tile caps selection allocation");
@@ -2058,6 +2096,34 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
     require_ok(ds4_gpu_tensor_read(gcounts, 0, counts, sizeof(counts)), "MoE tile caps counts read");
     require_ok(counts[0] == (int32_t)T && counts[1] == (int32_t)((T + 1u) / 2u) && counts[2] == (int32_t)(T / 2u) && counts[3] == 0,
                "MoE tile caps hot, partial, and empty experts");
+    double *mid_exact = NULL, *part_exact = NULL;
+    if (down_type == 39u) {
+        /* full-precision reference: double products of the dequantized weights
+         * and the float activations, accumulated in double; part takes the
+         * exact mid, so mid and down tile paths are judged end to end */
+        mid_exact = malloc((uint64_t)T * n_out * F * sizeof(double));
+        part_exact = malloc(part_n * sizeof(double));
+        require_ok(mid_exact && part_exact, "MoE nax exact reference allocation");
+        for (uint32_t t = 0; t < T; t++) {
+            for (uint32_t s = 0; s < slots; s++) {
+                const uint32_t e = (uint32_t)sel[t * slots + s];
+                const float *xr = x + (uint64_t)t * E;
+                for (uint32_t f = 0; f < F; f++) {
+                    const double *gr = gate_shadow + ((uint64_t)e * F + f) * E;
+                    const double *ur = up_shadow + ((uint64_t)e * F + f) * E;
+                    double g = 0.0, u = 0.0;
+                    for (uint32_t k = 0; k < E; k++) { g += gr[k] * (double)xr[k]; u += ur[k] * (double)xr[k]; }
+                    mid_exact[((uint64_t)t * n_out + s) * F + f] = (g / (1.0 + exp(-g))) * u;
+                }
+                for (uint32_t d = 0; d < E; d++) {
+                    const double *dr = down_shadow + ((uint64_t)e * E + d) * F;
+                    double p = 0.0;
+                    for (uint32_t k = 0; k < F; k++) p += dr[k] * mid_exact[((uint64_t)t * n_out + s) * F + k];
+                    part_exact[((uint64_t)t * n_out + s) * E + d] = p;
+                }
+            }
+        }
+    }
     ds4_gpu_tensor *gmid = upload(NULL, mid_n + guard);
     ds4_gpu_tensor *gpart = upload(NULL, part_n + guard);
     float *ref_mid = NULL, *ref_part = NULL;
@@ -2081,7 +2147,16 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
             ref_mid = got_mid; check_exact_f32(name, ref_mid, ref_mid, mid_n);
             uint64_t h = 1469598103934665603ull;
             for (uint64_t i = 0; i < mid_n; i++) { uint32_t u; memcpy(&u, &got_mid[i], 4); h = (h ^ u) * 1099511628211ull; }
-            printf("  MoE simdgroup mid (down=%u): hash=%016llx\n", down_type, (unsigned long long)h);
+            if (mid_exact) {
+                double eworst = 0.0, esum = 0.0;
+                for (uint64_t i = 0; i < mid_n; i++) {
+                    if (ref_mid[i] == sentinel) continue;
+                    const double d = fabs((double)ref_mid[i] - mid_exact[i]);
+                    if (d > eworst) eworst = d;
+                    esum += d;
+                }
+                printf("  MoE simdgroup mid vs exact: max=%.3e mean=%.3e\n", eworst, esum / (double)mid_n);
+            }
         }
         else { check_exact_f32(name, got_mid, ref_mid, mid_n + guard); free(got_mid); }
         require_ok(ds4_gpu_qwen4_moe_mm_down_tensor(gpart, gmid, glists, gcounts, a->base, a->size, down_off,
@@ -2095,7 +2170,16 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
             ref_part = got_part; check_exact_f32(name, ref_part, ref_part, part_n);
             uint64_t h = 1469598103934665603ull;
             for (uint64_t i = 0; i < part_n; i++) { uint32_t u; memcpy(&u, &got_part[i], 4); h = (h ^ u) * 1099511628211ull; }
-            printf("  MoE simdgroup down (down=%u): hash=%016llx\n", down_type, (unsigned long long)h);
+            if (part_exact) {
+                double eworst = 0.0, esum = 0.0;
+                for (uint64_t i = 0; i < part_n; i++) {
+                    if (ref_part[i] == sentinel) continue;
+                    const double d = fabs((double)ref_part[i] - part_exact[i]);
+                    if (d > eworst) eworst = d;
+                    esum += d;
+                }
+                printf("  MoE simdgroup down vs exact: max=%.3e mean=%.3e\n", eworst, esum / (double)part_n);
+            }
         }
         else { check_exact_f32(name, got_part, ref_part, part_n + guard); free(got_part); }
     }
@@ -2112,9 +2196,11 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
         unsetenv("DS4_QWEN4_MOE_MID_NT");
         unsetenv("DS4_QWEN4_MOE_TAILS");
     }
-    if (down_type == 39u) for (uint32_t nax = 1; nax <= 2; nax++) {
-        /* tensor-op tiles of 32 (1) and 64 (2) tokens: same operands, cooperative
-         * accumulation; bound the drift against the simdgroup tiles */
+    if (down_type == 39u) for (uint32_t nax = 1; nax <= 5; nax++) {
+        /* tensor-op tiles of 32/64 tokens, half (1/2), float (3/4) or
+         * compensated (5) activation operands: cooperative accumulation;
+         * bound the drift against the simdgroup tiles and print the
+         * exact-reference error */
         char nax_str[4]; snprintf(nax_str, sizeof(nax_str), "%u", nax);
         for (uint32_t i = 0; i < 2; i++) setenv(env_names[i], "8", 1);
         setenv("DS4_QWEN4_MOE_MM_NAX", nax_str, 1);
@@ -2137,6 +2223,16 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
                 for (uint64_t i = 0; i < mid_n; i++) { uint32_t u; memcpy(&u, &got_mid[i], 4); h = (h ^ u) * 1099511628211ull; }
                 printf("  MoE nax=%u mid: max|d|=%.3e (scale %.3e) hash=%016llx\n", nax, worst, scale, (unsigned long long)h);
             }
+            {
+                double eworst = 0.0, esum = 0.0;
+                for (uint64_t i = 0; i < mid_n; i++) {
+                    if (ref_mid[i] == sentinel) continue;
+                    const double d = fabs((double)got_mid[i] - mid_exact[i]);
+                    if (d > eworst) eworst = d;
+                    esum += d;
+                }
+                printf("  MoE nax=%u mid vs exact: max=%.3e mean=%.3e\n", nax, eworst, esum / (double)mid_n);
+            }
             require_ok(ds4_gpu_qwen4_moe_mm_down_tensor(gpart, gmid, glists, gcounts, a->base, a->size, down_off,
                                                      down_type, NE, T, slots, n_out, F, E, list_cap), "MoE nax down dispatch");
             float *got_part = download(gpart, part_n + guard);
@@ -2154,19 +2250,73 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
                 for (uint64_t i = 0; i < part_n; i++) { uint32_t u; memcpy(&u, &got_part[i], 4); h = (h ^ u) * 1099511628211ull; }
                 printf("  MoE nax=%u down: max|d|=%.3e (scale %.3e) hash=%016llx\n", nax, worst, scale, (unsigned long long)h);
             }
+            {
+                double eworst = 0.0, esum = 0.0;
+                for (uint64_t i = 0; i < part_n; i++) {
+                    if (ref_part[i] == sentinel) continue;
+                    const double d = fabs((double)got_part[i] - part_exact[i]);
+                    if (d > eworst) eworst = d;
+                    esum += d;
+                }
+                printf("  MoE nax=%u down vs exact: max=%.3e mean=%.3e\n", nax, eworst, esum / (double)part_n);
+            }
             free(got_mid); free(got_part);
         } else {
             printf("  MoE nax: tensor API unavailable, skipped\n");
         }
         unsetenv("DS4_QWEN4_MOE_MM_NAX");
     }
+    if (down_type == 39u) {
+        /* error decomposition on a dyadic Q4_K fixture: the dequantized
+         * weights are exactly representable in half, so the simdgroup path's
+         * residual is the activation rounding plus fp32 accumulation, and the
+         * compensated tensor path's residual is its accumulation alone */
+        double *dgs, *dus;
+        const uint64_t dgate_off = arena_q4_K_dyadic(a, (uint64_t)NE * F, E, &dgs);
+        const uint64_t dup_off = arena_q4_K_dyadic(a, (uint64_t)NE * F, E, &dus);
+        double *dmid = malloc((uint64_t)T * n_out * F * sizeof(double));
+        require_ok(dmid != NULL, "MoE dyadic reference allocation");
+        for (uint32_t t = 0; t < T; t++) {
+            for (uint32_t s = 0; s < slots; s++) {
+                const uint32_t e2 = (uint32_t)sel[t * slots + s];
+                const float *xr = x + (uint64_t)t * E;
+                for (uint32_t f = 0; f < F; f++) {
+                    const double *gr = dgs + ((uint64_t)e2 * F + f) * E;
+                    const double *ur = dus + ((uint64_t)e2 * F + f) * E;
+                    double g = 0.0, u = 0.0;
+                    for (uint32_t k = 0; k < E; k++) { g += gr[k] * (double)xr[k]; u += ur[k] * (double)xr[k]; }
+                    dmid[((uint64_t)t * n_out + s) * F + f] = (g / (1.0 + exp(-g))) * u;
+                }
+            }
+        }
+        for (uint32_t level = 0; level < 3; level++) {
+            double eworst = 0.0, esum = 0.0;
+            setenv("DS4_QWEN4_MOE_MM_NAX", level == 0 ? "0" : level == 1 ? "2" : "5", 1);
+            require_ok(ds4_gpu_tensor_fill_f32(gmid, sentinel, mid_n + guard), "MoE dyadic sentinels");
+            require_ok(ds4_gpu_qwen4_moe_mm_mid_tensor(gmid, gx, glists, gcounts, a->base, a->size, dgate_off, dup_off,
+                                                    12u, NE, T, slots, n_out, E, F, list_cap), "MoE dyadic mid dispatch");
+            float *got = download(gmid, mid_n + guard);
+            for (uint64_t i = 0; i < mid_n; i++) {
+                if (ref_mid[i] == sentinel) continue;
+                const double d = fabs((double)got[i] - dmid[i]);
+                if (d > eworst) eworst = d;
+                esum += d;
+            }
+            printf("  MoE dyadic mid %s: max=%.3e mean=%.3e\n",
+                   level == 0 ? "simdgroup" : level == 1 ? "nax=2" : "nax=5", eworst, esum / (double)mid_n);
+            free(got);
+        }
+        unsetenv("DS4_QWEN4_MOE_MM_NAX");
+        free(dmid); free(dgs); free(dus);
+    }
     printf("  MoE tile caps T=%u Q4_K/%s: caps 1,16,32 and 64-token gate/up tiles byte-exact mid/down vs cap8\n",
            T, down_type == 39u ? "mxfp4" : "q8_0");
-    for (uint32_t i = 0; i < 2; i++) {
+    for (uint32_t i = 0; i < 3; i++) {
         if (saved_env[i]) setenv(env_names[i], saved_env[i], 1); else unsetenv(env_names[i]);
         free(saved_env[i]);
     }
     free(ref_part); free(ref_mid); free(sel); free(x);
+    free(gate_shadow); free(up_shadow); free(down_shadow); free(mid_exact); free(part_exact);
     ds4_gpu_tensor_free(gpart); ds4_gpu_tensor_free(gmid); ds4_gpu_tensor_free(gcounts);
     ds4_gpu_tensor_free(glists); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gx);
 }

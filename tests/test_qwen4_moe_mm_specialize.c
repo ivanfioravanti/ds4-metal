@@ -51,6 +51,7 @@ static int check(const void *map, uint64_t bytes, const format *f, uint32_t T) {
         host_ids[t * S + 1] = 1 + t % 3;
         host_ids[t * S + 2] = 4 + t % 3;
     }
+    setenv("DS4_QWEN4_MOE_MM_NAX", "0", 1);   /* the knob matrix exercises the simdgroup tiles */
     ok = ds4_gpu_tensor_write(x, 0, host_x, (uint64_t)T * D * sizeof(float)) &&
          ds4_gpu_tensor_write(ids, 0, host_ids, (uint64_t)T * S * sizeof(int32_t)) &&
          ds4_gpu_qwen4_moe_build_lists_tensor(lists, counts, ids, T, S, E, T);

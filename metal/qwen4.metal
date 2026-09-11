@@ -3053,16 +3053,42 @@ kernel void kernel_qwen4_rows_f32_to_f16(
  * so one float C tile goes through threadgroup memory.  Threadgroup
  * memory, mid: gate A 4 KB + up A 4 KB + B NR1/16 KB while staging, then
  * NR1/4 KB of C; down: A 4 KB + B NR1/16 KB, then NR1/4 KB of C. */
-template <int NR1>
+/* Staging copy of one token's 8-wide k slice (8 halves or 8 floats). */
+template <typename XT>
+inline void qwen4_nax_stage8(threadgroup XT *dst, device const XT *src) {
+    if (src) {
+        if constexpr (is_same<XT, half>::value) {
+            *(threadgroup uint4 *)dst = *(device const uint4 *)src;
+        } else {
+            *(threadgroup float4 *)dst = *(device const float4 *)src;
+            *(threadgroup float4 *)(dst + 4) = *(device const float4 *)(src + 4);
+        }
+    } else {
+        if constexpr (is_same<XT, half>::value) {
+            *(threadgroup uint4 *)dst = uint4(0u);
+        } else {
+            *(threadgroup float4 *)dst = float4(0.0f);
+            *(threadgroup float4 *)(dst + 4) = float4(0.0f);
+        }
+    }
+}
+
+/* B operand element type: compensated tiles always stage halves (the float
+ * input is split into a half part and a half residual at staging time). */
+template <bool COMP, typename XT> struct qwen4_nax_btype { using type = XT; };
+template <typename XT> struct qwen4_nax_btype<true, XT> { using type = half; };
+
+template <int NR1, typename XT, bool COMP>
 kernel void kernel_qwen4_moe_mm_mid_nax_t(
         constant ds4_metal_args_qwen4_moe_mm & args,
         device const char    *gate_base,
         device const char    *up_base,
         device const int32_t *lists,
         device const int32_t *counts,
-        device const half    *x,          /* [T][in_dim], pre-rounded */
+        device const XT      *x,          /* [T][in_dim] */
         device float         *mid,
         device half          *midh,       /* [T][n_out][out_rows], the down tiles' operand */
+        device half          *midr,       /* [T][n_out][out_rows] residual of midh (COMP) */
         threadgroup char     *shmem [[threadgroup(0)]],
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tid [[thread_index_in_threadgroup]],
@@ -3070,6 +3096,7 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     constexpr int NR0 = 64, NK = 32;
     constexpr int NB = NR1 * 4 / 128;   /* B staging items per thread (token, 8-wide k slice) */
+    using BT = typename qwen4_nax_btype<COMP, XT>::type;
     uint rb, tile0;
     if (args.expert_major) { const uint n_rb = (args.out_rows + NR0 - 1u) / NR0; rb = tgpig.x % n_rb; tile0 = tgpig.x / n_rb; }
     else { rb = tgpig.x; tile0 = tgpig.z; }
@@ -3092,7 +3119,8 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
     }
     threadgroup half *Ag = (threadgroup half *)shmem;                 /* [64][32] */
     threadgroup half *Au = (threadgroup half *)(shmem + 4096);        /* [64][32] */
-    threadgroup half *Bs = (threadgroup half *)(shmem + 8192);        /* [NR1][32] */
+    threadgroup BT *Bs = (threadgroup BT *)(shmem + 8192);            /* [NR1][32] */
+    threadgroup half *Br = (threadgroup half *)(shmem + 8192 + NR1 * 64); /* [NR1][32] residual (COMP) */
     threadgroup float *Cs = (threadgroup float *)shmem;               /* [NR1 tok][64 row] after the K loop */
     device const char *gbase = gate_base + (uint64_t)e * args.expert_bytes;
     device const char *ubase = up_base + (uint64_t)e * args.expert_bytes;
@@ -3103,6 +3131,7 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
     auto tA_g = tensor(Ag, dextents<int32_t, 2>(NK, NR0));
     auto tA_u = tensor(Au, dextents<int32_t, 2>(NK, NR0));
     auto tB = tensor(Bs, dextents<int32_t, 2>(NK, NR1));   /* left operand: k contiguous, one token per column */
+    auto tBr = tensor(Br, dextents<int32_t, 2>(NK, NR1));
     matmul2d<matmul2d_descriptor(NR1, NR0, NK, false, true, false, matmul2d_descriptor::mode::multiply_accumulate),
              execution_simdgroups<4>> mm;
     const uint ar = tid / 2, aq = tid % 2;       /* A staging: (row, 16-wide half of the 32-block) */
@@ -3115,14 +3144,16 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
         for (uint16_t i = 0; i < cG.get_capacity(); ++i) { if (cG.is_valid_element(i)) cG[i] = 0.0f; }
 #pragma unroll
         for (uint16_t i = 0; i < cU.get_capacity(); ++i) { if (cU.is_valid_element(i)) cU[i] = 0.0f; }
-        device const half *xr[NB];
-        threadgroup half *bdst[NB];
+        device const XT *xr[NB];
+        threadgroup BT *bdst[NB];
+        threadgroup half *rdst[NB];
 #pragma unroll
         for (int b = 0; b < NB; b++) {
             const uint item = (uint)tid + (uint)b * 128u, tok = item / 4u, kq = item % 4u;
             const int pair = tok < n_tile ? list[t0 + tok] : -1;
-            xr[b] = pair >= 0 ? x + (uint64_t)((uint)pair / args.n_slots) * args.in_dim + kq * 8u : (device const half *)0;
+            xr[b] = pair >= 0 ? x + (uint64_t)((uint)pair / args.n_slots) * args.in_dim + kq * 8u : (device const XT *)0;
             bdst[b] = Bs + tok * NK + kq * 8u;
+            if constexpr (COMP) rdst[b] = Br + tok * NK + kq * 8u;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);   /* previous tile's C tile consumed */
         const bool a_row = row0 + ar < args.out_rows;
@@ -3142,9 +3173,26 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
                 if (kb + 1 < nk) { rg = qwen4_load_raw16(grow, kb + 1, aq * 2, type); ru = qwen4_load_raw16(urow, kb + 1, aq * 2, type); }
             }
 #pragma unroll
-            for (int b = 0; b < NB; b++) {   /* the same half rounding as the simdgroup tiles */
-                threadgroup half *dst = bdst[b];
-                *(threadgroup uint4 *)dst = xr[b] ? *(device const uint4 *)(xr[b] + kb * NK) : uint4(0u);
+            for (int b = 0; b < NB; b++) {
+                if constexpr (COMP) {
+                    /* stage xh and the residual xr: x = xh + xr to ~2^-22 relative */
+                    if (xr[b]) {
+                        const float4 v0 = *(device const float4 *)(xr[b] + kb * NK);
+                        const float4 v1 = *(device const float4 *)(xr[b] + kb * NK + 4);
+                        const half4 h0 = half4(v0), h1 = half4(v1);
+                        *(threadgroup uint2 *)bdst[b] = as_type<uint2>(h0);
+                        *(threadgroup uint2 *)(bdst[b] + 4) = as_type<uint2>(h1);
+                        *(threadgroup uint2 *)rdst[b] = as_type<uint2>(half4(v0 - float4(h0)));
+                        *(threadgroup uint2 *)(rdst[b] + 4) = as_type<uint2>(half4(v1 - float4(h1)));
+                    } else {
+                        *(threadgroup uint2 *)bdst[b] = uint2(0u);
+                        *(threadgroup uint2 *)(bdst[b] + 4) = uint2(0u);
+                        *(threadgroup uint2 *)rdst[b] = uint2(0u);
+                        *(threadgroup uint2 *)(rdst[b] + 4) = uint2(0u);
+                    }
+                } else {
+                    qwen4_nax_stage8(bdst[b], xr[b] ? xr[b] + kb * NK : (device const XT *)0);
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             {
@@ -3153,6 +3201,11 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
                 auto mAu = tA_u.slice(0, 0);
                 mm.run(mB, mAg, cG);
                 mm.run(mB, mAu, cU);
+                if constexpr (COMP) {
+                    auto mBr = tBr.slice(0, 0);
+                    mm.run(mBr, mAg, cG);
+                    mm.run(mBr, mAu, cU);
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
@@ -3168,24 +3221,33 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
             const int pair = list[t0 + j];
             const uint t = (uint)pair / args.n_slots, slot = (uint)pair % args.n_slots;
             device float *out = mid + ((uint64_t)t * args.n_out + slot) * args.out_rows + row0;
-            device half *outh = midh + ((uint64_t)t * args.n_out + slot) * args.out_rows + row0;
+            device half *outh = nullptr, *outr = nullptr;
             for (uint i = tiisg; i < NR0 && row0 + i < args.out_rows; i += 32) {
                 const float v = Cs[j * NR0 + i];
                 out[i] = v;
-                outh[i] = (half)v;
+                if constexpr (is_same<XT, half>::value || COMP) {
+                    outh = midh + ((uint64_t)t * args.n_out + slot) * args.out_rows + row0;
+                    if constexpr (COMP) outr = midr + ((uint64_t)t * args.n_out + slot) * args.out_rows + row0;
+                }
+                if (outh) {
+                    const half h = (half)v;
+                    outh[i] = h;
+                    if constexpr (COMP) outr[i] = (half)(v - (float)h);
+                }
             }
         }
     }
 }
 
-template <int NR1>
+template <int NR1, typename XT, bool COMP>
 kernel void kernel_qwen4_moe_mm_down_nax_t(
         constant ds4_metal_args_qwen4_moe_mm & args,
         device const char    *down_base,
         device const int32_t *lists,
         device const int32_t *counts,
-        device const half    *midv,       /* [T][n_out][in_dim], pre-rounded */
+        device const XT      *midv,       /* [T][n_out][in_dim] */
         device float         *part,
+        device const half    *midr,       /* [T][n_out][in_dim] residual of midh (COMP) */
         threadgroup char     *shmem [[threadgroup(0)]],
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tid [[thread_index_in_threadgroup]],
@@ -3214,7 +3276,8 @@ kernel void kernel_qwen4_moe_mm_down_nax_t(
         }
     }
     threadgroup half *As = (threadgroup half *)shmem;                 /* [64][32] */
-    threadgroup half *Bs = (threadgroup half *)(shmem + 4096);        /* [NR1][32] */
+    threadgroup XT *Bs = (threadgroup XT *)(shmem + 4096);            /* [NR1][32] */
+    threadgroup half *Br = (threadgroup half *)(shmem + 4096 + NR1 * 64); /* [NR1][32] residual (COMP) */
     threadgroup float *Cs = (threadgroup float *)shmem;               /* [NR1 tok][64 row] after the K loop */
     device const char *dbase = down_base + (uint64_t)e * args.expert_bytes;
     device const int32_t *list = lists + (uint64_t)e * args.list_cap;
@@ -3223,6 +3286,7 @@ kernel void kernel_qwen4_moe_mm_down_nax_t(
     const uint type = qwen4_moe_weight_type ? qwen4_moe_weight_type : args.weight_type;
     auto tA = tensor(As, dextents<int32_t, 2>(NK, NR0));
     auto tB = tensor(Bs, dextents<int32_t, 2>(NK, NR1));   /* left operand: k contiguous, one token per column */
+    auto tBr = tensor(Br, dextents<int32_t, 2>(NK, NR1));
     matmul2d<matmul2d_descriptor(NR1, NR0, NK, false, true, false, matmul2d_descriptor::mode::multiply_accumulate),
              execution_simdgroups<4>> mm;
     const uint ar = tid / 2, aq = tid % 2;
@@ -3232,15 +3296,20 @@ kernel void kernel_qwen4_moe_mm_down_nax_t(
         auto cT = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
 #pragma unroll
         for (uint16_t i = 0; i < cT.get_capacity(); ++i) { if (cT.is_valid_element(i)) cT[i] = 0.0f; }
-        device const half *mr[NB];
-        threadgroup half *bdst[NB];
+        device const XT *mr[NB];
+        device const half *rr[NB];
+        threadgroup XT *bdst[NB];
+        threadgroup half *rdst[NB];
 #pragma unroll
         for (int b = 0; b < NB; b++) {
             const uint item = (uint)tid + (uint)b * 128u, tok = item / 4u, kq = item % 4u;
             const int pair = tok < n_tile ? list[t0 + tok] : -1;
             mr[b] = pair >= 0 ? midv + ((uint64_t)((uint)pair / args.n_slots) * args.n_out + (uint)pair % args.n_slots) * args.in_dim + kq * 8u
+                              : (device const XT *)0;
+            rr[b] = pair >= 0 ? midr + ((uint64_t)((uint)pair / args.n_slots) * args.n_out + (uint)pair % args.n_slots) * args.in_dim + kq * 8u
                               : (device const half *)0;
             bdst[b] = Bs + tok * NK + kq * 8u;
+            if constexpr (COMP) rdst[b] = Br + tok * NK + kq * 8u;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const bool a_row = row0 + ar < args.out_rows;
@@ -3255,14 +3324,23 @@ kernel void kernel_qwen4_moe_mm_down_nax_t(
             }
 #pragma unroll
             for (int b = 0; b < NB; b++) {
-                threadgroup half *dst = bdst[b];
-                *(threadgroup uint4 *)dst = mr[b] ? *(device const uint4 *)(mr[b] + kb * NK) : uint4(0u);
+                if constexpr (COMP) {
+                    /* stage the half operand and its residual separately */
+                    *(threadgroup uint4 *)bdst[b] = mr[b] ? *(device const uint4 *)(mr[b] + kb * NK) : uint4(0u);
+                    *(threadgroup uint4 *)rdst[b] = rr[b] ? *(device const uint4 *)(rr[b] + kb * NK) : uint4(0u);
+                } else {
+                    qwen4_nax_stage8(bdst[b], mr[b] ? mr[b] + kb * NK : (device const XT *)0);
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             {
                 auto mB = tB.slice(0, 0);
                 auto mA = tA.slice(0, 0);
                 mm.run(mB, mA, cT);
+                if constexpr (COMP) {
+                    auto mBr = tBr.slice(0, 0);
+                    mm.run(mBr, mA, cT);
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
@@ -3281,16 +3359,27 @@ kernel void kernel_qwen4_moe_mm_down_nax_t(
     }
 }
 
-#define QWEN4_NAX_MID_SIG constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const char *, device const int32_t *, device const int32_t *, device const half *, device float *, device half *, threadgroup char *, uint3, ushort, ushort, ushort
-#define QWEN4_NAX_DOWN_SIG constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const half *, device float *, threadgroup char *, uint3, ushort, ushort, ushort
-template [[host_name("kernel_qwen4_moe_mm_mid_nax")]] kernel void kernel_qwen4_moe_mm_mid_nax_t<32>(QWEN4_NAX_MID_SIG);
-template [[host_name("kernel_qwen4_moe_mm_mid_nax64")]] kernel void kernel_qwen4_moe_mm_mid_nax_t<64>(QWEN4_NAX_MID_SIG);
-template [[host_name("kernel_qwen4_moe_mm_down_nax")]] kernel void kernel_qwen4_moe_mm_down_nax_t<32>(QWEN4_NAX_DOWN_SIG);
-template [[host_name("kernel_qwen4_moe_mm_down_nax64")]] kernel void kernel_qwen4_moe_mm_down_nax_t<64>(QWEN4_NAX_DOWN_SIG);
-#undef QWEN4_NAX_MID_SIG
-#undef QWEN4_NAX_DOWN_SIG
-#endif
-
+#define QWEN4_NAX_MID_SIG_HALF constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const char *, device const int32_t *, device const int32_t *, device const half *, device float *, device half *, device half *, threadgroup char *, uint3, ushort, ushort, ushort
+#define QWEN4_NAX_MID_SIG_FLOAT constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, device half *, device half *, threadgroup char *, uint3, ushort, ushort, ushort
+#define QWEN4_NAX_DOWN_SIG_HALF constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const half *, device float *, device const half *, threadgroup char *, uint3, ushort, ushort, ushort
+#define QWEN4_NAX_DOWN_SIG_FLOAT constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, device const half *, threadgroup char *, uint3, ushort, ushort, ushort
+template [[host_name("kernel_qwen4_moe_mm_mid_nax")]] kernel void kernel_qwen4_moe_mm_mid_nax_t<32, half, false>(QWEN4_NAX_MID_SIG_HALF);
+template [[host_name("kernel_qwen4_moe_mm_mid_nax64")]] kernel void kernel_qwen4_moe_mm_mid_nax_t<64, half, false>(QWEN4_NAX_MID_SIG_HALF);
+template [[host_name("kernel_qwen4_moe_mm_down_nax")]] kernel void kernel_qwen4_moe_mm_down_nax_t<32, half, false>(QWEN4_NAX_DOWN_SIG_HALF);
+template [[host_name("kernel_qwen4_moe_mm_down_nax64")]] kernel void kernel_qwen4_moe_mm_down_nax_t<64, half, false>(QWEN4_NAX_DOWN_SIG_HALF);
+template [[host_name("kernel_qwen4_moe_mm_mid_naxf")]] kernel void kernel_qwen4_moe_mm_mid_nax_t<32, float, false>(QWEN4_NAX_MID_SIG_FLOAT);
+template [[host_name("kernel_qwen4_moe_mm_mid_naxf64")]] kernel void kernel_qwen4_moe_mm_mid_nax_t<64, float, false>(QWEN4_NAX_MID_SIG_FLOAT);
+template [[host_name("kernel_qwen4_moe_mm_down_naxf")]] kernel void kernel_qwen4_moe_mm_down_nax_t<32, float, false>(QWEN4_NAX_DOWN_SIG_FLOAT);
+template [[host_name("kernel_qwen4_moe_mm_down_naxf64")]] kernel void kernel_qwen4_moe_mm_down_nax_t<64, float, false>(QWEN4_NAX_DOWN_SIG_FLOAT);
+template [[host_name("kernel_qwen4_moe_mm_mid_naxc")]] kernel void kernel_qwen4_moe_mm_mid_nax_t<32, float, true>(QWEN4_NAX_MID_SIG_FLOAT);
+template [[host_name("kernel_qwen4_moe_mm_mid_naxc64")]] kernel void kernel_qwen4_moe_mm_mid_nax_t<64, float, true>(QWEN4_NAX_MID_SIG_FLOAT);
+template [[host_name("kernel_qwen4_moe_mm_down_naxc")]] kernel void kernel_qwen4_moe_mm_down_nax_t<32, half, true>(QWEN4_NAX_DOWN_SIG_HALF);
+template [[host_name("kernel_qwen4_moe_mm_down_naxc64")]] kernel void kernel_qwen4_moe_mm_down_nax_t<64, half, true>(QWEN4_NAX_DOWN_SIG_HALF);
+#undef QWEN4_NAX_MID_SIG_HALF
+#undef QWEN4_NAX_MID_SIG_FLOAT
+#undef QWEN4_NAX_DOWN_SIG_HALF
+#undef QWEN4_NAX_DOWN_SIG_FLOAT
+#endif /* DS4_METAL_HAS_TENSOR */
 /* --- prefill: dense tiled GEMM for f32/f16/q8_0 weights ----------------- */
 
 struct ds4_metal_args_qwen4_dense_mm {

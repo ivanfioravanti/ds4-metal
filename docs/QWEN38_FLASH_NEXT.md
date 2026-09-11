@@ -156,6 +156,22 @@ Round 4 on M5 Max focused on prefill (`speed-bench/qwen38-m5-round4.md`). A prod
 
 Round 5 on M5 Max took that lever, opt-in (`speed-bench/qwen38-m5-round5.md`). The routed Q4_K gate/up and MXFP4 down tiles run on the Metal 4 tensor ops (`kernel_qwen4_moe_mm_mid_nax[64]` / `_down_nax[64]`): the same dequantized halves are staged, only the cooperative matmul's accumulation order differs, so logits drift instead of matching bit for bit. `DS4_QWEN4_MOE_MM_NAX=1` selects 32-token tiles, `=2` 64-token tiles (bit-identical to each other), off by default. Measured with the chunk-interleaved harness in its new `--tolerate-drift` mode: +18.4% at 8K-40K with 32-token tiles, +3.4% more with 64-token tiles, +19.7 to +20.7% at 96K-128K (unthrottled repeats; +17 to +23% aggregates); the routed tile microbench halves (16.1 ms to 7.5 ms). The drift is a fixed-size perturbation (mean |delta logit| 0.09-0.15 on the last row at 2K, 32K and 128K, top-1 agreeing) and the BF16-reference fixture (99 cases) moves within noise: target NLL 0.20505 to 0.20503, logprob MAE 0.0468 to 0.0466, top-1 agreement 96.34% to 96.25%, first-token matches 86/99 both ways, two orders of magnitude under the Q4_K to Q8 spread. Double-buffered staging and relaxed-precision accumulation did not pay; a register-resident SiLU epilogue did. Skip-variants then put the tile at 41% tensor op, 35% weight staging, 18% activation staging, nearly serial, and three bit-identical staging changes followed (output hashes unchanged): a pre-rounded half activation operand (one conversion pass per call), a register prefetch of the next K step's raw weight words, a 32-token tail tile for the 64-token kernel, and the half copy of `mid` written by the mid tiles instead of a conversion pass; together the tensor path reaches **+32.6% at 8K-40K** (1186 -> 1572 tok/s) and +30% at 96K-128K over the simdgroup tiles. Exact prefetches of the attention K/V gather and of the GDN scan operands were tried and rejected (noise). `test_qwen4_kernels` bounds both tile widths against the simdgroup tiles and prints their output hashes.
 
+An accuracy follow-up (`speed-bench/qwen38-m5-round5-accuracy.md`) added operand-precision
+levels to the opt-in tensor tiles: `DS4_QWEN4_MOE_MM_NAX=3/4` stage the activation operand at
+full float precision, and `=5/6` compensated tiles stage the half rounding residual of the
+operand beside it and run the tensor op twice, so the activation operand enters at ~2^-22
+relative instead of 2^-11. Both reach the same tile accuracy — mean |error| versus a double
+reference drops 26% (mid) and 31% (down) against the simdgroup tiles — but the fp32 path gives
+up the whole prefill win (the unit's fp32 tiles run ~2.4x slower), while the compensated path
+keeps most of it: +22.0% at 8K-40K versus +25 to +33% for `=2`, with the best fixture NLL of
+all paths (0.20430 versus 0.20505 simdgroup and 0.20503 `=2`) on the 99-case BF16 fixture.
+
+The compensated level is the promoted default on devices with the Metal tensor API
+(`DS4_QWEN4_MOE_MM_NAX` unset selects it); `=0` restores the simdgroup tiles, `=2` selects
+the uncompensated 64-token tiles for maximum speed (+48% at 8K-40K and +51% at 96K-128K
+over the simdgroup tiles on the corrected binary, +21% / +20% for the compensated level),
+and decode is unaffected at every level (the decode MoE path never dispatches these tiles).
+
 The older recipes below keep PLE inside the main GGUF, so their file sizes
 are not directly comparable with the external-PLE builds.
 

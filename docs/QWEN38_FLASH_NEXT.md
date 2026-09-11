@@ -165,7 +165,12 @@ reference drops 26% (mid) and 31% (down) against the simdgroup tiles — but the
 up the whole prefill win (the unit's fp32 tiles run ~2.4x slower), while the compensated path
 keeps most of it: +22.0% at 8K-40K versus +25 to +33% for `=2`, with the best fixture NLL of
 all paths (0.20430 versus 0.20505 simdgroup and 0.20503 `=2`) on the 99-case BF16 fixture.
-Decode stays byte-exact and unaffected at every level.
+
+The compensated level is the promoted default on devices with the Metal tensor API
+(`DS4_QWEN4_MOE_MM_NAX` unset selects it); `=0` restores the simdgroup tiles, `=2` selects
+the uncompensated 64-token tiles for maximum speed (+48% at 8K-40K and +51% at 96K-128K
+over the simdgroup tiles on the corrected binary, +21% / +20% for the compensated level),
+and decode is unaffected at every level (the decode MoE path never dispatches these tiles).
 
 The older recipes below keep PLE inside the main GGUF, so their file sizes
 are not directly comparable with the external-PLE builds.

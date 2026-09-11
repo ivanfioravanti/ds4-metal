@@ -48616,10 +48616,11 @@ static uint32_t qwen4_moe_mm_nt(uint32_t n_tokens, uint32_t type, const char *en
  * conversion pass); 5/6 compensated tiles (64/32 tokens), which stage the
  * half rounding residual of the operand beside it and run the tensor op on
  * both, reaching the 3/4 accuracy while keeping the fp16 tensor-op rate.
- * Returns the token tile width, 0 for the simdgroup path. */
+ * Unset now selects 5 on devices with the tensor API; 0 forces the simdgroup
+ * tiles.  Returns the token tile width, 0 for the simdgroup path. */
 static long qwen4_moe_mm_nax_level(void) {
     const char *v = getenv("DS4_QWEN4_MOE_MM_NAX");
-    if (!v || !v[0]) return 0;
+    if (!v || !v[0]) return 5;   /* default: compensated 64-token tiles */
     return strtol(v, NULL, 10);
 }
 static uint32_t qwen4_moe_mm_nax(uint32_t type) {
@@ -48702,6 +48703,7 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
     qwen4_moe_mm_args args = { n_tokens, n_slots, n_out, in_dim, ff_dim, weight_type, row_bytes, list_cap,
                                expert_bytes, n_expert, tiles, 0, qwen4_moe_mm_expert_major() };
     const bool tails = qwen4_moe_mm_tails(weight_type, nt);
+    if (tails) args.tail_base = nt * 8u;
     qwen4_bind b[8];
     if (n_tokens == 0 || n_slots == 0 || n_out < n_slots || row_bytes == 0 ||
         (weight_type != 8u && weight_type != 39u && weight_type != 12u && weight_type != 10u && weight_type != 16u && weight_type != 2u) ||

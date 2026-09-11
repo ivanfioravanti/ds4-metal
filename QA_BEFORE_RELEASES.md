@@ -687,6 +687,28 @@ the vision graph, multimodal prompt spans, or image-aware KV identity.
   encoder comparison, prompt replay test, and six-case server fixture on one
   DGX Spark and on `strixhalo`; ROCm Q2 must use bounded SSD streaming.
 
+### Qwen3.8-Flash-Next (Metal tensor routed tiles)
+
+The routed Q4_K gate/up and MXFP4 down tiles run on the Metal 4 tensor ops by
+default on devices with the tensor API (compensated level; `DS4_QWEN4_MOE_MM_NAX=0`
+restores the simdgroup tiles).  This declares the measured full-logit tolerance
+the Metal oracle section requires for the drift class:
+
+- Per-tile versus a double-precision reference (test_qwen4_kernels,
+  test_moe_mm_tiles_exact): mean |error| 4.998e-06 mid / 2.444e-06 down, max
+  2.55e-04 / 4.03e-05 — strictly closer to exact than the simdgroup tiles
+  (6.78e-06 / 3.55e-06); on half-exact weights the residual is the tensor
+  unit's accumulation alone (1.57e-06, ~1150x below the operand-rounding error).
+- Last-row logits versus the simdgroup build: mean |delta| 0.11-0.16 at
+  2K-128K, fixed-size (does not grow with context); top-1 flips only on
+  near-ties (observed margins 0.23-0.99).  Decode logits are byte-identical
+  (the decode MoE path does not dispatch these tiles); acceptance rates and
+  first-token matches on the 99-case BF16 fixture are unchanged, target NLL
+  0.20430 versus 0.20505 simdgroup, logprob MAE 0.04665 versus 0.04679.
+- Speed on M5 Max (chunk-interleaved, 8192-token chunks): +48% at 8K-40K and
+  +51% at 96K-128K prefill for `=2`, +21% / +20% for the compensated default.
+  The Q2 pack (IQ2XXS/Q2_K routed experts) does not take the tensor path.
+
 ## 7. SSD Streaming
 
 SSD streaming is a capacity path, so test both correctness and user experience.

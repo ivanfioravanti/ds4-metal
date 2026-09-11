@@ -95,3 +95,20 @@ with extra work (compensation: 2x tensor-op) or lost rate (fp32 operands:
 decode untouched) while making the routed tiles the most numerically faithful
 path measured; levels 3/4 are kept for the record but rejected.  Everything
 remains opt-in; the default path is untouched and byte-exact.
+
+## Correction: mid-tail dispatch bug and re-measurement
+
+The compensated-levels rewrite dropped `if (tails) args.tail_base = nt * 8u;` from the
+mid dispatch, so simdgroup mid-tile launches ran with the tail mechanism disabled —
+byte-exact outputs but ~24% slower mid tiles.  Every branch-vs-base measurement taken
+with that binary had depressed control legs (the "+55%" deltas and the apparent thermal
+control-leg sag).  Fixed and re-measured (chunk-interleaved, `=0` control):
+
+| window | simdgroup | `=2` | delta | `=5` (default) | delta |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8K->40K | 888.4 t/s | 1315.4 t/s | **+48.1%** | 947.7 t/s | **+21.2%** |
+| 96K->128K | 738.2 t/s | 1113.7 t/s | **+50.9%** | 883.1 t/s | **+20.4%** |
+
+Microbench parity after the fix: `=0` 16.03-16.06 ms matches the pre-PR binary
+16.04-16.09 ms; compensated 12.88-12.90 ms; `=2` 6.62-6.64 ms.  The compensated level is
+promoted to the default on tensor-API devices; `=0` restores the simdgroup tiles.

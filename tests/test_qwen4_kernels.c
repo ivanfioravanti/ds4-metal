@@ -2069,13 +2069,14 @@ static void test_q4k_ordered_exact(arena_t *a, uint32_t T, uint32_t F, bool shar
 static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
     const uint32_t T = 641, E = 256, F = 256, NE = 4, slots = 2, n_out = 3, list_cap = T + 7, guard = 16;
     const uint64_t mid_n = (uint64_t)T * n_out * F, part_n = (uint64_t)T * n_out * E;
-    const char *env_names[] = {"DS4_QWEN4_MOE_MID_TILES", "DS4_QWEN4_MOE_DOWN_TILES"};
-    char *saved_env[2];
-    for (uint32_t i = 0; i < 2; i++) {
+    const char *env_names[] = {"DS4_QWEN4_MOE_MID_TILES", "DS4_QWEN4_MOE_DOWN_TILES", "DS4_QWEN4_MOE_MM_NAX"};
+    char *saved_env[3];
+    for (uint32_t i = 0; i < 3; i++) {
         const char *v = getenv(env_names[i]);
         saved_env[i] = v ? strdup(v) : NULL;
         require_ok(!v || saved_env[i] != NULL, "save MoE tile caps environment");
     }
+    setenv("DS4_QWEN4_MOE_MM_NAX", "0", 1);   /* caps/nt8 sections pin the simdgroup tiles */
     double *gate_shadow, *up_shadow, *down_shadow;
     const uint64_t gate_off = arena_q4_K(a, (uint64_t)NE * F, E, &gate_shadow, 0.05f);
     const uint64_t up_off = arena_q4_K(a, (uint64_t)NE * F, E, &up_shadow, 0.05f);
@@ -2290,12 +2291,7 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
         }
         for (uint32_t level = 0; level < 3; level++) {
             double eworst = 0.0, esum = 0.0;
-            if (level == 0) unsetenv("DS4_QWEN4_MOE_MM_NAX");
-            else {
-                char lvl[4];
-                snprintf(lvl, sizeof(lvl), "%u", level == 1 ? 2u : 5u);
-                setenv("DS4_QWEN4_MOE_MM_NAX", lvl, 1);
-            }
+            setenv("DS4_QWEN4_MOE_MM_NAX", level == 0 ? "0" : level == 1 ? "2" : "5", 1);
             require_ok(ds4_gpu_tensor_fill_f32(gmid, sentinel, mid_n + guard), "MoE dyadic sentinels");
             require_ok(ds4_gpu_qwen4_moe_mm_mid_tensor(gmid, gx, glists, gcounts, a->base, a->size, dgate_off, dup_off,
                                                     12u, NE, T, slots, n_out, E, F, list_cap), "MoE dyadic mid dispatch");
@@ -2315,7 +2311,7 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
     }
     printf("  MoE tile caps T=%u Q4_K/%s: caps 1,16,32 and 64-token gate/up tiles byte-exact mid/down vs cap8\n",
            T, down_type == 39u ? "mxfp4" : "q8_0");
-    for (uint32_t i = 0; i < 2; i++) {
+    for (uint32_t i = 0; i < 3; i++) {
         if (saved_env[i]) setenv(env_names[i], saved_env[i], 1); else unsetenv(env_names[i]);
         free(saved_env[i]);
     }

@@ -48623,8 +48623,18 @@ static long qwen4_moe_mm_nax_level(void) {
     if (!v || !v[0]) return 5;   /* default: compensated 64-token tiles */
     return strtol(v, NULL, 10);
 }
+static bool qwen4_moe_mm_nax_env_set(void) {
+    const char *v = getenv("DS4_QWEN4_MOE_MM_NAX");
+    return v != NULL && v[0] != '\0';
+}
 static uint32_t qwen4_moe_mm_nax(uint32_t type) {
-    if (!(type == 12u || type == 39u) || !ds4_gpu_mpp_available()) return 0;
+    if (!ds4_gpu_mpp_available()) return 0;
+    const bool q4 = type == 12u || type == 39u;
+    /* The Q2 tiers (iq2_xxs gate/up, q2_K down) take the tensor tiles only
+     * when the level is set explicitly; the default stays the simdgroup
+     * tiles until full-model measurements justify promoting them. */
+    if (!q4 && !(type == 16u || type == 10u)) return 0;
+    if (!q4 && !qwen4_moe_mm_nax_env_set()) return 0;
     const long n = qwen4_moe_mm_nax_level();
     if (n <= 0) return 0;
     return (n == 1 || n == 4 || n == 6) ? 32u : 64u;

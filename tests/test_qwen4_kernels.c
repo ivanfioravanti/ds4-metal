@@ -2066,6 +2066,132 @@ static void test_q4k_ordered_exact(arena_t *a, uint32_t T, uint32_t F, bool shar
 /* Freeze the GPU-built routing lists across launch-cap comparisons.
  * The hot expert spans 21 tiles, exceeding caps eight and sixteen, and
  * the final 32-token tile contains only one token. */
+/* Q2-pack tiers (iq2_xxs gate/up + q2_K down) on the routed tiles: the
+ * simdgroup tiles are the reference; the tensor-op levels are bounded
+ * against them and against a double-precision exact reference. */
+static void test_moe_mm_tiles_iq2(arena_t *a) {
+    const uint32_t T = 641, E = 256, F = 256, NE = 4, slots = 2, n_out = 3, list_cap = T + 7, guard = 16;
+    const uint64_t mid_n = (uint64_t)T * n_out * F, part_n = (uint64_t)T * n_out * E;
+    const char *env_names[] = {"DS4_QWEN4_MOE_MID_TILES", "DS4_QWEN4_MOE_DOWN_TILES"};
+    char *saved_env[3];
+    for (uint32_t i = 0; i < 3; i++) {
+        const char *names[] = {env_names[0], env_names[1], "DS4_QWEN4_MOE_MM_NAX"};
+        const char *v = getenv(names[i]);
+        saved_env[i] = v ? strdup(v) : NULL;
+        require_ok(!v || saved_env[i] != NULL, "save Q2 tile environment");
+    }
+    setenv("DS4_QWEN4_MOE_MM_NAX", "0", 1);   /* simdgroup reference */
+    double *gate_shadow, *up_shadow, *down_shadow;
+    const uint64_t gate_off = arena_tier(a, 16u, (uint64_t)NE * F, E, &gate_shadow);
+    const uint64_t up_off = arena_tier(a, 16u, (uint64_t)NE * F, E, &up_shadow);
+    const uint64_t down_off = arena_tier(a, 10u, (uint64_t)NE * E, F, &down_shadow);
+    float *x = rand_vec((uint64_t)T * E, 2.0f);
+    int32_t *sel = malloc((uint64_t)T * slots * sizeof(int32_t));
+    require_ok(sel != NULL, "Q2 tile selection allocation");
+    for (uint32_t t = 0; t < T; t++) { sel[t * slots] = 0; sel[t * slots + 1] = (int32_t)(1u + t % 2u); }
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * E);
+    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * slots * sizeof(int32_t));
+    ds4_gpu_tensor *glists = ds4_gpu_tensor_alloc((uint64_t)NE * list_cap * sizeof(int32_t));
+    ds4_gpu_tensor *gcounts = ds4_gpu_tensor_alloc(NE * sizeof(int32_t));
+    require_ok(gsel && glists && gcounts && ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * slots * sizeof(int32_t)),
+               "Q2 tile routing setup");
+    require_ok(ds4_gpu_qwen4_moe_build_lists_tensor(glists, gcounts, gsel, T, slots, NE, list_cap), "Q2 tile frozen lists");
+    double *mid_exact = malloc(mid_n * sizeof(double)), *part_exact = malloc(part_n * sizeof(double));
+    require_ok(mid_exact && part_exact, "Q2 tile exact reference allocation");
+    for (uint32_t t = 0; t < T; t++) {
+        for (uint32_t s = 0; s < slots; s++) {
+            const uint32_t e = (uint32_t)sel[t * slots + s];
+            const float *xr = x + (uint64_t)t * E;
+            for (uint32_t f = 0; f < F; f++) {
+                const double *gr = gate_shadow + ((uint64_t)e * F + f) * E;
+                const double *ur = up_shadow + ((uint64_t)e * F + f) * E;
+                double g = 0.0, u = 0.0;
+                for (uint32_t k = 0; k < E; k++) { g += gr[k] * (double)xr[k]; u += ur[k] * (double)xr[k]; }
+                mid_exact[((uint64_t)t * n_out + s) * F + f] = (g / (1.0 + exp(-g))) * u;
+            }
+            for (uint32_t d = 0; d < E; d++) {
+                const double *dr = down_shadow + ((uint64_t)e * E + d) * F;
+                double p = 0.0;
+                for (uint32_t k = 0; k < F; k++) p += dr[k] * mid_exact[((uint64_t)t * n_out + s) * F + k];
+                part_exact[((uint64_t)t * n_out + s) * E + d] = p;
+            }
+        }
+    }
+    ds4_gpu_tensor *gmid = upload(NULL, mid_n + guard);
+    ds4_gpu_tensor *gpart = upload(NULL, part_n + guard);
+    const float sentinel = -1234.5f;
+    float *ref_mid = NULL, *ref_part = NULL;
+    const uint32_t nax_levels[] = {0, 1, 2, 5};
+    for (uint32_t li = 0; li < sizeof(nax_levels) / sizeof(nax_levels[0]); li++) {
+        const uint32_t nax = nax_levels[li];
+        char nax_str[4]; snprintf(nax_str, sizeof(nax_str), "%u", nax);
+        setenv("DS4_QWEN4_MOE_MM_NAX", nax_str, 1);
+        for (uint32_t i = 0; i < 2; i++) setenv(env_names[i], "8", 1);
+        require_ok(ds4_gpu_tensor_fill_f32(gmid, sentinel, mid_n + guard) &&
+                   ds4_gpu_tensor_fill_f32(gpart, sentinel, part_n + guard), "Q2 tile sentinels");
+        char name[96];
+        const bool have_nax = ds4_gpu_qwen4_moe_mm_mid_tensor(gmid, gx, glists, gcounts, a->base, a->size, gate_off, up_off,
+                                                             16u, NE, T, slots, n_out, E, F, list_cap);
+        if (!have_nax && nax != 0) { printf("  Q2 tiles nax=%u: unavailable, skipped\n", nax); continue; }
+        require_ok(have_nax, "Q2 tile mid dispatch");
+        float *got_mid = download(gmid, mid_n + guard);
+        for (uint64_t i = mid_n; i < mid_n + guard; i++) require_ok(got_mid[i] == sentinel, "Q2 tile mid tail guard");
+        for (uint32_t t = 0; t < T; t++) for (uint32_t f = 0; f < F; f++)
+            require_ok(got_mid[((uint64_t)t * n_out + slots) * F + f] == sentinel, "Q2 tile reserved mid slot");
+        double worst = 0.0, scale = 0.0;
+        for (uint64_t i = 0; i < mid_n; i++) {
+            if (got_mid[i] == sentinel) continue;
+            if (ref_mid) { const double d = fabs((double)got_mid[i] - ref_mid[i]); if (d > worst) worst = d; }
+            if (fabs(got_mid[i]) > scale) scale = fabs(got_mid[i]);
+        }
+        double eworst = 0.0, esum = 0.0;
+        for (uint64_t i = 0; i < mid_n; i++) {
+            if (got_mid[i] == sentinel) continue;
+            const double d = fabs((double)got_mid[i] - mid_exact[i]);
+            if (d > eworst) eworst = d;
+            esum += d;
+        }
+        printf("  Q2 tiles nax=%u mid vs exact: max=%.3e mean=%.3e\n", nax, eworst, esum / (double)mid_n);
+        if (ref_mid) {
+            snprintf(name, sizeof(name), "Q2 tile mid nax=%u within 2e-3 of simdgroup", nax);
+            require_ok(worst <= 2e-3 * scale, name);
+            printf("  Q2 tiles nax=%u mid vs simdgroup: max|d|=%.3e (scale %.3e)\n", nax, worst, scale);
+        } else { ref_mid = got_mid; got_mid = NULL; }
+        free(got_mid);
+        require_ok(ds4_gpu_qwen4_moe_mm_down_tensor(gpart, gmid, glists, gcounts, a->base, a->size, down_off,
+                                                    10u, NE, T, slots, n_out, F, E, list_cap), "Q2 tile down dispatch");
+        float *got_part = download(gpart, part_n + guard);
+        for (uint64_t i = part_n; i < part_n + guard; i++) require_ok(got_part[i] == sentinel, "Q2 tile down tail guard");
+        worst = 0.0; scale = 0.0;
+        for (uint64_t i = 0; i < part_n; i++) {
+            if (got_part[i] == sentinel) continue;
+            if (ref_part) { const double d = fabs((double)got_part[i] - ref_part[i]); if (d > worst) worst = d; }
+            if (fabs(got_part[i]) > scale) scale = fabs(got_part[i]);
+        }
+        eworst = 0.0; esum = 0.0;
+        for (uint64_t i = 0; i < part_n; i++) {
+            if (got_part[i] == sentinel) continue;
+            const double d = fabs((double)got_part[i] - part_exact[i]);
+            if (d > eworst) eworst = d;
+            esum += d;
+        }
+        printf("  Q2 tiles nax=%u down vs exact: max=%.3e mean=%.3e\n", nax, eworst, esum / (double)part_n);
+        if (ref_part) {
+            snprintf(name, sizeof(name), "Q2 tile down nax=%u within 2e-3 of simdgroup", nax);
+            require_ok(worst <= 2e-3 * scale, name);
+            printf("  Q2 tiles nax=%u down vs simdgroup: max|d|=%.3e (scale %.3e)\n", nax, worst, scale);
+        } else { ref_part = got_part; got_part = NULL; }
+        free(got_part);
+    }
+    for (uint32_t i = 0; i < 3; i++) {
+        const char *names[] = {env_names[0], env_names[1], "DS4_QWEN4_MOE_MM_NAX"};
+        if (saved_env[i]) { setenv(names[i], saved_env[i], 1); free(saved_env[i]); } else unsetenv(names[i]);
+    }
+    free(x); free(sel); free(mid_exact); free(part_exact); free(ref_mid); free(ref_part); free(gate_shadow); free(up_shadow); free(down_shadow);
+    ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(glists); ds4_gpu_tensor_free(gcounts);
+    ds4_gpu_tensor_free(gmid); ds4_gpu_tensor_free(gpart);
+}
+
 static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
     const uint32_t T = 641, E = 256, F = 256, NE = 4, slots = 2, n_out = 3, list_cap = T + 7, guard = 16;
     const uint64_t mid_n = (uint64_t)T * n_out * F, part_n = (uint64_t)T * n_out * E;
@@ -2639,6 +2765,35 @@ static int bench_p_moe_mm_q4k_case(bench_ctx *c, uint32_t NE, uint32_t seed0, ds
            ds4_gpu_qwen4_moe_mm_mid_tensor(st[4], st[3], st[1], st[2], c->a->base, c->a->size, offs[0], offs[1], 12u, NE, T, slots, slots, E, F, cap) &&
            ds4_gpu_qwen4_moe_mm_down_tensor(st[5], st[4], st[1], st[2], c->a->base, c->a->size, offs[2], 39u, NE, T, slots, slots, F, E, cap);
 }
+/* Q2-pack-shaped routed tiles: IQ2XXS gate/up + Q2_K down (768-wide ff), 10
+ * slots per token.  Dense case (32 experts, ~640 pairs each). */
+static int bench_p_moe_mm_iq2_case(bench_ctx *c, uint32_t NE, uint32_t seed0, ds4_gpu_tensor **st, uint64_t *offs) {
+    const uint32_t T = 2048, slots = 10, E = 2560, F = 768, cap = NE >= 256 ? 512 : T;
+    if (!st[0]) {
+        double *sh;
+        offs[0] = arena_tier(c->a, 16u, (uint64_t)NE * F, E, &sh); free(sh);
+        offs[1] = arena_tier(c->a, 16u, (uint64_t)NE * F, E, &sh); free(sh);
+        offs[2] = arena_tier(c->a, 10u, (uint64_t)NE * E, F, &sh); free(sh);
+        int32_t *s = malloc((uint64_t)T * slots * sizeof(int32_t));
+        uint32_t seed = seed0;
+        for (uint64_t i = 0; i < (uint64_t)T * slots; i++) { seed = seed * 1664525u + 1013904223u; s[i] = (int32_t)((seed >> 8) % NE); }
+        st[0] = ds4_gpu_tensor_alloc((uint64_t)T * slots * sizeof(int32_t));
+        require_ok(st[0] && ds4_gpu_tensor_write(st[0], 0, s, (uint64_t)T * slots * sizeof(int32_t)), "moe iq2 bench selection");
+        free(s);
+        st[1] = ds4_gpu_tensor_alloc((uint64_t)NE * cap * sizeof(int32_t));
+        st[2] = ds4_gpu_tensor_alloc(NE * sizeof(int32_t));
+        float *xv = rand_vec((uint64_t)T * E, 1.0f);
+        st[3] = upload(xv, (uint64_t)T * E); free(xv);
+        st[4] = upload(NULL, (uint64_t)T * slots * F);
+        st[5] = upload(NULL, (uint64_t)T * slots * E);
+        require_ok(st[1] && st[2] && st[3] && st[4] && st[5], "moe iq2 bench buffers");
+    }
+    return ds4_gpu_qwen4_moe_build_lists_tensor(st[1], st[2], st[0], T, slots, NE, cap) &&
+           ds4_gpu_qwen4_moe_mm_mid_tensor(st[4], st[3], st[1], st[2], c->a->base, c->a->size, offs[0], offs[1], 16u, NE, T, slots, slots, E, F, cap) &&
+           ds4_gpu_qwen4_moe_mm_down_tensor(st[5], st[4], st[1], st[2], c->a->base, c->a->size, offs[2], 10u, NE, T, slots, slots, F, E, cap);
+}
+static int bench_p_moe_mm_iq2(void *ud) { static ds4_gpu_tensor *st[6]; static uint64_t offs[3]; return bench_p_moe_mm_iq2_case(ud, 32, 4242u, st, offs); }
+
 static int bench_p_moe_mm_q4k(void *ud) { static ds4_gpu_tensor *st[6]; static uint64_t offs[3]; return bench_p_moe_mm_q4k_case(ud, 32, 12345u, st, offs); }
 static int bench_p_moe_mm_q4k_lo(void *ud) { static ds4_gpu_tensor *st[6]; static uint64_t offs[3]; return bench_p_moe_mm_q4k_case(ud, 256, 777u, st, offs); }
 static int bench_gdn_scan(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_gdn_scan_tensor(c->t[15], c->t[1], c->t[11], c->t[13], c->t[14], 1, 16, 48, 128, NULL, 0u); }
@@ -2795,6 +2950,7 @@ static void bench_dispatch(arena_t *a) {
     bench_run("q8 gemm 6144x2560 T=256 (dense mm)", bench_p_q8_mm, &c, 20);
     bench_run("moe mm lists+mid+down 16 experts T=256 (all 2560 pairs)", bench_p_moe_mm, &c, 10);
     bench_run("moe mm q4k/mxfp4 32 experts T=2048 x10 slots", bench_p_moe_mm_q4k, &c, 10);
+    bench_run("moe mm iq2xxs/q2k 32 experts T=2048 x10 slots", bench_p_moe_mm_iq2, &c, 10);
     bench_run("moe mm q4k/mxfp4 lo 256 experts T=2048 x10 slots", bench_p_moe_mm_q4k_lo, &c, 10);
     {   /* decays in (0,1], betas in (0,1) for the scan benches */
         float *g = malloc(1024 * 48 * 4), *b = malloc(1024 * 48 * 4);
@@ -2990,6 +3146,7 @@ int main(void) {
     test_q4k_ordered_exact(&arena, 2, 641, true);
     test_moe_mm_tiles_exact(&arena, 8u);
     test_moe_mm_tiles_exact(&arena, 39u);
+    test_moe_mm_tiles_iq2(&arena);
     printf("dense mm\n");
     test_dense_mm(&arena, 2560, 512, 37, 0u);
     test_dense_mm(&arena, 10240, 320, 33, 1u);

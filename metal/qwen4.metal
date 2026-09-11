@@ -2739,7 +2739,10 @@ static inline void qwen4_mm_stage16(device const char *row, uint b, uint q0, uin
 
 /* Raw words of one 32-block (K step) of an expert row, for the tensor tiles'
  * register prefetch: Q4_K keeps the 16-byte header (d, dmin, scales) and the
- * 16 nibble bytes of the quarter pair; MXFP4 keeps the 17 block bytes. */
+ * 16 nibble bytes of the quarter pair; Q2_K keeps d|dmin, the group's scale
+ * nibble and the 16 bit-plane bytes of its group pair; IQ2XXS keeps d, the
+ * 32-bit grid indices and the sign/scale word of the block; MXFP4 keeps the
+ * 17 block bytes. */
 struct qwen4_raw16 { uint4 h; uint4 q; uchar m[17]; };
 static inline qwen4_raw16 qwen4_load_raw16(device const char *row, uint b, uint q0, uint type) {
     qwen4_raw16 r;
@@ -2748,6 +2751,22 @@ static inline qwen4_raw16 qwen4_load_raw16(device const char *row, uint b, uint 
         device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 144);
         r.h = *(device const uint4 *)blk;
         r.q = *(device const uint4 *)(blk + 16 + (group >> 1) * 32 + q0 * 8);
+    } else if (type == 10) {
+        const uint sb = b / 8, g = (b % 8) * 2 + q0 / 2;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 84);
+        r.h.x = *(device const uint *)(blk + 80);   /* d | dmin << 16 */
+        r.h.y = blk[g];                            /* scale | min nibbles */
+        device const uint *qs = (device const uint *)(blk + 16 + 32u * (g / 8u) + 16u * (g & 1u));
+        r.q.x = qs[0]; r.q.y = qs[1]; r.q.z = qs[2]; r.q.w = qs[3];
+    } else if (type == 16) {
+        const uint sb = b / 8, ib32 = b % 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 66);
+        device const ushort *q2 = (device const ushort *)(blk + 2) + 4 * ib32;
+        const uint ag = (uint)q2[0] | ((uint)q2[1] << 16);
+        const uint auxs = (uint)q2[2] | ((uint)q2[3] << 16);
+        r.h.x = ((uint)*(device const ushort *)blk) | (ag << 16);
+        r.h.y = (ag >> 16) | (auxs << 16);
+        r.h.z = auxs >> 16;
     } else {
         device const uchar *blk = (device const uchar *)(row + (uint64_t)b * 17);
 #pragma unroll
@@ -2769,6 +2788,31 @@ static inline void qwen4_dequant_raw16(qwen4_raw16 r, uint b, uint q0, uint type
         const float ds = d * (float)sN, dm = dmin * (float)mn;
         const uint shift = (group & 1u) * 4u;
         for (uint i = 0; i < 16; i++) dst[i] = (half)(ds * (float)((r.q[i >> 2] >> (8u * (i & 3u) + shift)) & 0xFu) - dm);
+        return;
+    }
+    if (type == 10) {
+        const uint g = (b % 8) * 2 + q0 / 2;
+        const float d = (float)as_type<half>((ushort)(r.h.x & 0xFFFFu));
+        const float dmin = (float)as_type<half>((ushort)(r.h.x >> 16));
+        const float ds = d * (float)(r.h.y & 0xFu), dm = dmin * (float)(r.h.y >> 4);
+        const uint shift = ((g / 2u) & 3u) * 2u;
+        for (uint i = 0; i < 16; i++) {
+            const uint byte = (r.q[i >> 2] >> (8u * (i & 3u))) & 0xFFu;
+            dst[i] = (half)(ds * (float)((byte >> shift) & 3u) - dm);
+        }
+        return;
+    }
+    if (type == 16) {
+        const uint ag = (r.h.x >> 16) | (r.h.y << 16);
+        const uint auxs = (r.h.y >> 16) | (r.h.z << 16);
+        const float d = (float)as_type<half>((ushort)(r.h.x & 0xFFFFu));
+        const float dl = d * (0.5f + (float)(auxs >> 28)) * 0.25f;
+        for (uint h = 0; h < 2; h++) {
+            const uint qq = q0 + h;
+            constant const uchar *grid = (constant const uchar *)(ds4_metal_iq2xxs_grid + ((ag >> (8u * qq)) & 0xFFu));
+            const uint signs = ds4_metal_ksigns_iq2xs[(auxs >> (7u * qq)) & 127u];
+            for (uint i = 0; i < 8; i++) dst[h * 8 + i] = (half)(dl * (float)grid[i] * ((signs >> i) & 1u ? -1.0f : 1.0f));
+        }
         return;
     }
     const float d = ds4_metal_e8m0_to_f32(r.m[0]);

@@ -61,12 +61,37 @@ of 3 top-1 tokens of BF16 agreement (96.21% vs 96.34%); first-token matches
 are unchanged.  All paths remain two orders of magnitude inside the Q4_K->Q8
 quantization spread.
 
+
+## Error decomposition (dyadic fixture)
+
+`test_moe_mm_tiles_exact` also runs the mid tile on a dyadic Q4_K fixture
+(power-of-two scale, zero mins), whose dequantized weights are exactly
+representable in half, so weight rounding vanishes and the residual sources
+separate:
+
+| path | mid mean \|error\| |
+| --- | ---: |
+| default (simdgroup): activation fp16 rounding + fp32 accumulation | 1.799e-03 |
+| `=2`: identical to default (same operands, different summation order) | 1.799e-03 |
+| `=5` compensated: fp32 accumulation alone | **1.567e-06** |
+
+Three findings: the compensated path's residual is the pure tensor-unit
+accumulation error (~1150x below the default's operand-rounding error on
+this fixture — the compensation removes the activation rounding essentially
+perfectly); the default and `=2` are equally (in)accurate, differing only in
+accumulation order; and on the real fixture the remaining 5.0e-06 of `=5` is
+weight fp16 rounding, which cannot be removed at speed — compensating the
+weights needs a third tensor op per K step (slower than the simdgroup tiles),
+and float weight staging lands on the slow fp32 tgmem kernels or 20+ KB of
+threadgroup memory.  5.0e-06 is therefore the practical floor of the tensor
+path at competitive speed; going lower means not using it.
+
 ## Verdict
 
 Mathematical accuracy and the tensor-op prefill win trade off directly on
 this hardware: the fast path is fp16-only, so accuracy can only be bought
 with extra work (compensation: 2x tensor-op) or lost rate (fp32 operands:
-~2.4x).  `DS4_QWEN4_MOE_MM_NAX=5` keeps a good boost (+22% prefill,
+~2.4x slower).  `DS4_QWEN4_MOE_MM_NAX=5` keeps a good boost (+22% prefill,
 decode untouched) while making the routed tiles the most numerically faithful
-path measured.  Levels 3/4 are kept for the record but rejected.  Everything
+path measured; levels 3/4 are kept for the record but rejected.  Everything
 remains opt-in; the default path is untouched and byte-exact.

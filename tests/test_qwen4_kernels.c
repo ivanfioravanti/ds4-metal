@@ -228,7 +228,44 @@ static uint64_t arena_q4_K(arena_t *a, uint64_t rows, uint64_t cols, double **sh
     return off;
 }
 
+/* q4_K rows with dyadic dequantized values (d a power of two, mins 0), so
+ * d*sc*q is exactly representable in half and the weight-rounding share of
+ * the error vanishes; the residual is activation rounding plus accumulation */
+static uint64_t arena_q4_K_dyadic(arena_t *a, uint64_t rows, uint64_t cols, double **shadow) {
+    const uint64_t blocks = cols / 256;
+    const uint64_t off = arena_alloc(a, rows * blocks * 144u);
+    uint8_t *w = a->base + off;
+    *shadow = malloc(rows * cols * sizeof(double));
+    for (uint64_t r = 0; r < rows; r++) {
+        for (uint64_t b = 0; b < blocks; b++) {
+            uint8_t *blk = w + (r * blocks + b) * 144u;
+            const uint16_t dh = f32_to_f16(ldexpf(1.0f, -9));
+            const float dq = f16_to_f32(dh);
+            memcpy(blk, &dh, 2);
+            memcpy(blk + 2, &dh, 2);
+            uint8_t sc[8] = {0};
+            for (int g = 0; g < 8; g++) sc[g] = (uint8_t)(1 + (int)(31.0f * (0.5f * frand() + 0.5f)));
+            uint8_t *s = blk + 4;
+            memset(blk + 4, 0, 12);
+            for (int g = 0; g < 4; g++) s[g] = sc[g] & 63;
+            for (int g = 4; g < 8; g++) {
+                s[g + 4] = (uint8_t)(sc[g] & 0xF);
+                s[g - 4] |= (uint8_t)((sc[g] >> 4) << 6);
+            }
+            memset(blk + 16, 0, 128);
+            for (int g = 0; g < 8; g++) {
+                for (int j = 0; j < 32; j++) {
+                    const int q = (int)(15.0f * (0.5f * frand() + 0.5f));
+                    blk[16 + (g >> 1) * 32 + j] |= (uint8_t)(q << ((g & 1) * 4));
+                    (*shadow)[r * cols + b * 256 + g * 32 + j] = (double)dq * sc[g] * q;
+                }
+            }
+        }
+    }
+    return off;
+}
 static uint64_t arena_mxfp4(arena_t *a, uint64_t rows, uint64_t cols, double **shadow) {
+
     static const double values[16] = {0, .5, 1, 1.5, 2, 3, 4, 6, -0.0, -.5, -1, -1.5, -2, -3, -4, -6};
     const uint64_t blocks = cols / 32;
     const uint64_t off = arena_alloc(a, rows * blocks * 17u);
@@ -2227,6 +2264,54 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
             printf("  MoE nax: tensor API unavailable, skipped\n");
         }
         unsetenv("DS4_QWEN4_MOE_MM_NAX");
+    }
+    if (down_type == 39u) {
+        /* error decomposition on a dyadic Q4_K fixture: the dequantized
+         * weights are exactly representable in half, so the simdgroup path's
+         * residual is the activation rounding plus fp32 accumulation, and the
+         * compensated tensor path's residual is its accumulation alone */
+        double *dgs, *dus;
+        const uint64_t dgate_off = arena_q4_K_dyadic(a, (uint64_t)NE * F, E, &dgs);
+        const uint64_t dup_off = arena_q4_K_dyadic(a, (uint64_t)NE * F, E, &dus);
+        double *dmid = malloc((uint64_t)T * n_out * F * sizeof(double));
+        require_ok(dmid != NULL, "MoE dyadic reference allocation");
+        for (uint32_t t = 0; t < T; t++) {
+            for (uint32_t s = 0; s < slots; s++) {
+                const uint32_t e2 = (uint32_t)sel[t * slots + s];
+                const float *xr = x + (uint64_t)t * E;
+                for (uint32_t f = 0; f < F; f++) {
+                    const double *gr = dgs + ((uint64_t)e2 * F + f) * E;
+                    const double *ur = dus + ((uint64_t)e2 * F + f) * E;
+                    double g = 0.0, u = 0.0;
+                    for (uint32_t k = 0; k < E; k++) { g += gr[k] * (double)xr[k]; u += ur[k] * (double)xr[k]; }
+                    dmid[((uint64_t)t * n_out + s) * F + f] = (g / (1.0 + exp(-g))) * u;
+                }
+            }
+        }
+        for (uint32_t level = 0; level < 3; level++) {
+            double eworst = 0.0, esum = 0.0;
+            if (level == 0) unsetenv("DS4_QWEN4_MOE_MM_NAX");
+            else {
+                char lvl[4];
+                snprintf(lvl, sizeof(lvl), "%u", level == 1 ? 2u : 5u);
+                setenv("DS4_QWEN4_MOE_MM_NAX", lvl, 1);
+            }
+            require_ok(ds4_gpu_tensor_fill_f32(gmid, sentinel, mid_n + guard), "MoE dyadic sentinels");
+            require_ok(ds4_gpu_qwen4_moe_mm_mid_tensor(gmid, gx, glists, gcounts, a->base, a->size, dgate_off, dup_off,
+                                                    12u, NE, T, slots, n_out, E, F, list_cap), "MoE dyadic mid dispatch");
+            float *got = download(gmid, mid_n + guard);
+            for (uint64_t i = 0; i < mid_n; i++) {
+                if (ref_mid[i] == sentinel) continue;
+                const double d = fabs((double)got[i] - dmid[i]);
+                if (d > eworst) eworst = d;
+                esum += d;
+            }
+            printf("  MoE dyadic mid %s: max=%.3e mean=%.3e\n",
+                   level == 0 ? "simdgroup" : level == 1 ? "nax=2" : "nax=5", eworst, esum / (double)mid_n);
+            free(got);
+        }
+        unsetenv("DS4_QWEN4_MOE_MM_NAX");
+        free(dmid); free(dgs); free(dus);
     }
     printf("  MoE tile caps T=%u Q4_K/%s: caps 1,16,32 and 64-token gate/up tiles byte-exact mid/down vs cap8\n",
            T, down_type == 39u ? "mxfp4" : "q8_0");

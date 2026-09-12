@@ -92,6 +92,13 @@ Use `--mtp-exact-sampling` to preserve the ordinary target sampling
 distribution. Exact mode accepts greedy proposals with their target
 probability and samples from the remaining distribution on rejection.
 
+When a verified block crosses a tool sampling-mode boundary (for example
+entering tool-call syntax during server decoding), the server rewinds to the
+block start and re-evaluates the boundary token so the next sample uses the
+new mode. Under exact sampling that rewind restores a pre-verify snapshot of
+the recurrent state instead of resetting the graph, so long retained
+contexts are not replayed at every boundary.
+
 Accepted tokens keep the state produced by the batched verifier. Floating-point
 reduction order can differ from one-token decode, so long greedy continuations
 need not be byte-identical. For DeepSeek comparisons against the ordinary

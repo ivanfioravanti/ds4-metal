@@ -124,6 +124,7 @@ static ds4_engine *test_open_engine(bool quality) {
         .mtp_path = (mtp && mtp[0] && !quality) ? mtp : NULL,
         .mtp_draft_tokens = (mtp && mtp[0] && !quality) ? 4 : 0,
         .glm_mtp = test_env_bool("DS4_TEST_GLM_MTP"),
+        .dspark_exact_sampling = test_env_bool("DS4_TEST_MTP_EXACT"),
     };
     TEST_ASSERT(ds4_engine_open(&engine, &opt) == 0);
     return engine;
@@ -237,6 +238,76 @@ static void test_session_rewind_replay(void) {
 
 cleanup:
     ds4_tokens_free(&replay);
+    ds4_tokens_free(&prompt);
+    ds4_session_free(fresh);
+    ds4_session_free(live);
+}
+
+/* Issue #8 regression: the server rewinds a verified block to its start and
+ * re-evaluates the kept token when exact sampling crosses a tool
+ * sampling-mode boundary at nonzero temperature.  The rewind must restore
+ * the pre-verify snapshot and land on the logits a session that never ran
+ * the verify produces for the same committed tokens; before the fix the
+ * rewind reset the recurrent state and the next eval replayed the whole
+ * kept context.  Needs DS4_TEST_GLM_MTP and DS4_TEST_MTP_EXACT. */
+static void test_session_rewind_resample_boundary(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+    if (!ds4_engine_is_qwen4(engine) || !ds4_engine_mtp_exact_sampling(engine)) {
+        puts("session-rewind-resample: Qwen3.8 model with DS4_TEST_MTP_EXACT required, skipped");
+        return;
+    }
+    ds4_session *live = NULL, *fresh = NULL;
+    ds4_tokens prompt = {0};
+    char err[192] = {0};
+    ds4_token_score got[8], want[8];
+    uint64_t rng = 12345;
+
+    ds4_chat_begin(engine, &prompt);
+    ds4_chat_append_message(engine, &prompt, "user", "List the primary colors, then name two fruits.");
+    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+    TEST_ASSERT(ds4_session_create(&live, engine, 1024) == 0);
+    TEST_ASSERT(ds4_session_create(&fresh, engine, 1024) == 0);
+    if (!live || !fresh) goto cleanup;
+    TEST_ASSERT(ds4_session_sync(live, &prompt, err, sizeof(err)) == 0);
+
+    int acc[2] = {0, 0};
+    int block_start = -1;
+    for (int attempt = 0; attempt < 64; attempt++) {
+        const int tok = ds4_session_sample(live, 1.0f, 0, 1.0f, 0.0f, &rng);
+        block_start = ds4_session_pos(live);
+        const int ntok = ds4_session_eval_speculative(
+            live, tok, 8, ds4_token_eos(engine), 1.0f, 0, 1.0f, 0.0f, &rng,
+            acc, 2, err, sizeof(err));
+        TEST_ASSERT(ntok >= 1);
+        if (ntok < 1) { block_start = -1; goto cleanup; }
+        if (ntok == 2) break;   /* an accepted two-row block to rewind */
+        block_start = -1;
+    }
+    TEST_ASSERT(block_start >= 0);
+    if (block_start < 0) goto cleanup;
+
+    /* the server resample flow: rewind to the block start, re-evaluate the
+     * kept token so the next sample uses the boundary's new mode */
+    ds4_session_rewind(live, block_start);
+    TEST_ASSERT(ds4_session_pos(live) == block_start);
+    TEST_ASSERT(ds4_session_eval(live, acc[0], err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_pos(live) == block_start + 1);
+
+    /* reference: the same committed tokens, one row at a time, no verify */
+    TEST_ASSERT(ds4_session_sync(fresh, &prompt, err, sizeof(err)) == 0);
+    const ds4_tokens *hist = ds4_session_tokens(live);
+    TEST_ASSERT(hist->len > prompt.len);
+    for (int i = prompt.len; i < hist->len; i++) {
+        TEST_ASSERT(ds4_session_eval(fresh, hist->v[i], err, sizeof(err)) == 0);
+    }
+    TEST_ASSERT(ds4_session_pos(fresh) == ds4_session_pos(live));
+    TEST_ASSERT(ds4_session_top_logprobs(live, got, 8) == 8);
+    TEST_ASSERT(ds4_session_top_logprobs(fresh, want, 8) == 8);
+    TEST_ASSERT(got[0].id == want[0].id);
+    for (int i = 0; i < 8; i++) TEST_ASSERT(fabsf(got[i].logprob - want[i].logprob) < 2e-3f);
+
+cleanup:
     ds4_tokens_free(&prompt);
     ds4_session_free(fresh);
     ds4_session_free(live);
@@ -6940,6 +7011,7 @@ static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
     {"--session-snapshot", "session-snapshot", "session snapshot and recurrent-state round trip", test_session_snapshot_roundtrip},
     {"--session-rewind", "session-rewind", "Qwen3.8 rewind by snapshot restore and by replay", test_session_rewind_replay},
+    {"--session-rewind-resample", "session-rewind-resample", "exact-sampling tool-boundary resample rewind restores the block-start state", test_session_rewind_resample_boundary},
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model tool call and post-result stop regression", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "recover a complete tool call emitted inside unclosed reasoning", test_think_tool_recovery},

@@ -707,7 +707,26 @@ the Metal oracle section requires for the drift class:
   0.20430 versus 0.20505 simdgroup, logprob MAE 0.04665 versus 0.04679.
 - Speed on M5 Max (chunk-interleaved, 8192-token chunks): +48% at 8K-40K and
   +51% at 96K-128K prefill for `=2`, +21% / +20% for the compensated default.
-  The Q2 pack (IQ2XXS/Q2_K routed experts) does not take the tensor path.
+
+### Qwen3.8-Flash-Next Q2 pack (IQ2XXS/Q2_K tensor tiles)
+
+The Q2 pack's routed tiers run the same cooperative tiles at level 2 by
+default (`DS4_QWEN4_MOE_MM_NAX` unset; `0` restores the simdgroup tiles,
+the Q4 pack keeps its compensated default).  This declares the measured
+full-logit tolerance for that drift class:
+
+- Per-tile versus the simdgroup tiles: accumulation order only (max
+  relative 5e-7 on the tile fixture); the operand rounding is identical.
+- 98-case BF16 fixture (2376 tokens): target NLL 0.30418 vs 0.30346
+  simdgroup, top-1 agreement 90.28% vs 90.32%, logprob MAE 0.17865 vs
+  0.17703, first-token matches 68 vs 65.
+- Pairwise versus the simdgroup build: top-1 agreement 99.29% of tokens
+  (17 flips, all near-ties: median margin 0.10, max 0.84 logits), the
+  displaced token stays in the other build's top-5 in 100% of flips,
+  top-5 set overlap 98.6%.  Last-row drift at chunk windows: mean
+  |delta| 0.12-0.20, max 0.81-1.26, top-1 agrees with margins 0.48-0.83.
+- Speed on M5 Max: +29% at 8K-40K and +36% at 96K-128K prefill (microbench
+  tile time 19.33 -> 7.38 ms); decode byte-identical at every level.
 
 ## 7. SSD Streaming
 

@@ -48618,37 +48618,33 @@ static uint32_t qwen4_moe_mm_nt(uint32_t n_tokens, uint32_t type, const char *en
  * both, reaching the 3/4 accuracy while keeping the fp16 tensor-op rate.
  * Unset now selects 5 on devices with the tensor API; 0 forces the simdgroup
  * tiles.  Returns the token tile width, 0 for the simdgroup path. */
-static long qwen4_moe_mm_nax_level(void) {
+static long qwen4_moe_mm_nax_level(uint32_t type) {
     const char *v = getenv("DS4_QWEN4_MOE_MM_NAX");
-    if (!v || !v[0]) return 5;   /* default: compensated 64-token tiles */
+    /* defaults per tier: the Q4 pack keeps the compensated tiles (best
+     * fixture NLL of all paths at +21% prefill); the Q2 tiers take the
+     * uncompensated 64-token tiles, whose compensated sibling retains only
+     * a third of their +29..36% gain while its accuracy cost is noise
+     * (NLL +0.0007, one near-tie top-1 flip per 1000 tokens). */
+    if (!v || !v[0]) return (type == 12u || type == 39u) ? 5 : (type == 16u || type == 10u) ? 2 : 0;
     return strtol(v, NULL, 10);
-}
-static bool qwen4_moe_mm_nax_env_set(void) {
-    const char *v = getenv("DS4_QWEN4_MOE_MM_NAX");
-    return v != NULL && v[0] != '\0';
 }
 static uint32_t qwen4_moe_mm_nax(uint32_t type) {
     if (!ds4_gpu_mpp_available()) return 0;
-    const bool q4 = type == 12u || type == 39u;
-    /* The Q2 tiers (iq2_xxs gate/up, q2_K down) take the tensor tiles only
-     * when the level is set explicitly; the default stays the simdgroup
-     * tiles until full-model measurements justify promoting them. */
-    if (!q4 && !(type == 16u || type == 10u)) return 0;
-    if (!q4 && !qwen4_moe_mm_nax_env_set()) return 0;
-    const long n = qwen4_moe_mm_nax_level();
+    if (!(type == 12u || type == 39u || type == 16u || type == 10u)) return 0;
+    const long n = qwen4_moe_mm_nax_level(type);
     if (n <= 0) return 0;
     return (n == 1 || n == 4 || n == 6) ? 32u : 64u;
 }
 /* float-activation tensor tiles (levels 3 and 4) */
-static bool qwen4_moe_mm_nax_fx(void) {
-    const long n = qwen4_moe_mm_nax_level();
+static bool qwen4_moe_mm_nax_fx(uint32_t type) {
+    const long n = qwen4_moe_mm_nax_level(type);
     return n == 3 || n == 4;
 }
 /* compensated tensor tiles (levels 5 and 6): the fast fp16 tensor kernels run
  * twice per K step, on the half-rounded operand and on its half residual, so
  * the activation operand enters at ~2^-22 relative instead of 2^-11 */
-static bool qwen4_moe_mm_nax_comp(void) {
-    const long n = qwen4_moe_mm_nax_level();
+static bool qwen4_moe_mm_nax_comp(uint32_t type) {
+    const long n = qwen4_moe_mm_nax_level(type);
     return n == 5 || n == 6;
 }
 
@@ -48727,8 +48723,8 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
         return 0;
     }
     const uint32_t nax = qwen4_moe_mm_nax(weight_type);
-    const bool nax_fx = qwen4_moe_mm_nax_fx();
-    const bool nax_comp = qwen4_moe_mm_nax_comp();
+    const bool nax_fx = qwen4_moe_mm_nax_fx(weight_type);
+    const bool nax_comp = qwen4_moe_mm_nax_comp(weight_type);
     if (nax) {
         args.tail_base = 0;
         const uint64_t mid_count = (uint64_t)n_tokens * n_out * ff_dim;
@@ -48809,8 +48805,8 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
         return 0;
     }
     const uint32_t nax = qwen4_moe_mm_nax(weight_type);
-    const bool nax_fx = qwen4_moe_mm_nax_fx();
-    bool nax_comp = qwen4_moe_mm_nax_comp();
+    const bool nax_fx = qwen4_moe_mm_nax_fx(weight_type);
+    bool nax_comp = qwen4_moe_mm_nax_comp(weight_type);
     if (nax) {
         args.tail_base = 0;
         const uint64_t mid_count = (uint64_t)n_tokens * n_out * ff_dim;

@@ -172,6 +172,13 @@ the uncompensated 64-token tiles for maximum speed (+48% at 8K-40K and +51% at 9
 over the simdgroup tiles on the corrected binary, +21% / +20% for the compensated level),
 and decode is unaffected at every level (the decode MoE path never dispatches these tiles).
 
+The Q2 pack (IQ2XXS gate/up, Q2_K down) runs the same tiles at level 2 by default:
+the compensated level retains only a third of the +29-36% prefill gain on that pack
+while its accuracy cost is noise (NLL +0.0007 and one near-tie top-1 flip per 1000
+tokens versus the simdgroup tiles, which the level-2 tiles match in operand rounding
+and differ from only by accumulation order). `DS4_QWEN4_MOE_MM_NAX=0` still restores
+the simdgroup tiles for either pack.
+
 The older recipes below keep PLE inside the main GGUF, so their file sizes
 are not directly comparable with the external-PLE builds.
 

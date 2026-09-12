@@ -67,6 +67,13 @@ Cycle anatomy at depth 3 (Fibonacci, ~35 ms/cycle): verify T=3 ~29.3 ms GPU
 (of which routed experts ~9 ms, dense Q8 ~7.7 ms), predictor catch-up (3
 rows) ~2.8 ms, chain step ~2.2 ms.
 
+The Q2 pack (IQ2XXS/Q2_K routed tiers) runs the same cycle unchanged: the
+routed rows kernels there do not switch geometry with T, so no extra
+verify-geometry hook is needed.  Measured on
+`Qwen3.8-Flash-Next-IQ2XXSImatrix-Q2KDownPad768-MTP.gguf` (Fibonacci, same
+protocol): depth 2 79.9 t/s, depth 3 **93.2 (+16.6%)**, auto 91.2; depth-2
+and depth-3 outputs byte-identical over 400 tokens.
+
 ## Numerical behavior
 
 The committed stream is still gated by exact target argmax checks; every

@@ -690,8 +690,9 @@ the vision graph, multimodal prompt spans, or image-aware KV identity.
 ### Qwen3.8-Flash-Next (Metal tensor routed tiles)
 
 The routed Q4_K gate/up and MXFP4 down tiles run on the Metal 4 tensor ops by
-default on devices with the tensor API (compensated level; `DS4_QWEN4_MOE_MM_NAX=0`
-restores the simdgroup tiles).  This declares the measured full-logit tolerance
+default on devices with the tensor API (level 2, the 64-token half tiles;
+`DS4_QWEN4_MOE_MM_NAX=0` restores the simdgroup tiles, 5 selects the
+compensated tiles).  This declares the measured full-logit tolerance
 the Metal oracle section requires for the drift class:
 
 - Per-tile versus a double-precision reference (test_qwen4_kernels,
@@ -699,12 +700,15 @@ the Metal oracle section requires for the drift class:
   2.55e-04 / 4.03e-05 — strictly closer to exact than the simdgroup tiles
   (6.78e-06 / 3.55e-06); on half-exact weights the residual is the tensor
   unit's accumulation alone (1.57e-06, ~1150x below the operand-rounding error).
-- Last-row logits versus the simdgroup build: mean |delta| 0.11-0.16 at
-  2K-128K, fixed-size (does not grow with context); top-1 flips only on
-  near-ties (observed margins 0.23-0.99).  Decode logits are byte-identical
-  (the decode MoE path does not dispatch these tiles); acceptance rates and
-  first-token matches on the 99-case BF16 fixture are unchanged, target NLL
-  0.20430 versus 0.20505 simdgroup, logprob MAE 0.04665 versus 0.04679.
+- 99-case BF16 fixture, level 2 versus the simdgroup build: target NLL
+  0.20503 versus 0.20505, logprob MAE 0.04659 versus 0.04679, top-1
+  agreement 96.25% versus 96.34%, first-token matches 86/99 on both; the
+  compensated level 5 measures the best absolute NLL (0.20430) and stays
+  selectable via the environment.
+- Last-row logits at chunk windows, level 2 versus the simdgroup build:
+  mean |delta| 0.16, max 1.37 at 40K, fixed-size (does not grow with
+  context); top-1 flips only on near-ties.  Decode logits are byte-identical
+  (the decode MoE path does not dispatch these tiles).
 - Speed on M5 Max (chunk-interleaved, 8192-token chunks): +48% at 8K-40K and
   +51% at 96K-128K prefill for `=2`, +21% / +20% for the compensated default.
 
@@ -712,7 +716,7 @@ the Metal oracle section requires for the drift class:
 
 The Q2 pack's routed tiers run the same cooperative tiles at level 2 by
 default (`DS4_QWEN4_MOE_MM_NAX` unset; `0` restores the simdgroup tiles,
-the Q4 pack keeps its compensated default).  This declares the measured
+as on the Q4 pack).  This declares the measured
 full-logit tolerance for that drift class:
 
 - Per-tile versus the simdgroup tiles: accumulation order only (max

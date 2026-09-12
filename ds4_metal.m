@@ -48609,23 +48609,27 @@ static uint32_t qwen4_moe_mm_nt(uint32_t n_tokens, uint32_t type, const char *en
 
 /* Routed tiles on the Metal 4 tensor ops (drift class: the cooperative
  * matmul's accumulation order differs from the simdgroup tiles; needs the
- * tensor API).  DS4_QWEN4_MOE_MM_NAX: 0/unset simdgroup tiles; 1 tensor-op
+ * tensor API).  DS4_QWEN4_MOE_MM_NAX: 0 simdgroup tiles; 1 tensor-op
  * tiles of 32 tokens; 2 tensor-op tiles of 64 tokens; 3/4 the same widths
  * with the activation operand kept at full float precision (x gathered from
  * the float tensor, no half rounding of x or of the mid hand-off, no
  * conversion pass); 5/6 compensated tiles (64/32 tokens), which stage the
  * half rounding residual of the operand beside it and run the tensor op on
  * both, reaching the 3/4 accuracy while keeping the fp16 tensor-op rate.
- * Unset now selects 5 on devices with the tensor API; 0 forces the simdgroup
+ * Unset selects 2 (the 64-token half tiles) for every tensor tier on
+ * devices with the tensor API: its operand rounding matches the simdgroup
+ * tiles and its fixture NLL sits within noise of them, so the compensated
+ * level stays an env-selectable accuracy option.  0 forces the simdgroup
  * tiles.  Returns the token tile width, 0 for the simdgroup path. */
 static long qwen4_moe_mm_nax_level(uint32_t type) {
     const char *v = getenv("DS4_QWEN4_MOE_MM_NAX");
-    /* defaults per tier: the Q4 pack keeps the compensated tiles (best
-     * fixture NLL of all paths at +21% prefill); the Q2 tiers take the
-     * uncompensated 64-token tiles, whose compensated sibling retains only
-     * a third of their +29..36% gain while its accuracy cost is noise
-     * (NLL +0.0007, one near-tie top-1 flip per 1000 tokens). */
-    if (!v || !v[0]) return (type == 12u || type == 39u) ? 5 : (type == 16u || type == 10u) ? 2 : 0;
+    /* default 2 for every tensor tier: level 2 matches the simdgroup tiles'
+     * operand rounding and differs only by accumulation order, and its
+     * fixture NLL is within noise of them on both packs (Q4 0.20503 vs
+     * 0.20505, Q2 0.30418 vs 0.30346), while it carries the full prefill
+     * gain (+48/+51% Q4, +29/+36% Q2).  The compensated level 5 keeps the
+     * best absolute NLL and stays one env variable away. */
+    if (!v || !v[0]) return (type == 12u || type == 39u || type == 16u || type == 10u) ? 2 : 0;
     return strtol(v, NULL, 10);
 }
 static uint32_t qwen4_moe_mm_nax(uint32_t type) {

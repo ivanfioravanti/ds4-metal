@@ -166,18 +166,18 @@ up the whole prefill win (the unit's fp32 tiles run ~2.4x slower), while the com
 keeps most of it: +22.0% at 8K-40K versus +25 to +33% for `=2`, with the best fixture NLL of
 all paths (0.20430 versus 0.20505 simdgroup and 0.20503 `=2`) on the 99-case BF16 fixture.
 
-The compensated level is the promoted default on devices with the Metal tensor API
-(`DS4_QWEN4_MOE_MM_NAX` unset selects it); `=0` restores the simdgroup tiles, `=2` selects
-the uncompensated 64-token tiles for maximum speed (+48% at 8K-40K and +51% at 96K-128K
-over the simdgroup tiles on the corrected binary, +21% / +20% for the compensated level),
-and decode is unaffected at every level (the decode MoE path never dispatches these tiles).
+Level 2 (the uncompensated 64-token tiles) is the promoted default on devices with the
+Metal tensor API (`DS4_QWEN4_MOE_MM_NAX` unset selects it): +48% at 8K-40K and +51% at
+96K-128K prefill over the simdgroup tiles, with the same operand rounding and a fixture NLL
+within noise of them. The compensated level `=5` keeps the best absolute NLL and stays one
+environment variable away; `=0` restores the simdgroup tiles, and decode is unaffected at
+every level (the decode MoE path never dispatches these tiles).
 
-The Q2 pack (IQ2XXS gate/up, Q2_K down) runs the same tiles at level 2 by default:
-the compensated level retains only a third of the +29-36% prefill gain on that pack
-while its accuracy cost is noise (NLL +0.0007 and one near-tie top-1 flip per 1000
-tokens versus the simdgroup tiles, which the level-2 tiles match in operand rounding
-and differ from only by accumulation order). `DS4_QWEN4_MOE_MM_NAX=0` still restores
-the simdgroup tiles for either pack.
+The Q2 pack (IQ2XXS gate/up, Q2_K down) runs the same level-2 default: +29% at
+8K-40K and +36% at 96K-128K prefill (microbench tile time 19.33 -> 7.38 ms), again
+with simdgroup-identical operand rounding and accumulation-order-only drift (NLL
++0.0007, one near-tie top-1 flip per 1000 tokens, 100% top-5 containment).
+`DS4_QWEN4_MOE_MM_NAX=0` still restores the simdgroup tiles for either pack.
 
 The older recipes below keep PLE inside the main GGUF, so their file sizes
 are not directly comparable with the external-PLE builds.

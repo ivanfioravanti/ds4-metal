@@ -723,14 +723,14 @@ static void test_gdn(arena_t *a, uint32_t Hk, uint32_t Hv, uint32_t D, uint32_t 
                 ds4_gpu_tensor *vm = ds4_gpu_tensor_view(gmixed, (uint64_t)t0 * E * 4, (uint64_t)step * E * 4);
                 require_ok(ds4_gpu_qwen4_gdn_front_tensor(vqkv, ghist, vm, va, vb, a->base, a->size, conv_off, alpha_off, beta_off,
                                                           a_off, dt_off, 8u, step, Hk, Hv, D, K, E,
-                                                          t0 == 0 ? gsnap_hist : NULL, 0u), "gdn front");
+                                                          t0 == 0 ? gsnap_hist : NULL, 0u, NULL, 0u), "gdn front");
                 ds4_gpu_tensor_free(vm);
             } else {
                 require_ok(ds4_gpu_qwen4_conv_stream_tensor(vqkv, ghist, a->base, a->size, conv_off, step, C, K, true), "gdn conv");
                 require_ok(ds4_gpu_qwen4_gdn_prep_tensor(vqkv, va, vb, a->base, a->size, a_off, dt_off, step, Hk, Hv, D), "gdn prep");
             }
             require_ok(ds4_gpu_qwen4_gdn_scan_tensor(vout, gstate, vqkv, va, vb, step, Hk, Hv, D,
-                                                     t0 == 0 ? gsnap_state : NULL, 0u), "gdn scan");
+                                                     t0 == 0 ? gsnap_state : NULL, 0u, NULL, 0u), "gdn scan");
             require_ok(ds4_gpu_qwen4_gdn_out_tensor(vout, vz, a->base, a->size, norm_off, step, Hv, D, 1e-6f), "gdn out");
             ds4_gpu_tensor_free(vout); ds4_gpu_tensor_free(vz); ds4_gpu_tensor_free(vb); ds4_gpu_tensor_free(va); ds4_gpu_tensor_free(vqkv);
         }
@@ -968,7 +968,7 @@ static void test_ple(arena_t *a, uint32_t E, uint32_t T) {
             ds4_gpu_tensor *vn = ds4_gpu_tensor_view(gnormed, (uint64_t)t0 * dim * 4, (uint64_t)step * dim * 4);
             require_ok(ds4_gpu_qwen4_ple_gate_tensor(vg, vn, vR, vkey, vval, a->base, a->size, gk_off, gq_off, gc_off,
                                                      step, E, hc, eps), "ple gate");
-            require_ok(ds4_gpu_qwen4_ple_conv_tensor(vR, vg, vn, ghist, a->base, a->size, cw_off, 0u, step, dim, K, dil, NULL, 0u), "ple conv");
+            require_ok(ds4_gpu_qwen4_ple_conv_tensor(vR, vg, vn, ghist, a->base, a->size, cw_off, 0u, step, dim, K, dil, NULL, 0u, NULL, 0u), "ple conv");
             ds4_gpu_tensor_free(vn); ds4_gpu_tensor_free(vg); ds4_gpu_tensor_free(vval);
             ds4_gpu_tensor_free(vkey); ds4_gpu_tensor_free(vR);
         }
@@ -2518,7 +2518,7 @@ static void test_gdn_prefill_dispatch(void) {
                 ds4_gpu_tensor *o = ds4_gpu_tensor_view(go, pos * V * sizeof(float), n * V * sizeof(float));
                 require_ok(q && a && b && o, "GDN prefill views");
                 require_ok(ds4_gpu_qwen4_gdn_scan_tensor(o, gs, q, a, b, n, Hk, Hv, D,
-                                                       pos == 0u ? gsnap : NULL, 0u), "GDN prefill scan");
+                                                       pos == 0u ? gsnap : NULL, 0u, NULL, 0u), "GDN prefill scan");
                 ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(a);
                 ds4_gpu_tensor_free(b); ds4_gpu_tensor_free(o);
             }
@@ -2669,7 +2669,7 @@ static int bench_attn(void *ud) {
 static int bench_gdn_front(void *ud) {
     bench_ctx *c = ud;
     return ds4_gpu_qwen4_gdn_front_tensor(c->t[11], c->t[12], c->t[0], c->t[13], c->t[14], c->a->base, c->a->size,
-                                          c->off[6], c->off[0], c->off[0], c->off[7], c->off[7], 8u, 1, 16, 48, 128, 4, 2560, NULL, 0u);
+                                          c->off[6], c->off[0], c->off[0], c->off[7], c->off[7], 8u, 1, 16, 48, 128, 4, 2560, NULL, 0u, NULL, 0u);
 }
 static int bench_gdn_unfused(void *ud) {
     bench_ctx *c = ud;
@@ -2730,7 +2730,7 @@ static int bench_p_attn_sparse(void *ud) {
     return ds4_gpu_qwen4_attn_decode_tensor(c->t[37], c->t[33], c->t[34], c->t[31], c->t[32], c->n[2] ? c->t[36] : c->t[35], c->t[38], NULL,
                                             1024, 24, 2, 256, 262144 - 1024, true, 2052, 0.0625f);
 }
-static int bench_p_gdn_r4(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_gdn_scan_tensor(c->t[15], c->t[1], c->t[11], c->t[13], c->t[14], 1024, 16, 48, 128, NULL, 0u); }
+static int bench_p_gdn_r4(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_gdn_scan_tensor(c->t[15], c->t[1], c->t[11], c->t[13], c->t[14], 1024, 16, 48, 128, NULL, 0u, NULL, 0u); }
 static int bench_p_moe_mm(void *ud) {
     bench_ctx *c = ud;
     return ds4_gpu_qwen4_moe_build_lists_tensor(c->t[20], c->t[21], c->t[16], 256, 10, 16, 256) &&
@@ -2796,8 +2796,8 @@ static int bench_p_moe_mm_iq2(void *ud) { static ds4_gpu_tensor *st[6]; static u
 
 static int bench_p_moe_mm_q4k(void *ud) { static ds4_gpu_tensor *st[6]; static uint64_t offs[3]; return bench_p_moe_mm_q4k_case(ud, 32, 12345u, st, offs); }
 static int bench_p_moe_mm_q4k_lo(void *ud) { static ds4_gpu_tensor *st[6]; static uint64_t offs[3]; return bench_p_moe_mm_q4k_case(ud, 256, 777u, st, offs); }
-static int bench_gdn_scan(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_gdn_scan_tensor(c->t[15], c->t[1], c->t[11], c->t[13], c->t[14], 1, 16, 48, 128, NULL, 0u); }
-static int bench_gdn_scan2(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_gdn_scan_tensor(c->t[15], c->t[1], c->t[11], c->t[13], c->t[14], 2, 16, 48, 128, NULL, 0u); }
+static int bench_gdn_scan(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_gdn_scan_tensor(c->t[15], c->t[1], c->t[11], c->t[13], c->t[14], 1, 16, 48, 128, NULL, 0u, NULL, 0u); }
+static int bench_gdn_scan2(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_gdn_scan_tensor(c->t[15], c->t[1], c->t[11], c->t[13], c->t[14], 2, 16, 48, 128, NULL, 0u, NULL, 0u); }
 
 /* QWEN4_BENCH=1: per-dispatch cost of the decode kernels at full-model shapes */
 static void bench_dispatch(arena_t *a) {

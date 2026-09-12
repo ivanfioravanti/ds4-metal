@@ -3352,12 +3352,15 @@ int ds4_gpu_qwen4_gdn_prep_tensor(
         ds4_gpu_tensor *qkv, ds4_gpu_tensor *a, ds4_gpu_tensor *b,
         const void *model_map, uint64_t model_size, uint64_t ssm_a_offset, uint64_t dt_bias_offset,
         uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim);
-/* snap_state (optional) receives the state right after token snap_tok */
+/* snap_state/snap2_state (optional) receive the state right after tokens
+ * snap_tok/snap2_tok; two points serve the 3-row MTP verifier */
+void ds4_gpu_qwen4_set_verify_rows_exact(bool on);
 int ds4_gpu_qwen4_gdn_scan_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *state, const ds4_gpu_tensor *qkv,
         const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,
         uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
-        ds4_gpu_tensor *snap_state, uint32_t snap_tok);
+        ds4_gpu_tensor *snap_state, uint32_t snap_tok,
+        ds4_gpu_tensor *snap2_state, uint32_t snap2_tok);
 int ds4_gpu_qwen4_gdn_out_tensor(
         ds4_gpu_tensor *o, const ds4_gpu_tensor *z,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,
@@ -3372,7 +3375,8 @@ int ds4_gpu_qwen4_ple_conv_tensor(
         ds4_gpu_tensor *R, const ds4_gpu_tensor *gated, const ds4_gpu_tensor *normed,
         ds4_gpu_tensor *history, const void *model_map, uint64_t model_size, uint64_t weight_offset,
         uint32_t weight_type, uint32_t n_tokens, uint32_t n_channels, uint32_t conv_kernel, uint32_t dilation,
-        ds4_gpu_tensor *snap_history, uint32_t snap_tok);
+        ds4_gpu_tensor *snap_history, uint32_t snap_tok,
+        ds4_gpu_tensor *snap2_history, uint32_t snap2_tok);
 /* up to four projections of x in one dispatch; weight types 0 f32, 1 f16,
  * 2 q4_0, 8 q8_0, 30 bf16, 39 mxfp4 */
 int ds4_gpu_qwen4_multi_gemv_tensor(
@@ -3467,7 +3471,8 @@ int ds4_gpu_qwen4_gdn_front_tensor(
         const void *model_map, uint64_t model_size, uint64_t conv_offset,
         uint64_t alpha_offset, uint64_t beta_offset, uint64_t ssm_a_offset, uint64_t dt_bias_offset,
         uint32_t weight_type, uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
-        uint32_t conv_kernel, uint32_t in_dim, ds4_gpu_tensor *snap_state, uint32_t snap_tok);
+        uint32_t conv_kernel, uint32_t in_dim, ds4_gpu_tensor *snap_state, uint32_t snap_tok,
+        ds4_gpu_tensor *snap2_state, uint32_t snap2_tok);
 #define DS4_QWEN4_VISION_LAYERS 27
 typedef struct {
     uint64_t ln1_w, ln1_b, qkv_w, qkv_b, out_w, out_b, ln2_w, ln2_b, up_w, up_b, down_w, down_b;

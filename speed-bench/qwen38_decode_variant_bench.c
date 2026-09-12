@@ -46,6 +46,7 @@ typedef struct {
     int prefix_tokens;
     int ctx;
     bool mtp;                /* greedy speculative cycles instead of single-token steps */
+    bool stream_compare;     /* depth A/B: independent cycling to a shared final position */
     int warmup;
     int measured;
     uint32_t prefill_chunk;
@@ -67,6 +68,9 @@ static void usage(FILE *fp, const char *argv0) {
             "  --ctx N                   session allocation (default: prefix + steps + 1)\n"
             "  --warmup N                untimed steps per variant (default: 16)\n"
             "  --mtp                 greedy speculative cycles (MTP) instead of single-token steps\n"
+            "  --stream-compare      depth A/B: each variant cycles independently to the same\n"
+            "                            final position; logits compare at every aligned\n"
+            "                            position and the committed transcripts must match\n"
             "  --tokens N                measured steps per variant (default: 512)\n",
             argv0);
 }
@@ -149,6 +153,9 @@ static bench_config parse_options(int argc, char **argv) {
             cfg.warmup = parse_int_arg(need_arg(&i, argc, argv, arg), arg, 0);
         } else if (!strcmp(arg, "--tokens") || !strcmp(arg, "--measured")) {
             cfg.measured = parse_int_arg(need_arg(&i, argc, argv, arg), arg, 1);
+        } else if (!strcmp(arg, "--stream-compare")) {
+            cfg.mtp = true;
+            cfg.stream_compare = true;
         } else if (!strcmp(arg, "--mtp")) {
             cfg.mtp = true;
         } else {
@@ -251,9 +258,9 @@ static int compare_frontier(ds4_session *s0, ds4_session *s1, float *l0, float *
             }
         }
         fprintf(stderr,
-                "qwen38-decode-variant-bench: raw logit mismatch at step %zu: differing=%zu/%d "
+                "qwen38-decode-variant-bench: raw logit mismatch at step %zu pos=%d: differing=%zu/%d "
                 "top0=%d top1=%d first id=%zu control=%a (0x%08x) candidate=%a (0x%08x)\n",
-                step, differing, vocab, ds4_session_argmax(s0), ds4_session_argmax(s1),
+                step, ds4_session_pos(s0), differing, vocab, ds4_session_argmax(s0), ds4_session_argmax(s1),
                 first, l0[first], (unsigned)float_bits(l0[first]),
                 l1[first], (unsigned)float_bits(l1[first]));
         return 1;
@@ -335,7 +342,7 @@ int main(int argc, char **argv) {
     const int eos = ds4_token_eos(engine);
     const int total_steps = cfg.warmup + cfg.measured;
     size_t cycles[VARIANT_COUNT] = {0};
-    for (int step = 0; step < total_steps; step++) {
+    for (int step = 0; !cfg.stream_compare && step < total_steps; step++) {
         int token = -1;
         if (compare_frontier(sessions[0], sessions[1], logits[0], logits[1], vocab, eos,
                              (size_t)step, &token) != 0) goto done;
@@ -382,9 +389,129 @@ int main(int argc, char **argv) {
             goto done;
         }
     }
-    if (compare_frontier(sessions[0], sessions[1], logits[0], logits[1], vocab, eos,
-                         (size_t)total_steps, NULL) != 0) goto done;
-    exact_rows++;
+    if (cfg.stream_compare) {
+        /* Independent greedy continuation per variant to a common position:
+         * every time the two sessions land on the same position their logits
+         * must be bit-identical, and the committed transcripts must match. */
+        int *stream[2];
+        size_t stream_n[2] = {0};
+        const size_t stream_cap = (size_t)total_steps * 4 + 64;
+        for (int i = 0; i < 2; i++) {
+            stream[i] = malloc(stream_cap * sizeof(int));
+            if (!stream[i]) goto done;
+        }
+        const int target = cfg.prefix_tokens + cfg.measured + 8;
+        int first_div = -1;
+        unsigned long long *hashes[2] = {0};
+        for (int i = 0; i < 2; i++) {
+            hashes[i] = calloc((size_t)target + 8, sizeof(unsigned long long));
+            if (!hashes[i]) goto done;
+        }
+#define STREAM_HASH(which_) do { \
+        ds4_session *s_ = sessions[which_]; \
+        float *l_ = logits[which_]; \
+        if (ds4_session_copy_logits(s_, l_, vocab) == vocab) { \
+            unsigned long long h_ = 1469598103934665603ULL; \
+            const unsigned char *b_ = (const unsigned char *)l_; \
+            const size_t n_ = (size_t)vocab * sizeof(float); \
+            for (size_t i_ = 0; i_ < n_; i_++) { h_ ^= b_[i_]; h_ *= 1099511628211ULL; } \
+            const int p_ = ds4_session_pos(s_); \
+            if (p_ >= 0 && p_ < target + 8 && !hashes[which_][p_]) hashes[which_][p_] = h_; \
+        } \
+    } while (0)
+        for (int guard = 0; guard < cfg.measured * 4 + 64; guard++) {
+            const int p0 = ds4_session_pos(sessions[0]);
+            const int p1 = ds4_session_pos(sessions[1]);
+            if (p0 >= target && p1 >= target) break;
+            if (p0 == p1) {
+                int token = -1;
+                STREAM_HASH(0);
+                STREAM_HASH(1);
+                if (hashes[0][p0] != hashes[1][p0]) {
+                    if (first_div < 0) first_div = p0;
+                    token = ds4_session_argmax_excluding(sessions[0], eos);
+                } else {
+                    if (compare_frontier(sessions[0], sessions[1], logits[0], logits[1], vocab, eos,
+                                         (size_t)guard, &token) != 0) { for (int i=0;i<2;i++) free(stream[i]); goto done; }
+                    exact_rows++;
+                }
+                if (p0 >= target) break;
+                for (int order = 0; order < VARIANT_COUNT; order++) {
+                    ds4_session *s = sessions[order];
+                    int acc[8];
+                    if (select_variant(&cfg, order) != 0) { for (int i=0;i<2;i++) free(stream[i]); goto done; }
+                    const double t0 = now_sec();
+                    const int committed = ds4_session_eval_speculative_argmax(s, token, 4, eos,
+                                                                             acc, 8, err, sizeof(err));
+                    const double t1 = now_sec();
+                    if (committed < 1) {
+                        fprintf(stderr, "qwen38-decode-variant-bench: stream cycle failed: %s\n",
+                                err[0] ? err : "unknown error");
+                        for (int i=0;i<2;i++) free(stream[i]);
+                        goto done;
+                    }
+                    if (stream_n[order] + (size_t)committed > stream_cap) {
+                        fprintf(stderr, "qwen38-decode-variant-bench: stream buffer exceeded\n");
+                        for (int i=0;i<2;i++) free(stream[i]);
+                        goto done;
+                    }
+                    memcpy(stream[order] + stream_n[order], acc, (size_t)committed * sizeof(int));
+                    stream_n[order] += (size_t)committed;
+                    if (order == 1 && guard >= cfg.warmup) {
+                        elapsed[1] += t1 - t0;
+                        measured_tokens[1] += (size_t)committed;
+                        cycles[1]++;
+                    }
+                    STREAM_HASH(order);
+                }
+                continue;
+            }
+            /* only the lagging session advances (the other already moved) */
+            const int lag = p0 < p1 ? 0 : 1;
+            ds4_session *s = sessions[lag];
+            int acc[8];
+            if (select_variant(&cfg, lag) != 0) { for (int i=0;i<2;i++) free(stream[i]); goto done; }
+            const double t0 = now_sec();
+            const int committed = ds4_session_eval_speculative_argmax(
+                    s, ds4_session_argmax_excluding(s, eos), 4, eos, acc, 8, err, sizeof(err));
+            const double t1 = now_sec();
+            if (committed < 1) {
+                fprintf(stderr, "qwen38-decode-variant-bench: stream catch-up failed: %s\n",
+                        err[0] ? err : "unknown error");
+                for (int i=0;i<2;i++) free(stream[i]);
+                goto done;
+            }
+            if (stream_n[lag] + (size_t)committed > stream_cap) {
+                fprintf(stderr, "qwen38-decode-variant-bench: stream buffer exceeded\n");
+                for (int i=0;i<2;i++) free(stream[i]);
+                goto done;
+            }
+            memcpy(stream[lag] + stream_n[lag], acc, (size_t)committed * sizeof(int));
+            stream_n[lag] += (size_t)committed;
+            STREAM_HASH(lag);
+            (void)t0; (void)t1;
+        }
+        if (first_div < 0) {
+            for (int p = cfg.prefix_tokens; p < target + 8; p++) {
+                if (hashes[0][p] && hashes[1][p] && hashes[0][p] != hashes[1][p]) { first_div = p; break; }
+            }
+        }
+        if (first_div >= 0) {
+            fprintf(stderr, "qwen38-decode-variant-bench: logits first diverge at position %d\n", first_div);
+        }
+        if (stream_n[0] != stream_n[1] || memcmp(stream[0], stream[1], stream_n[0] * sizeof(int)) != 0) {
+            fprintf(stderr, "qwen38-decode-variant-bench: committed streams differ (%zu vs %zu tokens)\n",
+                    stream_n[0], stream_n[1]);
+            for (int i = 0; i < 2; i++) { free(stream[i]); free(hashes[i]); }
+            goto done;
+        }
+        for (int i = 0; i < 2; i++) free(hashes[i]);
+        printf("stream_compare_tokens=%zu exact_rows=%zu\n", stream_n[0], exact_rows);
+        for (int i = 0; i < 2; i++) free(stream[i]);
+        elapsed[0] = 0.0;  /* control timing is not step-aligned in this mode */
+    } else if (compare_frontier(sessions[0], sessions[1], logits[0], logits[1], vocab, eos,
+                                (size_t)total_steps, NULL) != 0) goto done;
+    if (!cfg.stream_compare) exact_rows++;
 
     for (int v = 0; v < VARIANT_COUNT; v++) {
         printf("variant=%s tokens=%zu seconds=%.6f tokens_per_second=%.4f",

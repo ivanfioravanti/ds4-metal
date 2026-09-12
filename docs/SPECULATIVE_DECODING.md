@@ -71,6 +71,15 @@ Ordinary decode uses the same files with `--mtp` omitted. For non-zero
 temperature, add `--mtp-exact-sampling` to preserve the target sampling
 distribution. See [Qwen setup](QWEN38_FLASH_NEXT.md) for the Metal runtime.
 
+The cycle drafts one token ahead by default and engages a **second, chained
+draft** (one extra nextn-layer step conditioned on the predictor's own
+stream, verified in a 3-row pass) while recent first-draft acceptance is
+perfect, disengaging after repeated second-draft rejections. Deterministic
+continuations (lists, code, closed-form text) accept the chained draft at
+0.9+ and decode 10-20 percent faster; prose gains a few percent or stays on
+the depth-2 cycle. `DS4_QWEN4_MTP_DEPTH=2` or `=3` fixes the depth;
+`0` (default) is the adaptive policy.
+
 ## Sampling and reproducibility
 
 At temperature zero, accepted drafts must match the target's greedy

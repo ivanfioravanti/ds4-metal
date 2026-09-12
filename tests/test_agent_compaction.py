@@ -22,6 +22,7 @@ import pyte
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--binary", type=Path, default=Path("./ds4-agent"))
 parser.add_argument("--model", type=Path, required=True)
+parser.add_argument("--ple", type=Path, help="Qwen PLE sidecar")
 parser.add_argument("--vision", type=Path)
 parser.add_argument("--ssd-streaming", action="store_true")
 parser.add_argument("--ctx", type=int, default=4096)
@@ -49,6 +50,8 @@ cmd = [str(args.binary.resolve()), "-m", str(args.model.resolve()),
        "--seed", "12345", "--chdir", str(project), "--trace", str(trace)]
 if args.vision:
     cmd += ["--vision", str(args.vision.resolve())]
+if args.ple:
+    cmd += ["--ple", str(args.ple.resolve())]
 if args.ssd_streaming:
     cmd += ["--ssd-streaming"]
 if args.mtp:

@@ -23,6 +23,7 @@ from pathlib import Path
 MODEL_PROFILES = {
     "deepseek-v4-flash": (43, 4096),
     "glm-5.3-flash": (45, 4096),
+    "qwen3.8-flash-next": (48, 2560),
 }
 
 
@@ -62,6 +63,7 @@ def run_capture(
     n_layer: int,
     n_embd: int,
     work: Path,
+    ple: Path | None = None,
 ) -> list[list[float]]:
     """Run ds4 once and return the last prompt-row dump for every layer."""
     prompt_path = work / "prompt.txt"
@@ -72,6 +74,7 @@ def run_capture(
     env["DS4_METAL_GRAPH_DUMP_PREFIX"] = str(dump_prefix)
     env["DS4_METAL_GRAPH_DUMP_NAME"] = component
     env["DS4_METAL_GRAPH_DUMP_POS"] = "0"
+    env["DS4_QWEN4_PREFILL_CHUNK"] = str(max(ctx, 1024))
 
     cmd = [
         str(ds4),
@@ -79,10 +82,13 @@ def run_capture(
         "--ctx", str(ctx),
         "--prompt-file", str(prompt_path),
         "-n", "1",
+        "--prefill-chunk", str(max(ctx, 1024)),
     ]
+    if ple is not None:
+        cmd += ["--ple", str(ple)]
     if system:
         cmd += ["--system", system]
-    cmd.append("--think-high" if think else "--nothink")
+    cmd.append("--think" if think else "--nothink")
     result = subprocess.run(cmd, cwd=ds4.parent, env=env, check=False,
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     if result.returncode != 0:
@@ -128,7 +134,9 @@ def main() -> None:
     ap.add_argument("--system", default="You are a helpful assistant.")
     ap.add_argument("--component", default="ffn_out",
                     choices=("ffn_out", "attn_out"),
-                    help="runtime-editable 4096-wide activation stream")
+                    help="runtime-editable activation stream at the profile's embedding width")
+    ap.add_argument("--ple", default="",
+                    help="Qwen3.8 PLE sidecar GGUF (required for qwen3.8-flash-next)")
     ap.add_argument("--think", action="store_true",
                     help="capture after <think>; default captures direct answers")
     ap.add_argument("--pair-normalize", action="store_true",
@@ -141,6 +149,9 @@ def main() -> None:
     model_arg = Path(args.model)
     model = model_arg.resolve()
     n_layer, n_embd = MODEL_PROFILES[args.profile]
+    ple = Path(args.ple).resolve() if args.ple else None
+    if args.profile.startswith("qwen") and ple is None:
+        raise SystemExit("qwen profiles need --ple pointing at the PLE sidecar")
     good_prompts = read_prompt_file(Path(args.good_file))
     bad_prompts = read_prompt_file(Path(args.bad_file))
     n = min(len(good_prompts), len(bad_prompts))
@@ -160,9 +171,11 @@ def main() -> None:
             gw.mkdir()
             bw.mkdir()
             good_rows = run_capture(ds4, model, good, args.system, args.think,
-                                    args.ctx, args.component, n_layer, n_embd, gw)
+                                    args.ctx, args.component, n_layer, n_embd, gw,
+                                    ple)
             bad_rows = run_capture(ds4, model, bad, args.system, args.think,
-                                   args.ctx, args.component, n_layer, n_embd, bw)
+                                   args.ctx, args.component, n_layer, n_embd, bw,
+                                    ple)
             add_rows(good_sum, good_rows, n_layer)
             add_rows(bad_sum, bad_rows, n_layer)
             if args.pair_normalize:

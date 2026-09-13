@@ -54956,6 +54956,9 @@ typedef struct {
     size_t vis_span_count;
     float *host_row;
     float *host_logits;
+    ds4_gpu_tensor *steer_dirs;
+    float steer_attn_scale;
+    float steer_ffn_scale;
 } ds4_qwen4_gpu_graph;
 
 /* prefill chunk: DS4_QWEN4_PREFILL_CHUNK overrides the 8192-token default
@@ -55066,7 +55069,7 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         &g->moe_lists, &g->moe_counts, &g->sh_gate, &g->sh_up, &g->sh_mid, &g->sh_out, &g->hc_u, &g->hc_lo_act,
         &g->inj_alt, &g->mtp_e, &g->mtp_cat, &g->mtp_proj, &g->mtp_R, &g->mtp_argmax, &g->mtp_argmax_tmp,
         &g->snap_ple_hist, &g->snap2_ple_hist, &g->snap0_ple_hist, &g->pos3,
-        &g->draft_head,
+        &g->draft_head, &g->steer_dirs,
     };
     free(g->host_pos3);
     free(g->draft_ids);
@@ -55218,6 +55221,95 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
         return false;
     }
     return true;
+}
+
+static bool qwen4_graph_load_steering(ds4_qwen4_gpu_graph *g,
+                                      const char *path,
+                                      float attn_scale,
+                                      float ffn_scale) {
+    if (!g) return false;
+    if (attn_scale == 0.0f && ffn_scale == 0.0f) return true;
+    if (!path || !path[0]) {
+        fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
+        return false;
+    }
+    const uint32_t n_layers = directional_steering_layer_count();
+    if (n_layers == 0) return false;
+    const uint64_t n = (uint64_t)n_layers * DS4_N_EMBD;
+    float *dirs = xmalloc((size_t)n * sizeof(dirs[0]));
+    bool ok = read_f32_binary_file(path, dirs, n);
+    if (ok) {
+        g->steer_dirs = ds4_gpu_tensor_alloc(n * sizeof(dirs[0]));
+        ok = g->steer_dirs != NULL &&
+             ds4_gpu_tensor_write(g->steer_dirs, 0, dirs, n * sizeof(dirs[0])) != 0;
+    }
+    free(dirs);
+    if (!ok) {
+        fprintf(stderr, "ds4: failed to load directional steering vectors from %s\n", path);
+        return false;
+    }
+    g->steer_attn_scale = attn_scale;
+    g->steer_ffn_scale = ffn_scale;
+    fprintf(stderr, "ds4: Qwen3.8 directional steering enabled: %s attn=%g ffn=%g\n",
+            path, (double)attn_scale, (double)ffn_scale);
+    return true;
+}
+
+static bool qwen4_graph_apply_steering_attn(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t T) {
+    if (!g || !g->steer_dirs || g->steer_attn_scale == 0.0f) return true;
+    return ds4_gpu_directional_steering_project_tensor(
+               g->blk, g->steer_dirs, il, DS4_N_EMBD, T, g->steer_attn_scale) != 0;
+}
+
+static bool qwen4_graph_apply_steering_ffn(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t T) {
+    if (!g || !g->steer_dirs || g->steer_ffn_scale == 0.0f) return true;
+    return ds4_gpu_directional_steering_project_tensor(
+               g->R, g->steer_dirs, il, DS4_N_EMBD, T * DS4_N_HC, g->steer_ffn_scale) != 0;
+}
+
+/* Last prompt token, HC-mean of residual R. Filename uses pos0 so
+ * dir-steering/tools/build_direction.py can reuse the DeepSeek dump layout. */
+static void qwen4_graph_dump_last_ffn(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t T) {
+    const char *prefix = metal_graph_debug_prefix_for("ffn_out", il, 0);
+    /* T==1 is decode of a sampled token; extractors want the last prompt row. */
+    if (!g || !g->R || T <= 1 || !prefix) return;
+    if (ds4_gpu_synchronize() == 0) return;
+    const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC;
+    float *hc_row = xmalloc((size_t)hc * E * sizeof(hc_row[0]));
+    const uint64_t off = (uint64_t)(T - 1u) * hc * E * sizeof(float);
+    if (ds4_gpu_tensor_read(g->R, off, hc_row, (uint64_t)hc * E * sizeof(float)) != 0) {
+        float *mean = xmalloc((size_t)E * sizeof(mean[0]));
+        for (uint32_t i = 0; i < E; i++) {
+            float s = 0.0f;
+            for (uint32_t h = 0; h < hc; h++) s += hc_row[(uint64_t)h * E + i];
+            mean[i] = s / (float)hc;
+        }
+        char path[1024];
+        snprintf(path, sizeof(path), "%s_ffn_out-%u_pos0.bin", prefix, il);
+        if (write_f32_binary_file(path, mean, E)) {
+            fprintf(stderr, "ds4: dumped ffn_out layer %u last-token HC-mean to %s\n", il, path);
+        }
+        free(mean);
+    }
+    free(hc_row);
+    (void)glm_graph_begin_commands_if_needed();
+}
+
+static void qwen4_graph_dump_last_attn(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t T) {
+    const char *prefix = metal_graph_debug_prefix_for("attn_out", il, 0);
+    if (!g || !g->blk || T <= 1 || !prefix) return;
+    if (ds4_gpu_synchronize() == 0) return;
+    float *row = xmalloc((size_t)DS4_N_EMBD * sizeof(row[0]));
+    const uint64_t off = (uint64_t)(T - 1u) * DS4_N_EMBD * sizeof(float);
+    if (ds4_gpu_tensor_read(g->blk, off, row, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s_attn_out-%u_pos0.bin", prefix, il);
+        if (write_f32_binary_file(path, row, DS4_N_EMBD)) {
+            fprintf(stderr, "ds4: dumped attn_out layer %u last-token to %s\n", il, path);
+        }
+    }
+    free(row);
+    (void)glm_graph_begin_commands_if_needed();
 }
 
 static void qwen4_graph_reset(ds4_qwen4_gpu_graph *g) {
@@ -55787,6 +55879,10 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
             ok = ds4_qwen4_layer_is_linear(il) ? qwen4_graph_linear(g, m, l, il, T)
                                                : qwen4_graph_attention(g, m, l, il, pos0, T);
         }
+        if (ok && !ds4_qwen4_layer_is_linear(il)) {
+            qwen4_graph_dump_last_attn(g, il, T);
+            ok = qwen4_graph_apply_steering_attn(g, il, T);
+        }
         QWEN4_PROF(ds4_qwen4_layer_is_linear(il) ? 2 : 3);
         if (T == 1u && !g->mtp_R && DS4_N_HC == 4u && ds4_gpu_qwen4_decode_fusions_enabled() &&
             l->hc_ffn_inject->type == DS4_TENSOR_F16) {
@@ -55808,6 +55904,8 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         }
         QWEN4_PROF(4);
         if (ok) ok = qwen4_graph_moe(g, m, l, T);   /* the reduce folds the combine in */
+        if (ok) qwen4_graph_dump_last_ffn(g, il, T);
+        if (ok) ok = qwen4_graph_apply_steering_ffn(g, il, T);
         QWEN4_PROF(5);
         /* Submit this prefix while the host encodes the remaining layers.
          * Flush keeps the same ordered queue and retains pending buffers;
@@ -56072,9 +56170,11 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     g->R = g->mtp_R;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, T);
     if (ok) ok = qwen4_graph_attention(g, m, l, il, idx, T);
+    if (ok) ok = qwen4_graph_apply_steering_attn(g, il, T);
     if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, E, hc) != 0;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
     if (ok) ok = qwen4_graph_moe(g, m, l, T);
+    if (ok) ok = qwen4_graph_apply_steering_ffn(g, il, T);
     ds4_gpu_tensor *last = NULL;
     const char *argmax_env = getenv("DS4_QWEN4_MTP_GPU_ARGMAX");
     const bool gpu_argmax = want_logits && draft_out && !logits_out &&
@@ -56162,9 +56262,11 @@ static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *
     g->R = g->mtp_R;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, 1);
     if (ok) ok = qwen4_graph_attention(g, m, l, il, idx, 1);
+    if (ok) ok = qwen4_graph_apply_steering_attn(g, il, 1);
     if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, 1, E, hc) != 0;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, 1);
     if (ok) ok = qwen4_graph_moe(g, m, l, 1);
+    if (ok) ok = qwen4_graph_apply_steering_ffn(g, il, 1);
     /* the chained draft only needs its argmax; DS4_QWEN4_MTP_DRAFT_ROWS can
      * score the frequent-token prefix exactly like the first draft's head */
     const uint32_t chain_head_rows = qwen4_mtp_draft_rows();
@@ -67417,13 +67519,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
         if ((opt->mtp_path && opt->mtp_path[0]) ||
-            (opt->directional_steering_file && opt->directional_steering_file[0]) ||
-            opt->directional_steering_attn != 0.0f ||
-            opt->directional_steering_ffn != 0.0f ||
             e->ssd_streaming ||
             e->power_percent < 100) {
             fprintf(stderr,
-                    "ds4: --mtp-model, steering, SSD streaming and "
+                    "ds4: --mtp-model, SSD streaming and "
                     "--power are not supported for Qwen3.8\n");
             ds4_engine_close(e);
             *out = NULL;
@@ -69331,6 +69430,14 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             return 1;
         }
         qwen4_graph_reset(&s->qwen4_graph);
+        if (!qwen4_graph_load_steering(&s->qwen4_graph,
+                                       e->directional_steering_file,
+                                       e->directional_steering_attn_scale,
+                                       e->directional_steering_ffn_scale)) {
+            qwen4_graph_free(&s->qwen4_graph);
+            free(s);
+            return 1;
+        }
         s->qwen4_graph_ready = true;
         s->prefill_cap = (uint32_t)ctx_size;
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
@@ -69769,7 +69876,9 @@ int ds4_session_set_directional_steering_ffn(ds4_session *s, float scale) {
     bool loaded = s->engine->directional_steering_dirs != NULL;
 #ifndef DS4_NO_GPU
     if (!ds4_session_is_cpu(s)) {
-        if (ds4_session_is_glm(s)) {
+        if (s->qwen4_graph_ready) {
+            loaded = s->qwen4_graph.steer_dirs != NULL;
+        } else if (ds4_session_is_glm(s)) {
             const int tier = glm_graph_directional_steering_tier(
                     &s->glm_graph, s->glm_graph.layer_start);
             loaded = tier >= 0 &&
@@ -69788,7 +69897,9 @@ int ds4_session_set_directional_steering_ffn(ds4_session *s, float scale) {
     s->engine->directional_steering_ffn_scale = scale;
 #ifndef DS4_NO_GPU
     if (!ds4_session_is_cpu(s)) {
-        if (ds4_session_is_glm(s)) {
+        if (s->qwen4_graph_ready) {
+            s->qwen4_graph.steer_ffn_scale = scale;
+        } else if (ds4_session_is_glm(s)) {
             s->glm_graph.directional_steering_ffn_scale = scale;
             s->glm_mtp_have = 0;
             s->glm_mtp_rollback_valid = false;

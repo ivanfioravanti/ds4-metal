@@ -1206,7 +1206,7 @@ done:
     return rc;
 }
 
-static int check_decoder_suffix(const char *path, const char *prompt_path) {
+static int check_decoder_suffix(const char *path, const char *prompt_path, bool short_chunks, bool streaming) {
     ds4_engine *engine = NULL;
     ds4_session *control = NULL, *candidate = NULL;
     ds4_tokens tokens = {0};
@@ -1214,11 +1214,14 @@ static int check_decoder_suffix(const char *path, const char *prompt_path) {
     size_t prompt_bytes;
     int rc = 1;
     ds4_engine_options opt = {.model_path = path, .backend = DS4_BACKEND_METAL,
-        .context_size = 18432, .power_percent = 100, .ssd_streaming = true,
+        .context_size = 18432, .power_percent = 100, .ssd_streaming = streaming,
         .ssd_streaming_cache_bytes = UINT64_C(64) << 30};
-    /* Hold arithmetic fixed to isolate dependency pruning from GEMM tiling. */
-    setenv("DS4_METAL_DISABLE_V41_BATCH_MOE", "1", 1);
-    setenv("DS4_METAL_DISABLE_V41_BATCH_ATTN", "1", 1);
+    /* The short-chunk path preserves full matrix tiles, so exercise the
+     * production batched arithmetic as well as its live KV frontier. */
+    if (!short_chunks) {
+        setenv("DS4_METAL_DISABLE_V41_BATCH_MOE", "1", 1);
+        setenv("DS4_METAL_DISABLE_V41_BATCH_ATTN", "1", 1);
+    }
     REQUIRE(imatrix_read_text_file(prompt_path, &prompt, &prompt_bytes));
     REQUIRE(ds4_engine_open(&engine, &opt) == 0);
     ds4_encode_chat_prompt(engine, NULL, prompt, DS4_THINK_NONE, &tokens);
@@ -1227,11 +1230,16 @@ static int check_decoder_suffix(const char *path, const char *prompt_path) {
     REQUIRE(ds4_session_create(&candidate, engine, 18432) == 0);
     ds41_gpu_graph *a = &control->ds41_graph, *b = &candidate->ds41_graph;
     for (uint32_t pass = 0; pass < 2; pass++) {
-        const uint32_t start = a->pos, count = 8192;
+        const uint32_t start = a->pos, count = short_chunks ? (pass ? 7956u : 3072u) : 8192u;
         setenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX", "1", 1);
         double t0 = now_sec();
+        const uint32_t prefix = short_chunks ? count - count % 2048u : count;
         REQUIRE(ds41_graph_prefill(a, &engine->model, &engine->weights,
-            tokens.v + start, count, NULL, NULL, (int)(start + count), NULL, NULL));
+            tokens.v + start, prefix, NULL, NULL, (int)(start + count), NULL, NULL));
+        if (prefix < count)
+            REQUIRE(ds41_graph_prefill(a, &engine->model, &engine->weights,
+                tokens.v + start + prefix, count - prefix, NULL, NULL,
+                (int)(start + count), NULL, NULL));
         const double reference = now_sec() - t0;
         unsetenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
         t0 = now_sec();
@@ -1945,7 +1953,11 @@ int main(int argc, char **argv) {
     if (argc == 4 && !strcmp(argv[2], "--chunk-prefill"))
         return check_wide_prefill(argv[1], argv[3], false, false, "DS4_METAL_DISABLE_V41_WIDE_CHUNK");
     if (argc == 4 && !strcmp(argv[2], "--decoder-suffix"))
-        return check_decoder_suffix(argv[1], argv[3]);
+        return check_decoder_suffix(argv[1], argv[3], false, true);
+    if (argc == 4 && !strcmp(argv[2], "--short-decoder-suffix"))
+        return check_decoder_suffix(argv[1], argv[3], true, false);
+    if (argc == 4 && !strcmp(argv[2], "--short-decoder-suffix-ssd"))
+        return check_decoder_suffix(argv[1], argv[3], true, true);
     if (argc == 4 && !strcmp(argv[2], "--sweep-partitions"))
         return check_sweep_partitions(argv[1], argv[3]);
     if (argc == 4 && !strcmp(argv[2], "--deferred-decoder"))

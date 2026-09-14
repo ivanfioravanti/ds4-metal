@@ -40418,6 +40418,12 @@ static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
 
 static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
                         const ds4_tensor *weight, const ds4_gpu_tensor *in, bool round) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (round && weight->type == DS4_TENSOR_Q8_0 &&
+        !getenv("DS4_METAL_DISABLE_V41_Q8_BF16_FUSION"))
+        return ds4_gpu_matmul_q8_0_decode_bf16_tensor(out, m->map, m->size,
+            weight->abs_offset, weight->dim[0], weight->dim[1], in) != 0;
+#endif
     return metal_graph_matmul_plain_tensor(out, m, weight, weight->dim[0], weight->dim[1], in, 1) &&
            (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
 }

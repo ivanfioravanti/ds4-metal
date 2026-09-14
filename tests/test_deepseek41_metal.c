@@ -558,6 +558,53 @@ static int check_sparse_gather(void) {
     return 1;
 }
 
+/* Compare the fused store to the original two-dispatch GPU path, including
+ * odd output tails, the large-output reduction, and nonzero tensor offsets. */
+static int check_q8_bf16_fusion(void) {
+    typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
+    const uint32_t shapes[][2] = {{32,1}, {128,65}, {512,513}, {1024,5120},
+        {5120,1024}, {5120,1280}, {5120,512}, {5120,2304},
+        {2304,5120}, {5120,2560}, {2560,5120}, {128,65537}};
+    for (size_t shape = 0; shape < sizeof(shapes) / sizeof(shapes[0]); shape++) {
+        const uint32_t k = shapes[shape][0], n = shapes[shape][1];
+        const size_t weight_bytes = (size_t)((n + 3u) & ~3u) * k / 32 * sizeof(q8_block);
+        const size_t map_bytes = (weight_bytes + getpagesize() - 1) & ~(getpagesize() - 1);
+        void *model = NULL;
+        CHECK(posix_memalign(&model, getpagesize(), map_bytes) == 0);
+        memset(model, 0, map_bytes);
+        q8_block *w = model;
+        for (size_t i = 0; i < weight_bytes / sizeof(*w); i++) {
+            w[i].d = 0x1000u + (seed % 0x3400u);
+            for (unsigned j = 0; j < 32; j++) w[i].qs[j] = (int)(random_value() * 8192) % 128;
+        }
+        float *x = malloc((k + 8u) * sizeof(float));
+        CHECK(x);
+        for (uint32_t i = 0; i < k + 8u; i++) x[i] = random_value() / 11.0f;
+        CHECK(ds4_gpu_init() && ds4_gpu_set_model_map(model, map_bytes));
+        ds4_gpu_tensor *storage = upload(x, (k + 8u) * 4u);
+        ds4_gpu_tensor *input = ds4_gpu_tensor_view(storage, 16, k * 4u);
+        ds4_gpu_tensor *ref = upload(NULL, (n + 8u) * 4u);
+        ds4_gpu_tensor *out = upload(NULL, (n + 8u) * 4u);
+        CHECK(storage && input && ref && out);
+        memset(ds4_gpu_tensor_contents(ref), 0x5a, (n + 8u) * 4u);
+        memset(ds4_gpu_tensor_contents(out), 0x5a, (n + 8u) * 4u);
+        ds4_gpu_tensor *rv = ds4_gpu_tensor_view(ref, 16, n * 4u);
+        ds4_gpu_tensor *ov = ds4_gpu_tensor_view(out, 16, n * 4u);
+        CHECK(rv && ov && ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_matmul_q8_0_tensor(rv, model, map_bytes, 0, k, n, input, 1));
+        CHECK(ds4_gpu_dsv41_quantize(rv, n, 1, DS4_V41_BF16));
+        CHECK(ds4_gpu_matmul_q8_0_decode_bf16_tensor(ov, model, map_bytes, 0, k, n, input));
+        CHECK(ds4_gpu_end_commands());
+        CHECK(!memcmp(ds4_gpu_tensor_contents(ref), ds4_gpu_tensor_contents(out), (n + 8u) * 4u));
+        fprintf(stderr, "V4.1 Q8 BF16 fused store k=%u n=%u: byte-exact PASS\n", k, n);
+        ds4_gpu_tensor_free(rv); ds4_gpu_tensor_free(ov);
+        ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(out);
+        ds4_gpu_tensor_free(input); ds4_gpu_tensor_free(storage);
+        ds4_gpu_cleanup(); free(x); free(model);
+    }
+    return 1;
+}
+
 static int check_attention_output(bool large) {
     enum { GROUP = 4096, RANK = 1024, GROUPS = 8, OUT = 5120 };
     const uint32_t ROWS = large ? 8192u : 513u;
@@ -1258,6 +1305,11 @@ static int check_tp_attention(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--q8-bf16-fusion")) {
+        const int ok = check_q8_bf16_fusion();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--embedding")) {
         const int ok = ds4_gpu_init() && check_embedding();
         ds4_gpu_cleanup();

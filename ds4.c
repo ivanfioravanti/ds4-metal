@@ -40770,7 +40770,28 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         shared_queued = rc > 0;
     }
 #endif
-    if (shared_here && !shared_queued &&
+    bool parallel = false, shared_done = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* Overlap the owner's shared and routed experts at each dependency level.
+     * Join before adding the shared result and publishing the RDMA flag. */
+    if (shared_owner && g->tp_rank == (il & 1u) && !g->streaming && !g->quality && !g->imatrix &&
+        l->ffn_gate_exps->type == DS4_TENSOR_Q4_K && l->ffn_down_exps->type == DS4_TENSOR_Q4_K &&
+        l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 && l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 &&
+        !getenv("DS4_METAL_DISABLE_V41_TP_FFN_OVERLAP") &&
+        !getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") &&
+        !getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION"))
+        parallel = ds4_gpu_dsv41_parallel_ffn_start(g->shared_gate, g->shared_up,
+            g->shared_mid, g->shared, m->map, m->size, l->ffn_gate_shexp->abs_offset,
+            l->ffn_up_shexp->abs_offset, l->ffn_down_shexp->abs_offset,
+            DS4_N_EMBD, DS4_N_FF_EXP, g->norm, DS4_SWIGLU_CLAMP_EXP) != 0;
+    if (parallel && getenv("DS4_METAL_V41_TP_FFN_SERIAL")) {
+        if (!ds4_gpu_dsv41_shared_expert_only()) return false;
+        parallel = false;
+        shared_done = true;
+    }
+#endif
+    if (shared_here && !shared_queued && !shared_done && !parallel &&
         (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
         !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
         !ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
@@ -40800,6 +40821,9 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     if (shared_queued && !ds4_gpu_dsv41_shared_join()) return false;
 #endif
     if (!routed_ok) return false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (parallel && !ds4_gpu_parallel_ffn_finish()) return false;
+#endif
     /* Keep the shared expert's BF16 boundary, then include it exactly once
      * in the existing F32 reduction. Alternate ownership across layers. */
     if (shared_owner && g->tp_rank == (il & 1u) &&

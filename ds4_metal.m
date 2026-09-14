@@ -9569,6 +9569,8 @@ static NSUInteger g_parallel_gate_up_nr0;
 static NSUInteger g_parallel_gate_up_smem;
 static int g_parallel_ffn_mode; /* 2: gate/up + down */
 static int g_parallel_ffn_stage;
+static BOOL g_parallel_v41;
+static NSUInteger g_parallel_down_nsg;
 static BOOL g_parallel_q8_pending;
 static BOOL g_parallel_q8_encoded;
 /* GPU-decided shared-expert lane split (see ds4_shared_split_range in
@@ -9605,6 +9607,8 @@ static void ds4_gpu_parallel_ffn_reset_state(BOOL close_encoder) {
     g_parallel_q8_encoded = NO;
     g_parallel_ffn_mode = 0;
     g_parallel_ffn_stage = 0;
+    g_parallel_v41 = NO;
+    g_parallel_down_nsg = 0;
 
     g_parallel_q8_pipeline = nil;
     g_parallel_q8_weight = nil;
@@ -9667,7 +9671,7 @@ static int ds4_gpu_parallel_ffn_start_range(
         uint32_t              shared_lane_offset,
         uint32_t              shared_lane_count,
         const ds4_gpu_tensor *x,
-        float                 clamp) {
+        float                 clamp, bool v41) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!g_batch_cb || g_parallel_q8_pending || g_batch_encoder_concurrent ||
         !gate || !up || !mid || !shared_out || !x || !model_map ||
@@ -9722,13 +9726,17 @@ static int ds4_gpu_parallel_ffn_start_range(
     if (!gate_wbuf || !up_wbuf || !down_wbuf) return 0;
 
     ds4_gpu_mv_dispatch gate_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
-    const char *gate_fn = "kernel_dsv4_shared_gate_up_swiglu_q8_0";
+    const char *gate_fn = v41 ? "kernel_dsv41_shared_gate_up_swiglu_q8_0" :
+                               "kernel_dsv4_shared_gate_up_swiglu_q8_0";
     id<MTLComputePipelineState> gate_pipeline =
         ds4_gpu_get_mul_mv_pipeline(gate_fn, gate_dispatch.nsg);
+    /* TP scalar Q8 uses two SIMD groups. Preserve that reduction tree. */
+    const NSUInteger down_nsg = v41 ? gate_dispatch.nsg : 4u;
     id<MTLComputePipelineState> down_pipeline =
-        ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_q8_0_f32", 4);
+        ds4_gpu_get_mul_mv_pipeline(v41 ? "kernel_mul_mv_q8_0_f32_bf16" :
+                                     "kernel_mul_mv_q8_0_f32", (int16_t)down_nsg);
     if (!gate_pipeline || !down_pipeline ||
-        down_pipeline.maxTotalThreadsPerThreadgroup < 128u) {
+        down_pipeline.maxTotalThreadsPerThreadgroup < 32u * down_nsg) {
         return 0;
     }
 
@@ -9771,6 +9779,8 @@ static int ds4_gpu_parallel_ffn_start_range(
     g_parallel_q8_args.ne10 = (int32_t)shared_lane_count;
     g_parallel_q8_args.nr0 = 2;
 
+    g_parallel_down_nsg = down_nsg;
+    g_parallel_v41 = v41;
     g_parallel_ffn_mode = 2;
     g_parallel_ffn_stage = 0;
     g_parallel_q8_pending = YES;
@@ -9795,7 +9805,29 @@ int ds4_gpu_parallel_ffn_start(
     return ds4_gpu_parallel_ffn_start_range(
         gate, up, mid, shared_out, model_map, model_size,
         gate_offset, up_offset, down_offset, model_dim, shared_dim,
-        0, shared_dim, x, clamp);
+        0, shared_dim, x, clamp, false);
+}
+
+int ds4_gpu_dsv41_parallel_ffn_start(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *shared_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              model_dim,
+        uint32_t              shared_dim,
+        const ds4_gpu_tensor *x,
+        float                 clamp) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_gpu_device_name_contains("M3 Ultra")) return 0;
+    return ds4_gpu_parallel_ffn_start_range(
+        gate, up, mid, shared_out, model_map, model_size,
+        gate_offset, up_offset, down_offset, model_dim, shared_dim,
+        0, shared_dim, x, clamp, true);
 }
 
 int ds4_gpu_parallel_ffn_start_sliced(
@@ -9817,7 +9849,7 @@ int ds4_gpu_parallel_ffn_start_sliced(
     return ds4_gpu_parallel_ffn_start_range(
         gate, up, mid, shared_out, model_map, model_size,
         gate_offset, up_offset, down_offset, model_dim, shared_dim,
-        shared_lane_offset, shared_lane_count, x, clamp);
+        shared_lane_offset, shared_lane_count, x, clamp, false);
 }
 
 int ds4_gpu_parallel_ffn_start_split(
@@ -9937,6 +9969,7 @@ int ds4_gpu_parallel_ffn_start_split(
     };
     g_parallel_split_ids = idsbuf;
     g_parallel_split_ids_offset = ds4_gpu_tensor_offset(selected);
+    g_parallel_down_nsg = 4u;
     g_parallel_ffn_mode = 2;
     g_parallel_ffn_stage = 0;
     g_parallel_q8_pending = YES;
@@ -9972,7 +10005,7 @@ static void ds4_gpu_encode_parallel_q8_down(
     [enc setThreadgroupMemoryLength:32u * 2u * sizeof(float) atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake(
              ((NSUInteger)g_parallel_q8_args.ne0 + 1u) / 2u, 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+         threadsPerThreadgroup:MTLSizeMake(32, g_parallel_down_nsg, 1)];
 }
 
 static int ds4_gpu_parallel_q8_matvec_encode_pending(
@@ -10093,6 +10126,17 @@ int ds4_gpu_parallel_ffn_finish(void) {
     return completed;
 }
 
+
+/* Serial control for the same shared kernels used by the overlap path. */
+int ds4_gpu_dsv41_shared_expert_only(void) {
+    if (!g_parallel_v41 || !g_parallel_q8_pending) return 0;
+    if (!ds4_gpu_parallel_q8_matvec_encode_pending(g_batch_cb, g_parallel_gate_out) ||
+        !ds4_gpu_parallel_ffn_encode_second_stage(g_batch_cb)) {
+        ds4_gpu_parallel_ffn_abort();
+        return 0;
+    }
+    return ds4_gpu_parallel_ffn_finish();
+}
 
 static int ds4_gpu_stream_expert_cache_wait_inflight(const char *label) {
     const char *what = label ? label : "streaming expert cache in-flight";
@@ -40799,7 +40843,18 @@ int ds4_gpu_routed_moe_one_tensor(
                 g_tp_split_world == 2 && add_in == NULL &&
                 (force_resident || !g_ssd_streaming_mode) &&
                 !write_clamped_moe && fuse_pair_swiglu && direct_down_sum;
-            if (!parallel_iq2_route && !parallel_mxfp4_tp_route) {
+            const bool parallel_v41_q4_route =
+                g_parallel_v41 && g_parallel_ffn_mode == 2 &&
+                gate_type == DS4_METAL_TENSOR_Q4_K && down_type == DS4_METAL_TENSOR_Q4_K &&
+                n_tokens == 1 && n_expert == 6 && n_total_expert == 384 &&
+                expert_in_dim == 5120 && expert_mid_dim == 2304 && out_dim == 5120 &&
+                gate_row_bytes == 2880 && down_row_bytes == 1296 &&
+                gate_expert_bytes == 6635520 && down_expert_bytes == 6635520 &&
+                g_tp_split_world == 2 && n_bind_expert == 192 &&
+                first_expert == (uint32_t)g_tp_split_rank * 192u &&
+                add_in == NULL && (force_resident || !g_ssd_streaming_mode) &&
+                !write_clamped_moe && fuse_pair_swiglu && direct_down_sum;
+            if (!parallel_iq2_route && !parallel_mxfp4_tp_route && !parallel_v41_q4_route) {
                 fprintf(stderr,
                         "ds4: concurrent FFN requires a supported resident "
                         "fused pair-SwiGLU + direct sum6 route\n");

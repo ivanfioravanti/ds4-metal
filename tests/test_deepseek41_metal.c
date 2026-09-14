@@ -558,6 +558,64 @@ static int check_sparse_gather(void) {
     return 1;
 }
 
+/* Check every shared-expert boundary using the real V4.1 projection shape. */
+static int check_shared_bf16_fusion(void) {
+    fprintf(stderr, "V4.1 shared BF16 SIMD groups: %s\n", getenv("DS4_METAL_Q8_MV_NSG"));
+    typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
+    const uint32_t k = 5120, n = 2304;
+    const size_t matrix_bytes = (size_t)k * n / 32 * sizeof(q8_block);
+    const size_t map_bytes = 3 * matrix_bytes;
+    void *model = NULL;
+    CHECK(posix_memalign(&model, getpagesize(), map_bytes) == 0);
+    q8_block *w = model;
+    for (size_t i = 0; i < map_bytes / sizeof(*w); i++) {
+        w[i].d = 0x1400u + (seed % 0x2000u);
+        for (unsigned j = 0; j < 32; j++) w[i].qs[j] = (int)(random_value() * 8192) % 128;
+    }
+    float *x = malloc(k * 4u);
+    CHECK(x);
+    CHECK(ds4_gpu_init() && ds4_gpu_set_model_map(model, map_bytes));
+    ds4_gpu_tensor *input = upload(NULL, k * 4u), *a[4], *b[4];
+    CHECK(input);
+    for (unsigned i = 0; i < 4; i++) {
+        a[i] = upload(NULL, (i == 3 ? k : n) * 4u);
+        b[i] = upload(NULL, (i == 3 ? k : n) * 4u);
+        CHECK(a[i] && b[i]);
+    }
+    for (unsigned trial = 0; trial < 512; trial++) {
+        const float clamp = trial & 1 ? 10.0f : 0.0f;
+        for (uint32_t i = 0; i < k; i++) x[i] = bf16(random_value() / (trial % 8 + 1));
+        CHECK(ds4_gpu_tensor_write(input, 0, x, k * 4u));
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_matmul_q8_0_tensor(a[0], model, map_bytes, 0, k, n, input, 1));
+        CHECK(ds4_gpu_dsv41_quantize(a[0], n, 1, DS4_V41_BF16));
+        CHECK(ds4_gpu_matmul_q8_0_tensor(a[1], model, map_bytes, matrix_bytes, k, n, input, 1));
+        CHECK(ds4_gpu_dsv41_quantize(a[1], n, 1, DS4_V41_BF16));
+        CHECK(ds4_gpu_swiglu_tensor(a[2], a[0], a[1], n, clamp, 1.0f));
+        CHECK(ds4_gpu_dsv41_quantize(a[2], n, 1, DS4_V41_BF16));
+        CHECK(ds4_gpu_matmul_q8_0_tensor(a[3], model, map_bytes, 2 * matrix_bytes, n, k, a[2], 1));
+        CHECK(ds4_gpu_dsv41_quantize(a[3], k, 1, DS4_V41_BF16));
+        CHECK(ds4_gpu_dsv41_parallel_ffn_start(b[0], b[1], b[2], b[3], model, map_bytes,
+            0, matrix_bytes, 2 * matrix_bytes, k, n, input, clamp));
+        CHECK(ds4_gpu_dsv41_shared_expert_only());
+        CHECK(ds4_gpu_end_commands());
+        for (unsigned i = 0; i < 4; i++) {
+            const uint32_t *ref = ds4_gpu_tensor_contents(a[i]), *got = ds4_gpu_tensor_contents(b[i]);
+            for (uint32_t j = 0; j < (i == 3 ? k : n); j++) if (ref[j] != got[j]) {
+                fprintf(stderr, "shared BF16 mismatch trial=%u stage=%u index=%u ref=%08x got=%08x\n",
+                    trial, i, j, ref[j], got[j]);
+                return 0;
+            }
+        }
+        if (trial % 64 == 63)
+            fprintf(stderr, "V4.1 shared BF16 trials=%u: gate/up/mid/down byte-exact PASS\n", trial + 1);
+
+    }
+    for (unsigned i = 0; i < 4; i++) { ds4_gpu_tensor_free(a[i]); ds4_gpu_tensor_free(b[i]); }
+    ds4_gpu_tensor_free(input); ds4_gpu_cleanup(); free(x); free(model);
+    return 1;
+}
+
 /* Compare the fused store to the original two-dispatch GPU path, including
  * odd output tails, the large-output reduction, and nonzero tensor offsets. */
 static int check_q8_bf16_fusion(void) {
@@ -1305,6 +1363,15 @@ static int check_tp_attention(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--shared-bf16-fusion")) {
+        setenv("DS4_METAL_Q8_MV_NSG", "2", 1);
+        int ok = check_shared_bf16_fusion();
+        setenv("DS4_METAL_Q8_MV_NSG", "4", 1);
+        if (ok) ok = check_shared_bf16_fusion();
+        unsetenv("DS4_METAL_Q8_MV_NSG");
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--q8-bf16-fusion")) {
         const int ok = check_q8_bf16_fusion();
         ds4_gpu_cleanup();

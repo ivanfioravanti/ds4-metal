@@ -1140,7 +1140,7 @@ static int check_compact_carry(void) {
  * Selected rows are shuffled; include masked future rows at odd frontiers. */
 static int check_tp_attention(void) {
     enum { D = 512, H = 64, K = 512, C = 2048 };
-    const uint32_t sizes[] = {1, 31, 32, 33, 129, 257, 2048};
+    const uint32_t sizes[] = {1, 2, 15, 16, 17, 31, 32, 33, 129, 257, 2048};
     float *sinks = NULL;
     CHECK(posix_memalign((void **)&sinks, getpagesize(), getpagesize()) == 0);
     for (int h = 0; h < H; h++) sinks[h] = random_value();
@@ -1169,6 +1169,13 @@ static int check_tp_attention(void) {
         CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(out, sinks, getpagesize(),
             0, qt, rt, ct, 0, it, n, start, nr, nr, 0, C, K, 128, ratio, H, D));
         CHECK(ds4_gpu_tensor_read(out, 0, actual, nq * 4));
+        if (n > 1) {
+            ds4_gpu_set_quality(true); /* Original eight-head prefill kernel. */
+            CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(out, sinks, getpagesize(),
+                0, qt, rt, ct, 0, it, n, start, nr, nr, 0, C, K, 128, ratio, H, D));
+            CHECK(!memcmp(actual, ds4_gpu_tensor_contents(out), nq * 4));
+            ds4_gpu_set_quality(false);
+        }
         double max_split = 0, max_oracle = 0;
         for (uint32_t rank = 0; rank < 2; rank++) {
             for (uint32_t t = 0; t < n; t++)

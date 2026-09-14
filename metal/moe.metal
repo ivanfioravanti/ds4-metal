@@ -4319,7 +4319,8 @@ kernel void kernel_mul_mv_id_q4_K_pair_f32(
 // for gate and up, then the same lane that wrote each row derives the routed
 // SwiGLU input.  This keeps Q4 behavior aligned with the Q2 optimization while
 // preserving the old pair projection arithmetic.
-kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
+template<short NR0>
+kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32_rows(
         constant ds4_metal_args_mul_mv_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
         device const char * src0_gate,
@@ -4363,7 +4364,7 @@ kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
     const short iq = it / 4;
     const short ir = it % 4;
     const int nb = args.ne00 / QK_K;
-    const int first_row = (tgpig.x * NSG + sgitg) * N_R0_Q4_K;
+    const int first_row = (tgpig.x * NSG + sgitg) * NR0;
     device float *gate_f32 = (device float *)dst_gate_cur;
     device float *up_f32 = (device float *)dst_up_cur;
     const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
@@ -4379,8 +4380,8 @@ kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
     device const float *y = (device const float *)src1_cur;
     device const float *y4 = y + ix * QK_K + 64 * iq + 8 * ir;
 
-    float sumg[N_R0_Q4_K] = {0.f};
-    float sumu[N_R0_Q4_K] = {0.f};
+    float sumg[NR0] = {0.f};
+    float sumu[NR0] = {0.f};
     uint16_t sc16[4];
     thread const uint8_t *sc8 = (thread const uint8_t *)sc16;
 
@@ -4403,7 +4404,7 @@ kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
         device const uint16_t *qu1 = (device const uint16_t *)xu[ib].qs + 16 * iq + 4 * ir;
         device const half *dhu = &xu[ib].d;
 
-        for (short row = 0; row < N_R0_Q4_K; row++) {
+        for (short row = 0; row < NR0; row++) {
             sc16[0] = scg[0] & kmask1;
             sc16[1] = scg[2] & kmask1;
             sc16[2] = ((scg[4] >> 0) & kmask2) | ((scg[0] & kmask3) >> 2);
@@ -4469,7 +4470,7 @@ kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
         y4 += 4 * QK_K;
     }
 
-    for (int row = 0; row < N_R0_Q4_K && first_row + row < args.ne0; ++row) {
+    for (int row = 0; row < NR0 && first_row + row < args.ne0; ++row) {
         const float gate = simd_sum(sumg[row]);
         const float up = simd_sum(sumu[row]);
         if (tiisg == 0) {
@@ -4489,6 +4490,10 @@ kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
 
     (void)tiitg;
 }
+
+typedef decltype(kernel_mul_mv_id_q4_K_pair_swiglu_f32_rows<2>) kernel_mul_mv_id_q4_K_pair_swiglu_f32_type;
+template [[host_name("kernel_mul_mv_id_q4_K_pair_swiglu_f32")]] kernel kernel_mul_mv_id_q4_K_pair_swiglu_f32_type kernel_mul_mv_id_q4_K_pair_swiglu_f32_rows<2>;
+template [[host_name("kernel_mul_mv_id_q4_K_pair_swiglu_f32_nr1")]] kernel kernel_mul_mv_id_q4_K_pair_swiglu_f32_type kernel_mul_mv_id_q4_K_pair_swiglu_f32_rows<1>;
 
 template<typename args_t>
 void kernel_mul_mv_mxfp4_pair_swiglu_impl(
@@ -6744,7 +6749,8 @@ kernel void kernel_mul_mv_slots6_mxfp4_sum6_f32(
     (void)tiitg;
 }
 
-kernel void kernel_mul_mv_id_q4_K_sum6_f32(
+template<short NR0>
+kernel void kernel_mul_mv_id_q4_K_sum6_f32_rows(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src0s,
         device const char * src1,
@@ -6757,7 +6763,7 @@ kernel void kernel_mul_mv_id_q4_K_sum6_f32(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     const short NSG = FC_mul_mv_nsg;
-    const short nr0 = N_R0_Q4_K;
+    const short nr0 = NR0;
     const int nb = args.ne00 / QK_K;
     const int first_row = (tgpig.x * NSG + sgitg) * nr0;
     const uint token = tgpig.y;
@@ -6857,6 +6863,10 @@ kernel void kernel_mul_mv_id_q4_K_sum6_f32(
     (void)tiitg;
     (void)tgpig;
 }
+
+typedef decltype(kernel_mul_mv_id_q4_K_sum6_f32_rows<2>) kernel_mul_mv_id_q4_K_sum6_f32_type;
+template [[host_name("kernel_mul_mv_id_q4_K_sum6_f32")]] kernel kernel_mul_mv_id_q4_K_sum6_f32_type kernel_mul_mv_id_q4_K_sum6_f32_rows<2>;
+template [[host_name("kernel_mul_mv_id_q4_K_sum6_f32_nr4")]] kernel kernel_mul_mv_id_q4_K_sum6_f32_type kernel_mul_mv_id_q4_K_sum6_f32_rows<4>;
 
 kernel void kernel_mul_mv_group_q4_K_sum6_f32(
         constant ds4_metal_args_mul_mv_id & args,

@@ -40810,6 +40810,14 @@ int ds4_gpu_routed_moe_one_tensor(
             n_tokens == 1 &&
             down_sum6_pipeline != nil;
 
+        /* V4.1 resident TP only; streaming and other expert layouts keep their kernels. */
+        const bool tune_v41_q4_rows = g_tp_split_world == 2 && n_tokens == 1 && n_expert == 6 &&
+                n_total_expert == 384 && expert_in_dim == 5120 && expert_mid_dim == 2304 &&
+                out_dim == 5120 && gate_type == DS4_METAL_TENSOR_Q4_K &&
+                down_type == DS4_METAL_TENSOR_Q4_K && (force_resident || !g_ssd_streaming_mode) &&
+                ds4_gpu_device_name_contains("M3 Ultra") &&
+                !getenv("DS4_METAL_DISABLE_V41_Q4_ROWS");
+
         if (g_parallel_q8_pending) {
             /* A concurrent encoder invalidates every implicit dependency in
              * this generic function. Admit only resident fused pair-SwiGLU
@@ -42711,6 +42719,15 @@ int ds4_gpu_routed_moe_one_tensor(
                                                               false);
             }
         } else if (fuse_pair_swiglu) {
+            /* Each SIMD group reduces its own row; retain its K walk. */
+            if (tune_v41_q4_rows) {
+                id<MTLComputePipelineState> tuned = ds4_gpu_get_mul_mv_pipeline(
+                    "kernel_mul_mv_id_q4_K_pair_swiglu_f32_nr1", 2);
+                if (!tuned) return 0;
+                pair_swiglu_pipeline = tuned;
+                pair_swiglu_nsg = 2;
+                gate_args.nr0 = 1;
+            }
             ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
                 .width = expert_mid_dim,
                 .rows = pair_rows,
@@ -43041,6 +43058,14 @@ int ds4_gpu_routed_moe_one_tensor(
                                                        2);
             }
         } else if (ok && direct_down_sum) {
+            if (tune_v41_q4_rows) {
+                id<MTLComputePipelineState> tuned = ds4_gpu_get_mul_mv_pipeline(
+                    "kernel_mul_mv_id_q4_K_sum6_f32_nr4", 4);
+                if (!tuned) return 0;
+                down_sum6_pipeline = tuned;
+                down_sum6_nsg = 4;
+                down_args.nr0 = 4;
+            }
             ok = ds4_gpu_encode_mul_mv_id_sum6(cb,
                                                  down_sum6_pipeline,
                                                  &down_args,

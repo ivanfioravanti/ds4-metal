@@ -1207,9 +1207,9 @@ done:
 }
 
 /* Compare complete live state while decode crosses ring and compressor
- * boundaries. The control drains every layer; the candidate uses the default
- * resident queue. The SSD run also guards the per-layer fallback. */
-static int check_decode_queue(const char *path, const char *prompt_path, bool streaming) {
+ * boundaries. A diagnostic switch selects the control path on the same model;
+ * the candidate uses the default implementation, also checked in SSD mode. */
+static int check_decode_control(const char *path, const char *prompt_path, bool streaming, const char *disable) {
     ds4_engine *engine = NULL;
     ds4_session *control = NULL, *candidate = NULL;
     ds4_tokens tokens = {0};
@@ -1229,9 +1229,9 @@ static int check_decode_queue(const char *path, const char *prompt_path, bool st
         REQUIRE(ds4_session_create(&control, engine, 4096) == 0);
         REQUIRE(ds4_session_create(&candidate, engine, 4096) == 0);
         ds4_tokens input = {.v = tokens.v, .len = prefix, .cap = prefix};
-        setenv("DS4_METAL_DISABLE_V41_SOLO_DECODE_QUEUE", "1", 1);
+        setenv(disable, "1", 1);
         REQUIRE(ds4_session_sync(control, &input, err, sizeof(err)) == 0);
-        unsetenv("DS4_METAL_DISABLE_V41_SOLO_DECODE_QUEUE");
+        unsetenv(disable);
         REQUIRE(ds4_session_sync(candidate, &input, err, sizeof(err)) == 0);
         for (int step = 0; step <= 64; step++) {
             ds41_gpu_graph *a = &control->ds41_graph, *b = &candidate->ds41_graph;
@@ -1250,20 +1250,21 @@ static int check_decode_queue(const char *path, const char *prompt_path, bool st
             }
             if (step == 64) break;
             const int token = tokens.v[prefix + step];
-            setenv("DS4_METAL_DISABLE_V41_SOLO_DECODE_QUEUE", "1", 1);
+            setenv(disable, "1", 1);
             REQUIRE(ds4_session_eval(control, token, err, sizeof(err)) == 0);
-            unsetenv("DS4_METAL_DISABLE_V41_SOLO_DECODE_QUEUE");
+            unsetenv(disable);
             REQUIRE(ds4_session_eval(candidate, token, err, sizeof(err)) == 0);
         }
-        fprintf(stderr, "V4.1 decode queue %s prefix=%d: 65 exact logits/history/KV states PASS\n",
-            streaming ? "SSD fallback" : "resident", prefix);
+        fprintf(stderr, "V4.1 decode control %s %s prefix=%d: 65 exact logits/history/KV states PASS\n",
+            disable,
+            streaming ? "SSD" : "resident", prefix);
         ds4_session_free(candidate); candidate = NULL;
         ds4_session_free(control); control = NULL;
     }
     rc = 0;
 done:
     if (err[0]) fprintf(stderr, "%s\n", err);
-    unsetenv("DS4_METAL_DISABLE_V41_SOLO_DECODE_QUEUE");
+    unsetenv(disable);
     if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
     ds4_session_free(candidate); ds4_session_free(control); ds4_engine_close(engine);
     ds4_tokens_free(&tokens); free(prompt);
@@ -2016,10 +2017,14 @@ int main(int argc, char **argv) {
         return check_prefill_alias_fallback(argv[1], argv[3]);
     if (argc == 4 && !strcmp(argv[2], "--chunk-prefill"))
         return check_wide_prefill(argv[1], argv[3], false, false, "DS4_METAL_DISABLE_V41_WIDE_CHUNK");
+    if (argc == 4 && !strcmp(argv[2], "--q8-bf16-fusion"))
+        return check_decode_control(argv[1], argv[3], false, "DS4_METAL_DISABLE_V41_Q8_BF16_FUSION");
+    if (argc == 4 && !strcmp(argv[2], "--q8-bf16-fusion-ssd"))
+        return check_decode_control(argv[1], argv[3], true, "DS4_METAL_DISABLE_V41_Q8_BF16_FUSION");
     if (argc == 4 && !strcmp(argv[2], "--decode-queue"))
-        return check_decode_queue(argv[1], argv[3], false);
+        return check_decode_control(argv[1], argv[3], false, "DS4_METAL_DISABLE_V41_SOLO_DECODE_QUEUE");
     if (argc == 4 && !strcmp(argv[2], "--decode-queue-ssd"))
-        return check_decode_queue(argv[1], argv[3], true);
+        return check_decode_control(argv[1], argv[3], true, "DS4_METAL_DISABLE_V41_SOLO_DECODE_QUEUE");
     if (argc == 4 && !strcmp(argv[2], "--decoder-suffix"))
         return check_decoder_suffix(argv[1], argv[3], false, true);
     if (argc == 4 && !strcmp(argv[2], "--short-decoder-suffix"))
@@ -2059,6 +2064,7 @@ int main(int argc, char **argv) {
                         "--sweep-partitions PROMPT_FILE | "
                         "--deferred-decoder PROMPT_FILE | "
                         "--decode-queue PROMPT_FILE | --decode-queue-ssd PROMPT_FILE | "
+                        "--q8-bf16-fusion PROMPT_FILE | --q8-bf16-fusion-ssd PROMPT_FILE | "
                         "--decoder-suffix PROMPT_FILE | --session-accounting | --memory-plan | "
                         "RENDERED_PROMPT [GENERATE])\n", argv[0]);
         return 2;

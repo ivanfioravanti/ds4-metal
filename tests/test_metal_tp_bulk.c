@@ -10,6 +10,10 @@
 } } while (0)
 
 static int exchange(void *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
+    /* Force a release beyond the poll kernel's fast rounds after its RDMA
+     * receive window is already armed. Every later round must still have
+     * an observable release marker, including after ring/slot reuse. */
+    if (layer == 3u && gate == 1u) usleep(200000);
     return ds4_tp_gate_exchange(tp, layer, gate, seq);
 }
 

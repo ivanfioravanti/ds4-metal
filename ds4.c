@@ -40535,8 +40535,9 @@ static bool ds41_sum_partial(ds41_gpu_graph *g, ds4_gpu_tensor *x,
                              uint32_t il, uint32_t gate) {
     if (g->tp_world != 2) return true;
     const uint32_t slot = il * DS4_TP_GATES_PER_LAYER + gate;
-    if (!ds4_gpu_tensor_copy(g->tp_out[slot], 0, x, 0, (uint64_t)DS4_N_EMBD * 4u) ||
-        !ds4_gpu_tp_gate_encode(il, gate)) return false;
+    /* Scalar producers write their partial directly into this gate's slab
+     * slot. Keep rank order fixed when reducing into the graph scratch. */
+    if (!ds4_gpu_tp_gate_encode(il, gate)) return false;
     ds4_gpu_tensor *first = g->tp_rank ? g->tp_in[slot] : g->tp_out[slot];
     ds4_gpu_tensor *second = g->tp_rank ? g->tp_out[slot] : g->tp_in[slot];
     return ds4_gpu_add_tensor(x, first, second, DS4_N_EMBD) != 0;
@@ -40593,14 +40594,14 @@ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
-                                  const ds4_layer_weights *l) {
+                                  const ds4_layer_weights *l, ds4_gpu_tensor *out) {
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
     if (!ds41_attention_low(g, m, l)) return false;
     return g->tp_world == 2 ?
-        metal_graph_matmul_dense_quant_kslice(g->block, m, l->attn_output_b,
+        metal_graph_matmul_dense_quant_kslice(out, m, l->attn_output_b,
             8192, (uint64_t)g->tp_rank * groups * 1024u,
             (uint64_t)groups * 1024u, DS4_N_EMBD, g->low, 0) :
-        ds41_matmul(g->block, m, l->attn_output_b, g->low, false);
+        ds41_matmul(out, m, l->attn_output_b, g->low, false);
 }
 
 static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
@@ -40720,7 +40721,12 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
         !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
         !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
     if (projected) return true;
-    return ds41_attention_output(g, m, l) &&
+    ds4_gpu_tensor *out = g->block;
+    if (g->tp_world == 2) {
+        out = g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN];
+        ds4_gpu_tp_flag_fold_request(il, DS4_TP_GATE_ATTN);
+    }
+    return ds41_attention_output(g, m, l, out) &&
            ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
            ds41_bf16(g->block, DS4_N_EMBD);
 }
@@ -40732,7 +40738,9 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         !tensor_nbytes(l->ffn_down_exps->type, DS4_N_FF_EXP, &down_row)) return false;
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
-    ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
+    ds4_gpu_tensor *sum = shared_owner ? g->block : g->routed;
+    ds4_gpu_tensor *routed = g->tp_world == 2 ?
+        g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN] : sum;
     const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
     if (!bias) return false;
     if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) ||
@@ -40789,7 +40797,8 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     /* Keep the shared expert's BF16 boundary, then include it exactly once
      * in the existing F32 reduction. Alternate ownership across layers. */
     if (shared_owner && g->tp_rank == (il & 1u) &&
-        !ds4_gpu_add_tensor(routed, routed, g->shared, DS4_N_EMBD)) return false;
+        !ds4_gpu_add_tensor_tp_flag(routed, routed, g->shared,
+            DS4_N_EMBD, il, DS4_TP_GATE_FFN)) return false;
     return true;
 }
 
@@ -42079,7 +42088,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             row.q = queries[i];
             row.heads = heads[i];
             ok = ds41_attention(&row, model, l, il, true) &&
-                ds41_attention_output(&row, model, l);
+                ds41_attention_output(&row, model, l, row.block);
         }
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&

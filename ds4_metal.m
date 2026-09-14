@@ -10709,7 +10709,11 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
                 g_tp_poll_region +
                 (size_t)(req.seq % DS4_TP_POLL_RING) *
                     DS4_TP_POLL_LINES * (DS4_TP_POLL_LINE_BYTES / 4u);
-            for (uint32_t j = 0; j < DS4_TP_POLL_LINES; j++) {
+            /* The poll kernel probes 32 fresh lines per SIMD round and
+             * releases on any match. Publish lane zero in every round;
+             * writing the other 31 lines adds CPU work without extending
+             * the polling window or making a later round observable. */
+            for (uint32_t j = 0; j < DS4_TP_POLL_LINES; j += 32u) {
                 __atomic_store_n(&region[j * (DS4_TP_POLL_LINE_BYTES / 4u)],
                                  v, __ATOMIC_RELAXED);
             }

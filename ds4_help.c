@@ -396,6 +396,7 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--teacher-forced-decode", "Decode the following prompt tokens instead of each predicted argmax.");
     opt(fp, c, "--csv FILE", "Write CSV there instead of stdout.");
     opt(fp, c, "--dump-frontier-logits-dir DIR", "Write one full-logit JSON file per frontier.");
+    opt(fp, c, "DS4_BENCH_DUMP_DECODE_LOGITS=1", "Also dump each decode step to that directory; affects wall throughput.");
     fputc('\n', fp);
 }
 

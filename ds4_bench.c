@@ -464,7 +464,8 @@ static int write_frontier_logits_json(
         ds4_engine         *engine,
         ds4_session        *session,
         int                 frontier,
-        int                 previous) {
+        int                 previous,
+        int                 decode_start) {
     if (!cfg->dump_frontier_logits_dir) return 0;
 
     const int vocab = ds4_engine_vocab_size(engine);
@@ -480,11 +481,11 @@ static int write_frontier_logits_json(
     }
 
     char path[PATH_MAX];
-    const int n = snprintf(path,
-                           sizeof(path),
-                           "%s/frontier_%06d.logits.json",
-                           cfg->dump_frontier_logits_dir,
-                           frontier);
+    const int n = decode_start >= 0 ?
+        snprintf(path, sizeof(path), "%s/decode_%06d_%06d.logits.json",
+                 cfg->dump_frontier_logits_dir, decode_start, frontier) :
+        snprintf(path, sizeof(path), "%s/frontier_%06d.logits.json",
+                 cfg->dump_frontier_logits_dir, frontier);
     if (n <= 0 || (size_t)n >= sizeof(path)) {
         fprintf(stderr, "ds4-bench: frontier logits path is too long\n");
         free(logits);
@@ -505,14 +506,16 @@ static int write_frontier_logits_json(
             ",\n  \"backend\":\"%s\",\n  \"quality\":%s,\n"
             "  \"quant_bits\":%d,\n  \"prompt_tokens\":%d,\n"
             "  \"frontier_tokens\":%d,\n  \"prefill_tokens\":%d,\n"
+            "  \"decode_tokens\":%d,\n"
             "  \"ctx\":%d,\n  \"vocab\":%d,\n"
             "  \"argmax_id\":%d,\n  \"argmax_logit\":%.9g,\n  \"logits\":[",
             ds4_backend_name(cfg->backend),
             cfg->quality ? "true" : "false",
             ds4_engine_routed_quant_bits(engine),
+            decode_start >= 0 ? decode_start : frontier,
             frontier,
-            frontier,
-            frontier - previous,
+            decode_start >= 0 ? 0 : frontier - previous,
+            decode_start >= 0 ? frontier - decode_start : 0,
             cfg->ctx_alloc,
             vocab,
             argmax,
@@ -838,7 +841,7 @@ int main(int argc, char **argv) {
                     prefill_t0 * 1e3, prefill_t1 * 1e3);
         const int prefill_tokens = frontier - previous;
 
-        if (write_frontier_logits_json(&cfg, engine, session, frontier, previous) != 0) {
+        if (write_frontier_logits_json(&cfg, engine, session, frontier, previous, -1) != 0) {
             rc = 1;
             break;
         }
@@ -870,6 +873,8 @@ int main(int argc, char **argv) {
             }
         }
 
+        const bool dump_decode_logits = cfg.dump_frontier_logits_dir &&
+            getenv("DS4_BENCH_DUMP_DECODE_LOGITS") != NULL;
         const double gen_t0 = bench_now_sec();
         double gen_first_sec = 0.0;
         double gen_steady_sec = 0.0;
@@ -979,6 +984,15 @@ int main(int argc, char **argv) {
                 gen_first_tokens = cycle_tokens;
             } else {
                 gen_steady_sec += token_t1 - token_t0;
+            }
+            /* Diagnostic only: compare complete decode logits between two
+             * implementations using the same teacher-forced continuation.
+             * Dumps are outside token timing but affect wall throughput. */
+            if (dump_decode_logits &&
+                write_frontier_logits_json(&cfg, engine, session,
+                    ds4_session_pos(session), frontier, frontier) != 0) {
+                rc = 1;
+                break;
             }
         }
         const double gen_t1 = bench_now_sec();

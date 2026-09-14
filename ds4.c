@@ -41074,13 +41074,16 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
 #endif
         !getenv("DS4_METAL_DISABLE_V41_BATCH_COMPRESS");
     if (batch_publish && !ds41_attention_publish_batch(g, b, m, l, il, start, count)) return false;
-    for (uint32_t t = 0; (!batch_index || !batch_publish) && t < count; t++) {
+    /* Non-source layers have no per-token publication or index work. */
+    const bool scalar_publish = ds41_kv_source(il) && !batch_publish;
+    const bool scalar_index = ds41_index_source(il) && !batch_index;
+    for (uint32_t t = 0; (scalar_publish || scalar_index) && t < count; t++) {
         row.pos = start + t;
 #define DS41_SELECT_ROW(name, width) row.name = g->rows_view[t].name;
         DS41_PREFILL_ROWS(DS41_SELECT_ROW)
 #undef DS41_SELECT_ROW
-        if (!batch_publish && !ds41_attention_publish(&row, m, l, il)) return false;
-        if (!batch_index && !ds41_attention_select_published(&row, m, l, il)) return false;
+        if (scalar_publish && !ds41_attention_publish(&row, m, l, il)) return false;
+        if (scalar_index && !ds41_attention_select_published(&row, m, l, il)) return false;
     }
     if (batch_index && !ds41_index_batch(g, m, l, il, count)) return false;
     bool ok;

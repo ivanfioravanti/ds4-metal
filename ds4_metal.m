@@ -30660,8 +30660,11 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             ds4_gpu_hot_pipeline(g_dsv4_sort_i32_rows_asc_pipeline,
                                     "kernel_dsv4_sort_i32_rows_asc");
         const bool decode_one_token = n_tokens == 1u;
+        /* Two heads share each staged KV row without changing either head's
+         * online softmax recurrence; this also benefits M3 Ultra prefill. */
         const bool prefill_dual_heads =
-            !decode_one_token && !g_quality_mode && ds4_gpu_mpp_available() &&
+            !decode_one_token && !g_quality_mode &&
+            (ds4_gpu_mpp_available() || ds4_gpu_device_name_contains("M3 Ultra")) &&
             (n_head == 64u || n_head == 32u) &&
             top_k == 512u && window == 128u && head_dim == 512u;
         const uint32_t decode_splits =

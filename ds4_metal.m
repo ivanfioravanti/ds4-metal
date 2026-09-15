@@ -44762,7 +44762,7 @@ static int ds4_gpu_hc_weighted_sum_strided(
         uint64_t                weight_row_stride,
         uint32_t                n_embd,
         uint32_t                n_hc,
-        const char             *label) {
+        const char             *label, bool bf16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !residual_hc || !weights || n_embd == 0 || n_hc == 0 ||
         weight_row_stride < (uint64_t)n_hc * sizeof(float)) {
@@ -44825,8 +44825,11 @@ static int ds4_gpu_hc_weighted_sum_strided(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
 
+        id<MTLComputePipelineState> pipeline = bf16 ?
+            ds4_gpu_get_pipeline("kernel_dsv4_hc_weighted_sum_bf16") : g_hc_weighted_sum_pipeline;
+        if (!pipeline) return 0;
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:g_hc_weighted_sum_pipeline];
+        [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(residual_hc) atIndex:1];
         [enc setBuffer:wbuf offset:ds4_gpu_tensor_offset(weights) + (NSUInteger)weight_offset atIndex:2];
@@ -44854,7 +44857,7 @@ int ds4_gpu_hc_weighted_sum_tensor(
                                              (uint64_t)n_hc * sizeof(float),
                                              n_embd,
                                              n_hc,
-                                             "HC weighted sum");
+                                             "HC weighted sum", false);
 }
 
 int ds4_gpu_hc_weighted_sum_split_tensor(
@@ -44871,7 +44874,13 @@ int ds4_gpu_hc_weighted_sum_split_tensor(
                                              mix_hc * sizeof(float),
                                              n_embd,
                                              n_hc,
-                                             "HC weighted sum split");
+                                             "HC weighted sum split", false);
+}
+
+int ds4_gpu_dsv41_hc_sum_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual,
+        const ds4_gpu_tensor *weights, bool split) {
+    return ds4_gpu_hc_weighted_sum_strided(out, residual, weights, 0,
+        (split ? 24u : 4u) * sizeof(float), 5120, 4, "V4.1 HC BF16 sum", true);
 }
 
 /* Release decode fused HC pre-sublayer operation.  The graph driver owns the
@@ -46043,13 +46052,13 @@ int ds4_gpu_hc_expand_add_tensor(
     return 1;
 }
 
-int ds4_gpu_hc_expand_split_tensor(
+static int ds4_gpu_hc_expand_split_impl(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *block_out,
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
-        uint32_t                n_hc) {
+        uint32_t                n_hc, bool bf16) {
     if (!g_initialized && !ds4_gpu_init()) {
         fprintf(stderr, "ds4: Metal HC expand split could not initialize the backend\n");
         return 0;
@@ -46125,7 +46134,7 @@ int ds4_gpu_hc_expand_split_tensor(
         id<MTLComputePipelineState> expand_pipeline = g_hc_expand_pipeline;
         uint64_t n_elem = (uint64_t)n_embd * n_hc * n_tokens64;
         if (n_hc == 4) {
-            expand_pipeline = ds4_gpu_hot_pipeline(g_dsv4_hc_expand4_pipeline,
+            expand_pipeline = bf16 ? ds4_gpu_get_pipeline("kernel_dsv4_hc_expand4_bf16") : ds4_gpu_hot_pipeline(g_dsv4_hc_expand4_pipeline,
                                                       "kernel_dsv4_hc_expand4");
             n_elem = (uint64_t)n_embd * n_tokens64;
         }
@@ -46159,6 +46168,21 @@ int ds4_gpu_hc_expand_split_tensor(
     }
 
     return 1;
+}
+
+int ds4_gpu_hc_expand_split_tensor(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    return ds4_gpu_hc_expand_split_impl(out_hc, block_out, residual_hc, split, n_embd, n_hc, false);
+}
+
+int ds4_gpu_dsv41_hc_expand_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split) {
+    return ds4_gpu_hc_expand_split_impl(out, block, residual, split, 5120, 4, true);
 }
 
 int ds4_gpu_hc_expand_split_half_tensor(

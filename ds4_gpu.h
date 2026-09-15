@@ -2812,6 +2812,14 @@ int ds4_gpu_hc_split_sinkhorn_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps);
 
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+int ds4_gpu_dsv41_hc_sum_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual,
+        const ds4_gpu_tensor *weights, bool split);
+int ds4_gpu_dsv41_hc_expand_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split);
+#endif
+
 int ds4_gpu_hc_weighted_sum_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *residual_hc,

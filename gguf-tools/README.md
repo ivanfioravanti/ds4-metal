@@ -5,6 +5,8 @@ V4 Flash GGUF files for `ds4`.
 
 The important pieces are:
 
+- `deepseek41_dspark.py`: converts the matching V4.1 Flash draft shards into a
+  separate support GGUF; see [V4.1 DSpark](../docs/SPECULATIVE_DECODING.md#deepseek-v41-flash-dspark).
 - `deepseek4-quantize.c`: C HF-safetensors to GGUF quantizer.
 - `quants.[ch]`: the deliberately small local quantization implementation used
   by the quantizer.  It implements the DS4 output formats we actually ship:

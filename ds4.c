@@ -41297,7 +41297,8 @@ static bool ds41_decode_island(ds41_gpu_graph *g, const ds4_model *m,
         if (state == 1) return true;
         const bool ok = island == 0 ?
             ds41_graph_before_attention(g, m, l, il) && ds41_attention_project(g, m, l) :
-            island == 2 ? ds41_attention_output(g, m, l) :
+            island == 2 ? ds41_attention_output(g, m, l,
+                g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN]) :
             ds41_graph_after_attention(g, m, l) && ds41_moe_partial(g, m, l, il, 0);
         if (state != 0) return ok;
         if (!ok) ds4_gpu_decode_graph_abort(&key);

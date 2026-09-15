@@ -2361,6 +2361,18 @@ int ds4_gpu_attention_output_low_q8_tensor(
         uint64_t                rank,
         uint32_t                n_groups,
         const ds4_gpu_tensor *heads);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+int ds4_gpu_dsv41_attention_low_bf16(
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        const ds4_gpu_tensor *heads);
+#endif
+
 int ds4_gpu_attention_output_low_q4_K_slice_tensor(
         ds4_gpu_tensor       *low,
         const void             *model_map,

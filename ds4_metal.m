@@ -9730,7 +9730,7 @@ static int ds4_gpu_parallel_ffn_start_range(
                                "kernel_dsv4_shared_gate_up_swiglu_q8_0";
     id<MTLComputePipelineState> gate_pipeline =
         ds4_gpu_get_mul_mv_pipeline(gate_fn, gate_dispatch.nsg);
-    /* TP scalar Q8 uses two SIMD groups. Preserve that reduction tree. */
+    /* Preserve the scalar Q8 dispatch's reduction tree for V4.1. */
     const NSUInteger down_nsg = v41 ? gate_dispatch.nsg : 4u;
     id<MTLComputePipelineState> down_pipeline =
         ds4_gpu_get_mul_mv_pipeline(v41 ? "kernel_mul_mv_q8_0_f32_bf16" :
@@ -26992,7 +26992,7 @@ int ds4_gpu_attention_output_q8_tp_tensor(
     }
 }
 
-int ds4_gpu_attention_output_low_q8_tensor(
+static int ds4_gpu_attention_output_low_q8_impl(
         ds4_gpu_tensor       *low,
         const void             *model_map,
         uint64_t                model_size,
@@ -27000,7 +27000,7 @@ int ds4_gpu_attention_output_low_q8_tensor(
         uint64_t                group_dim,
         uint64_t                rank,
         uint32_t                n_groups,
-        const ds4_gpu_tensor *heads) {
+        const ds4_gpu_tensor *heads, bool bf16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!low || !heads || !model_map || group_dim == 0 || rank == 0 ||
         n_groups == 0 || group_dim > UINT32_MAX || rank > UINT32_MAX) {
@@ -27070,7 +27070,8 @@ int ds4_gpu_attention_output_low_q8_tensor(
                 .nr0 = 2,
             };
             id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_attn_out_low_q8_0_f32", 4);
+                ds4_gpu_get_mul_mv_pipeline(bf16 ? "kernel_dsv41_attn_out_low_q8_0_bf16" :
+                    "kernel_dsv4_attn_out_low_q8_0_f32", 4);
             ok = ds4_gpu_encode_attn_out_low_q8_direct(cb,
                                                          pipeline,
                                                          &args,
@@ -27090,6 +27091,30 @@ int ds4_gpu_attention_output_low_q8_tensor(
         }
         return ok ? 1 : 0;
     }
+}
+
+int ds4_gpu_attention_output_low_q8_tensor(
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        const ds4_gpu_tensor *heads) {
+    return ds4_gpu_attention_output_low_q8_impl(low, model_map, model_size, out_a_offset, group_dim, rank, n_groups, heads, false);
+}
+
+int ds4_gpu_dsv41_attention_low_bf16(
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        const ds4_gpu_tensor *heads) {
+    return ds4_gpu_attention_output_low_q8_impl(low, model_map, model_size, out_a_offset, group_dim, rank, n_groups, heads, true);
 }
 
 int ds4_gpu_attention_output_low_q4_K_slice_tensor(
@@ -40894,8 +40919,9 @@ int ds4_gpu_routed_moe_one_tensor(
                 expert_in_dim == 5120 && expert_mid_dim == 2304 && out_dim == 5120 &&
                 gate_row_bytes == 2880 && down_row_bytes == 1296 &&
                 gate_expert_bytes == 6635520 && down_expert_bytes == 6635520 &&
-                g_tp_split_world == 2 && n_bind_expert == 192 &&
-                first_expert == (uint32_t)g_tp_split_rank * 192u &&
+                ((g_tp_split_world == 2 && n_bind_expert == 192 &&
+                  first_expert == (uint32_t)g_tp_split_rank * 192u) ||
+                 (g_tp_split_world <= 1 && n_bind_expert == 384 && first_expert == 0)) &&
                 add_in == NULL && (force_resident || !g_ssd_streaming_mode) &&
                 !write_clamped_moe && fuse_pair_swiglu && direct_down_sum;
             if (!parallel_iq2_route && !parallel_mxfp4_tp_route && !parallel_v41_q4_route) {

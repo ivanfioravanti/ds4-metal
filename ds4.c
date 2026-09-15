@@ -40433,6 +40433,9 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
                               const ds4_tensor *weight, const ds4_gpu_tensor *in,
                               uint32_t count, bool round) {
     const uint32_t width = (uint32_t)weight->dim[0], outputs = (uint32_t)weight->dim[1];
+    if (count == 1 && round && weight->type == DS4_TENSOR_Q8_0 &&
+        !getenv("DS4_METAL_DISABLE_V41_ROW_BF16"))
+        return ds41_matmul(out, m, weight, in, true);
     bool ok;
     /* Small decode batches retain scalar reductions before BF16 and sparse
      * routing boundaries. Preserve Metal's separate vocabulary-head dispatch. */
@@ -40599,8 +40602,14 @@ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
     const uint32_t group0 = g->tp_rank * groups;
     uint64_t output_row;
-    return tensor_nbytes(l->attn_output_a->type, 4096, &output_row) &&
-        ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size,
+    if (!tensor_nbytes(l->attn_output_a->type, 4096, &output_row)) return false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (!getenv("DS4_METAL_DISABLE_V41_ATTN_LOW_BF16"))
+        return ds4_gpu_dsv41_attention_low_bf16(g->low, m->map, m->size,
+            l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * output_row,
+            4096, 1024, groups, g->heads) != 0;
+#endif
+    return ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size,
             l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * output_row,
             4096, 1024, groups, g->heads) && ds41_bf16(g->low, groups * DS4_N_LORA_O);
 }
@@ -40649,6 +40658,7 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+    /* Decoder filters are all-pass until the 2048-block budget is exceeded. */
     if (n_comp && ds41_index_source(il)) {
         if (il == 20) {
             const uint32_t blocks = (n_comp + 7u) / 8u, top = blocks < 2048u ? blocks : 2048u;
@@ -40656,6 +40666,7 @@ static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
                 !ds4_gpu_indexer_topk_tensor(g->block_selected, g->block_scores, blocks, 1, top) ||
                 !ds4_gpu_dsv4_topk_mask_tensor(g->block_mask, g->block_selected, blocks, 1, top)) return false;
         } else if (il > 20 &&
+            (n_comp > 2048u * 8u || getenv("DS4_METAL_DISABLE_V41_ALL_CANDIDATES")) &&
             !ds4_gpu_dsv41_candidate_filter(g->index_scores, g->block_mask, n_comp, 1, pos, ratio)) return false;
     }
     return true;
@@ -40778,9 +40789,11 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
 #endif
     bool parallel = false, shared_done = false;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    /* Overlap the owner's shared and routed experts at each dependency level.
-     * Join before adding the shared result and publishing the RDMA flag. */
-    if (shared_owner && g->tp_rank == (il & 1u) && !g->streaming && !g->quality && !g->imatrix &&
+    /* Overlap shared and routed experts at each dependency level. TP only
+     * computes the shared expert on its owner; join before the final sum. */
+    const bool shared_overlap = (shared_owner && g->tp_rank == (il & 1u)) ||
+        (g->tp_world == 1 && !getenv("DS4_METAL_DISABLE_V41_SOLO_FFN_OVERLAP"));
+    if (shared_overlap && !g->streaming && !g->quality && !g->imatrix &&
         l->ffn_gate_exps->type == DS4_TENSOR_Q4_K && l->ffn_down_exps->type == DS4_TENSOR_Q4_K &&
         l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 && l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
         l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 &&

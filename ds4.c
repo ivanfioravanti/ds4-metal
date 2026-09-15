@@ -40566,6 +40566,11 @@ static bool ds41_sum_partial(ds41_gpu_graph *g, ds4_gpu_tensor *x,
 
 static bool ds41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
                       const ds4_model *m, const ds4_tensor *weight) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (!getenv("DS4_METAL_DISABLE_V41_NORM_BF16"))
+        return ds4_gpu_dsv41_norm_bf16(out, in, m->map, m->size,
+            weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS) != 0;
+#endif
     return ds4_gpu_rms_norm_weight_tensor(out, in, m->map, m->size,
         weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS) &&
         ds41_bf16(out, (uint32_t)weight->dim[0]);

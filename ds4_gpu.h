@@ -1136,6 +1136,18 @@ int ds4_gpu_rms_norm_plain_rows_tensor(
         uint32_t                rows,
         float                   eps);
 
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+int ds4_gpu_dsv41_norm_bf16(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        float                   eps);
+#endif
+
 int ds4_gpu_rms_norm_weight_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,

@@ -649,7 +649,8 @@ kernel void kernel_dsv4_hc_expand(
 // HC=4 specialization of the post/expand step. One thread computes all four
 // destination HC streams for one token/dimension, reusing the same block output
 // and residual HC values while preserving the per-stream accumulation order.
-kernel void kernel_dsv4_hc_expand4(
+template<bool BF16>
+kernel void kernel_dsv4_hc_expand4_impl(
         constant ds4_metal_args_dsv4_hc_expand & args,
         device  const char * block_out,
         device  const char * residual,
@@ -688,9 +689,13 @@ kernel void kernel_dsv4_hc_expand4(
         acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 2*args.nb_comb1 + t*args.nb_comb2)) * r2;
         acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 3*args.nb_comb1 + t*args.nb_comb2)) * r3;
 
-        *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) = acc;
+        *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) = BF16 ? ds4_mv_round_bf16(acc) : acc;
     }
 }
+
+typedef decltype(kernel_dsv4_hc_expand4_impl<false>) kernel_dsv4_hc_expand4_t;
+template [[host_name("kernel_dsv4_hc_expand4")]] kernel kernel_dsv4_hc_expand4_t kernel_dsv4_hc_expand4_impl<false>;
+template [[host_name("kernel_dsv4_hc_expand4_bf16")]] kernel kernel_dsv4_hc_expand4_t kernel_dsv4_hc_expand4_impl<true>;
 
 // Decode-time FFN tail fusion:
 //
@@ -1046,7 +1051,8 @@ kernel void kernel_dsv4_q8_hc_expand4_q8_0_vec_hc(
 
 // Reduces HC channels to a normal embedding row with the learned pre weights.
 // This is the input adapter before the attention block and before the FFN block.
-kernel void kernel_dsv4_hc_weighted_sum(
+template<bool BF16>
+kernel void kernel_dsv4_hc_weighted_sum_impl(
         constant ds4_metal_args_dsv4_hc_weighted_sum & args,
         device  const char * x,
         device  const char * weights,
@@ -1067,8 +1073,12 @@ kernel void kernel_dsv4_hc_weighted_sum(
         acc += xv * wv;
     }
 
-    *((device float *) (dst + d*args.nb0 + t*args.nb1)) = acc;
+    *((device float *) (dst + d*args.nb0 + t*args.nb1)) = BF16 ? ds4_mv_round_bf16(acc) : acc;
 }
+
+typedef decltype(kernel_dsv4_hc_weighted_sum_impl<false>) kernel_dsv4_hc_weighted_sum_t;
+template [[host_name("kernel_dsv4_hc_weighted_sum")]] kernel kernel_dsv4_hc_weighted_sum_t kernel_dsv4_hc_weighted_sum_impl<false>;
+template [[host_name("kernel_dsv4_hc_weighted_sum_bf16")]] kernel kernel_dsv4_hc_weighted_sum_t kernel_dsv4_hc_weighted_sum_impl<true>;
 
 // The one-row HC=4 output head historically materializes four device-F32
 // stages across separate launches. Collapse those launches into one tiny

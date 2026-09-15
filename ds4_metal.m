@@ -26557,6 +26557,16 @@ static int ds4_gpu_matmul_q8_0_kslice_exact_rows(
         mv_args.nb13 = mv_args.nb12;
         ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
         if (out_dim > 65536u) mv_dispatch.nsg = 8;
+        /* Reuse the input across more output rows without changing the K
+         * traversal or SIMD reduction used by TP attention partials. */
+        if (n_rows >= 32u && full_in_dim == 8192u && k_cnt == 4096u &&
+            out_dim == 5120u && mv_dispatch.nsg == 2 && ds4_gpu_tp_world_is_two() &&
+            ds4_gpu_device_name_contains("M3 Ultra") &&
+            !getenv("DS4_METAL_DISABLE_V41_PREFILL_Q8_ROWS8")) {
+            mv_dispatch.function_name = "kernel_mul_mv_q8_0_f32_rows8";
+            mv_dispatch.nr0 = 8;
+            mv_dispatch.smem = 32u * 8u * sizeof(float);
+        }
         mv_args.nr0 = mv_dispatch.nr0;
         /* TP partial producer: publish the gate's checked flag from the
          * same kernel (last-arriving threadgroup) when requested. */

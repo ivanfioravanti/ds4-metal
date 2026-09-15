@@ -16,7 +16,7 @@ struct ds4_metal_args_norm {
 // RMSNorm over one activation row, optionally fusing the learned weight
 // multiply. DS4 calls this before attention, before the FFN, and for plain
 // diagnostics that need normalized but unweighted rows.
-template <typename T, short F>
+template <typename T, short F, bool BF16 = false>
 kernel void kernel_rms_norm_fuse_impl(
         constant ds4_metal_args_norm & args,
         device const char * src0,
@@ -70,7 +70,9 @@ kernel void kernel_rms_norm_fuse_impl(
             y[i00] = (x[i00]*scale);
         }
         if (F == 2) {
-            y[i00] = (x[i00]*scale)*f0[i00];
+            const float4 v = (x[i00]*scale)*f0[i00];
+            y[i00] = BF16 ? float4(ds4_mv_round_bf16(v.x), ds4_mv_round_bf16(v.y),
+                ds4_mv_round_bf16(v.z), ds4_mv_round_bf16(v.w)) : v;
         }
         if (F == 3) {
             y[i00] = (x[i00]*scale)*f0[i00] + f1[i00];
@@ -83,6 +85,7 @@ typedef decltype(kernel_rms_norm_fuse_impl<float4, 1>) kernel_rms_norm_fuse_t;
 // Host-visible RMSNorm variants: plain norm and norm multiplied by weight.
 template [[host_name("kernel_rms_norm_f32_4")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 1>;
 template [[host_name("kernel_rms_norm_mul_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
+template [[host_name("kernel_rms_norm_mul_bf16_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2, true>;
 
 kernel void kernel_add_rms_norm_mul_f32_4(
         constant ds4_metal_args_norm & args,

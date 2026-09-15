@@ -291,3 +291,19 @@ kernel void kernel_dsv41_indexer_scores_packed(
     }
 }
 #endif
+
+// Fuse sparse selection with the same float-to-half staging used by attention.
+kernel void kernel_dsv41_sparse_kv_stage(
+        constant uint *args, device const float4 *raw,
+        device const float4 *comp, device const int *ids,
+        device half4 *dst, uint gid [[thread_position_in_grid]]) {
+    const uint row = gid / 128u, col = gid % 128u;
+    if (row >= args[0] + args[3]) return;
+    if (row < args[0]) {
+        uint physical = args[2] + row;
+        if (physical >= args[1]) physical -= args[1];
+        dst[gid] = half4(raw[physical * 128u + col]);
+    } else {
+        dst[gid] = half4(comp[(ulong)ids[row - args[0]] * 128u + col]);
+    }
+}

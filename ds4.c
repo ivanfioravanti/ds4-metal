@@ -40176,6 +40176,7 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(shared_gate, DS4_N_FF_EXP) X(shared_up, DS4_N_FF_EXP) \
     X(shared_mid, DS4_N_FF_EXP) X(shared, DS4_N_EMBD) \
     X(engram_rows, DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
+    X(engram_rows_second, DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
     X(engram_prefetch, (g->carry_cap ? g->carry_cap : g->prefill_cap) * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
     X(engram_kv, (DS4_N_HC + 1u) * DS4_N_EMBD) X(logits, DS4_N_VOCAB)
 
@@ -41336,6 +41337,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
             ok = metal_graph_stream_map_layer(m, w, il) && ds4_gpu_begin_commands();
+        /* Select a separate input only for scalar decode. Prefill row views
+         * continue to use their own per-token Engram input. */
+        ds4_gpu_tensor *engram_input = g->engram_rows;
+        if (il == 14 && !getenv("DS4_METAL_DISABLE_V41_ENGRAM_INPUTS"))
+            g->engram_rows = g->engram_rows_second;
         if (ok && ds41_engram_layer(il)) {
             const uint32_t i = il == 1 ? 0 : 1;
             ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
@@ -41347,10 +41353,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = ds41_graph_layer(g, m, l, il, token);
 #endif
         }
-        /* Keep resident layers queued until the first Engram table's shared
-         * input is reused at layer 14, or the completed token reaches the CPU.
+        g->engram_rows = engram_input;
+        /* Separate Engram inputs let resident layers remain queued until the
+         * completed token reaches the CPU.
          * Solo streaming and imatrix collection retain their per-layer drain. */
-        const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
+        const bool drain = !queue_layers ||
+            (il == 13 && getenv("DS4_METAL_DISABLE_V41_ENGRAM_INPUTS")) ||
+            il + 1u == DS4_N_LAYER;
         /* The vocabulary head depends only on the final layer. Submit it
          * before the drain, avoiding a CPU round trip between GPU producers. */
         if (ok && queued_logits && il + 1u == DS4_N_LAYER)

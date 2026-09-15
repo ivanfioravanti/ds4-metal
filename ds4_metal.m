@@ -43571,6 +43571,13 @@ int ds4_gpu_routed_moe_batch_tensor(
             !g_quality_mode &&
             !use_q4_batch_expert_table &&
             !use_iq2_batch_selected_addr;
+        /* Tail SIMDgroups still stage data and synchronize, but skip MMA
+         * for routed rows outside the expert work item. */
+        const bool q4_prefill_tail_cull = use_mm_id &&
+            n_total_expert == 384u && expert_in_dim == 5120u && expert_mid_dim == 2304u &&
+            gate_type == DS4_METAL_TENSOR_Q4_K && down_type == DS4_METAL_TENSOR_Q4_K &&
+            ds4_gpu_device_name_contains("M3 Ultra") &&
+            !getenv("DS4_METAL_DISABLE_V41_Q4_PREFILL_TAIL_CULL");
         /*
          * Fused gate+up grouped matmul with the SwiGLU epilogue. Both IQ2 and
          * Q4_K use the compact expert work list, the same MMA accumulation
@@ -43717,6 +43724,13 @@ int ds4_gpu_routed_moe_batch_tensor(
                 request_mid_f16 ?
                     ds4_gpu_routed_mm_f16_rhs_pipeline(down_type) :
                     ds4_gpu_routed_mm_pipeline(down_type);
+            if (q4_prefill_tail_cull) {
+                gate_mm_pipeline = up_mm_pipeline = ds4_gpu_get_mul_mm_id_pipeline(
+                    "kernel_mul_mm_id_q4_K_f32_tail_cull", false);
+                down_mm_pipeline = ds4_gpu_get_mul_mm_id_pipeline(request_mid_f16 ?
+                    "kernel_mul_mm_id_q4_K_f16_tail_cull" :
+                    "kernel_mul_mm_id_q4_K_f32_tail_cull", false);
+            }
             const int mpp_mask = ds4_gpu_routed_mm_mpp_mask();
             if (mpp_mask && gate_type == DS4_METAL_TENSOR_IQ2_XXS) {
                 id<MTLComputePipelineState> mpp =
@@ -43811,7 +43825,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                 pair_swiglu_mm_pipeline =
                     ds4_gpu_get_pipeline(
                         gate_type == DS4_METAL_TENSOR_Q4_K ?
-                            "kernel_mul_mm_id_q4_K_pair_swiglu_f16" :
+                            (q4_prefill_tail_cull ? "kernel_mul_mm_id_q4_K_pair_swiglu_f16_tail_cull" :
+                             "kernel_mul_mm_id_q4_K_pair_swiglu_f16") :
                         gate_type == DS4_METAL_TENSOR_MXFP4 ?
                             (use_mxfp4_mm_id_pair_swiglu_compact_tile ?
                                 (use_mxfp4_mm_id_pair_half_scale ?

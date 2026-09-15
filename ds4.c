@@ -40603,6 +40603,17 @@ static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
     const ds4_tensor *fn = ffn ? l->hc_ffn_fn : l->hc_attn_fn;
     const ds4_tensor *scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale;
     const ds4_tensor *base = ffn ? l->hc_ffn_base : l->hc_attn_base;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* Retain the scalar RMS and matvec reduction trees without materializing
+     * the normalized 20K-wide residual between their dispatches. */
+    if (!g->quality && ds4_gpu_device_is_pre_m5_apple_silicon() &&
+        !getenv("DS4_METAL_DISABLE_V41_HC_NORM_MIX") && fn->type == DS4_TENSOR_F16)
+        return ds4_gpu_hc_rms_norm_mix_f16_tensor(g->mix, residual, m->map, m->size,
+            fn->abs_offset, DS4_N_HC * DS4_N_EMBD, 24u, DS4_RMS_EPS) &&
+            ds4_gpu_hc_split_sinkhorn_tensor(ffn ? g->ffn_split : g->attn_split,
+               g->mix, m->map, m->size, scale->abs_offset, base->abs_offset,
+               DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
+#endif
     return ds4_gpu_rms_norm_plain_tensor(g->flat_norm, residual,
                DS4_N_HC * DS4_N_EMBD, DS4_RMS_EPS) &&
            ds41_matmul(g->mix, m, fn, g->flat_norm, false) &&
@@ -40739,6 +40750,26 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     const uint32_t heads = DS4_N_HEAD / g->tp_world;
     const uint32_t head0 = g->tp_rank * heads;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* Each concurrent section contains independent single-dispatch producers.
+     * Diagnostic unfused producers must retain their serial dependencies. */
+    if (!projected && !g->quality && !g->streaming && !g->imatrix &&
+        !getenv("DS4_METAL_DISABLE_V41_QKV_OVERLAP") &&
+        !getenv("DS4_METAL_DISABLE_V41_Q8_BF16_FUSION") &&
+        !getenv("DS4_METAL_DISABLE_V41_NORM_BF16") &&
+        l->attn_q_a->type == DS4_TENSOR_Q8_0 && l->attn_kv->type == DS4_TENSOR_Q8_0 &&
+        ds4_gpu_dsv41_begin_parallel()) {
+        bool ok = ds41_matmul(g->qr, m, l->attn_q_a, g->norm, true) &&
+                  ds41_matmul(g->kv, m, l->attn_kv, g->norm, true);
+        ds4_gpu_dsv41_end_parallel();
+        if (!ok || !ds4_gpu_dsv41_begin_parallel()) return false;
+        ok = ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
+             ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
+        ds4_gpu_dsv41_end_parallel();
+        if (!ok || !ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr,
+                                     head0 * 512u, heads * 512u)) return false;
+    } else
+#endif
     if (!projected && !ds41_attention_project(g, m, l)) return false;
     if (!ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
         !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
@@ -40747,14 +40778,32 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
                              g->kv, 0, 512u * 4u) ||
         !ds41_attention_select(g, m, l, il)) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
-    if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
+    bool direct_stage = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    direct_stage = n_comp && !g->quality && ds4_gpu_device_is_pre_m5_apple_silicon() &&
+        !getenv("DS4_METAL_DISABLE_V41_DIRECT_KV_STAGE");
+#endif
+    if (!direct_stage && n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
                                          g->selected_comp, n_comp, attended)) return false;
     const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
-    if (!ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
+    bool attention_ok;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (direct_stage) {
+        attention_ok = ds4_gpu_dsv41_attention_selected(g->heads, m->map, m->size,
+            l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
+            g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
+            g->compressed[owner], attended,
+            heads, DS4_N_HEAD_DIM, g->selected_comp);
+    } else
+#endif
+    {
+        attention_ok = ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
             l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
             g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
             g->selected_kv, 0, attended, NULL, 0,
-            heads, DS4_N_HEAD_DIM) ||
+            heads, DS4_N_HEAD_DIM);
+    }
+    if (!attention_ok ||
         !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
         !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
     if (projected) return true;

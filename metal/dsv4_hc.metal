@@ -1150,7 +1150,7 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16(
     constexpr short NB  = 32;
     constexpr short NF  = 16;
     constexpr short NF4 = NF/4;
-    constexpr uint  VTHREADS = 1024u;                 // rms norm threads at n == 16384
+    constexpr uint  VTHREADS = 1024u;                 // rms norm threads for both supported widths
     constexpr short VSLICES  = VTHREADS/(NSG*NW);     // virtual 256-thread slices
 
     const uint n  = (uint)args.n;
@@ -1217,7 +1217,7 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16(
         }
     }
 
-    // n == 16384 makes the scalar tail loop of the original empty.
+    // Supported 16384/20480-wide residuals have no scalar matvec tail.
     device float * dst_f32 = (device float *) dst;
     helper_mv_reduce_and_write<NR0>(dst_f32, sumf_mv, r0, args.out_dim,
                                     tiisg, sgitg, (threadgroup char *)mv_shmem);

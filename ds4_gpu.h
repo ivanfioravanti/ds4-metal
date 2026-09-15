@@ -2131,6 +2131,25 @@ int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                use_mask,
         uint32_t                n_head,
         uint32_t                head_dim);
+/* Independent single-dispatch projection sections; a false begin requests
+ * the serial fallback. End joins the section before dependent work. */
+int ds4_gpu_dsv41_begin_parallel(void);
+void ds4_gpu_dsv41_end_parallel(void);
+int ds4_gpu_dsv41_attention_selected(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t                n_comp,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        const ds4_gpu_tensor *selected_ids);
 
 int ds4_gpu_attention_decode_heads_rope_tensor(
         ds4_gpu_tensor       *heads,

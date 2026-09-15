@@ -40860,13 +40860,18 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
     return ds41_moe_partial(g, m, l, il, token) && ds41_moe_finish(g, il);
 }
 
-static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
-                             const ds4_weights *w, float *logits) {
-    if (!g->valid || !logits || !ds4_gpu_begin_commands()) return false;
-    bool ok = ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
+static bool ds41_graph_encode_logits(ds41_gpu_graph *g, const ds4_model *m,
+                                    const ds4_weights *w) {
+    return ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
               ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, w->output_norm) &&
               ds41_output_projection(g, g->tp_logits_half ? g->tp_logits_half : g->logits,
                                       m, w, g->norm, 1);
+}
+
+static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
+                             const ds4_weights *w, float *logits) {
+    if (!g->valid || !logits || !ds4_gpu_begin_commands()) return false;
+    bool ok = ds41_graph_encode_logits(g, m, w);
     if (!ds4_gpu_end_commands()) ok = false;
     return ok && ds4_gpu_tensor_read(g->logits, 0, logits,
                                      (uint64_t)DS4_N_VOCAB * sizeof(float));
@@ -41325,6 +41330,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     queue_layers |= g->tp_world == 1 && !g->streaming && !g->imatrix &&
         !getenv("DS4_METAL_DISABLE_V41_SOLO_DECODE_QUEUE");
 #endif
+    const bool queued_logits = queue_layers && !layer_resident && logits &&
+        !getenv("DS4_METAL_DISABLE_V41_QUEUED_HEAD");
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
@@ -41344,6 +41351,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
          * input is reused at layer 14, or the completed token reaches the CPU.
          * Solo streaming and imatrix collection retain their per-layer drain. */
         const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
+        /* The vocabulary head depends only on the final layer. Submit it
+         * before the drain, avoiding a CPU round trip between GPU producers. */
+        if (ok && queued_logits && il + 1u == DS4_N_LAYER)
+            ok = ds41_graph_encode_logits(g, m, w);
         if (drain && !ds4_gpu_end_commands()) ok = false;
         /* Feed the GPU while the CPU encodes the next resident solo layer. */
         if (ok && !drain && g->tp_world == 1 && !ds4_gpu_flush_commands()) ok = false;
@@ -41358,7 +41369,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
-    if (ok && logits) ok = ds41_graph_logits(g, m, w, logits);
+    if (ok && logits) ok = queued_logits ?
+        ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0 :
+        ds41_graph_logits(g, m, w, logits);
     if (!ok) {
         g->valid = false;
         return false;

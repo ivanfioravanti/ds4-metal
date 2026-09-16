@@ -227,6 +227,70 @@ previous sweeps as comparators; small differences are not established
 statistical gains. Use the rotating greedy measurements for the controlled
 before/after comparison.
 
+### Three-row Q8 reuse and draft utilization
+
+Small speculative Q8 projections on pre-M5 Apple GPUs now share each weight
+load across three token rows for batches of three, five, or six. Four rows
+retain two pairs: two triples do not remove a weight pass and measured slower.
+Each row keeps the scalar K traversal, SIMD reduction and BF16 boundary.
+`DS4_METAL_DISABLE_Q8_TOKEN_TRIPLE=1` restores the preceding paired path for
+diagnosis. `DS4_DSPARK_SPEC_LOG=1` now includes first-row confidence and
+per-cycle draft/target latency.
+
+With a 7,956-token cold raw prefix, 512 greedy outputs, 327,680 allocated
+context and confidence 0.6, three alternating before/after comparisons gave
+the following medians. Ordinary decode was measured once per configuration:
+
+| Configuration | Ordinary tokens/s | DSpark before tokens/s | DSpark after tokens/s | Verify before seconds | Verify after seconds |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Single Mac | 25.57 | 26.83 | 27.15 | 11.197 | 11.026 |
+| TP RDMA | 30.07 | 30.47 | 30.78 | 9.503 | 9.432 |
+
+This is a modest kernel gain, not a change in draft policy. Proposal and
+acceptance counts match the preceding implementation in every controlled
+comparison. The single-Mac workload accepts 198 of 239 proposed drafts over
+314 cycles; TP accepts 194 of 234 over 318 cycles.
+
+The drafter computes five hidden positions per eligible attempt, but the
+confidence gate often returns a shorter prefix. The TP trace contains 317
+draft attempts, 152 confidence abstentions and one output-budget bypass.
+It averages 0.74 proposed and 0.61 accepted drafts per cycle, or 1.61 emitted
+tokens per greedy cycle. Its proposal-length histogram is
+`0:153, 1:108, 2:46, 3:10, 4:1, 5:0`. The 83% acceptance rate applies only to
+submitted proposals and does not include abstentions. Other workloads differ:
+the preceding sampled HTTP sweep averaged 1.43 proposed and 1.10 accepted
+drafts per cycle, including five-token proposals.
+
+Four experimental pauses after empty/low-confidence proposals saved draft
+work but lost useful proposals. Their TP results were near baseline, and the
+best TP policy regressed the single-Mac comparison; none is retained.
+Eliminating all drafting time would only reach about 35 tokens/s on this
+controlled TP trace with unchanged target work. Larger gains require more
+accepted drafts per cycle or cheaper multi-row verification.
+
+Scalar, paired and triple Q8 tests compare exact outputs and BF16 boundaries
+with guard regions, including odd row counts and large vocabulary shapes.
+Full-logit/live-cache, greedy-token, sampled-token and RNG oracles pass on
+single-Mac, RDMA and TCP, including forced six-row verification, rejected
+suffixes, ring wraparound and 16,383/32,767-token prefixes. Normal resident
+and SSD state checks pass. The regression suite retains its nine known
+assertions with no new failures. CPU-only syntax also passes; CUDA hardware
+was not used for these Metal-only kernel changes.
+
+The final cold HTTP sweep uses the same ten prompts (512 through 256K nominal
+context), temperature 0.7 and a 128-output-token cap. At the actual
+254,680-token prompt:
+
+| Configuration | Previous DSpark decode | New DSpark decode | New prefill | New output tokens |
+| --- | ---: | ---: | ---: | ---: |
+| Single Mac | 19.83 | 20.69 | 627.79 | 128 |
+| TP RDMA | 23.45 | 24.53 | 644.47 | 128 |
+
+Rates are tokens/s. All new requests reached the 128-token cap.
+These are single unseeded requests with previous sweeps as comparators;
+sampled text and stop lengths can differ. Use the alternating greedy runs
+for the controlled estimate of this kernel change.
+
 ## DeepSeek Flash: DSpark
 
 DSpark is a separate support GGUF, not a standalone language model. It proposes

@@ -34,10 +34,12 @@ static void check(uint32_t d, uint32_t o, uint32_t t) {
     require(input && actual && refs[0] && refs[1]);
     for (uint64_t i=0; i<(uint64_t)t*d; i++) input[i]=((int)(rnd()%257)-128)/256.f;
     require(ds4_gpu_tensor_write(x,0,input,(uint64_t)t*d*4));
-    const char *variants[]={"1",NULL,"1",NULL,"1"};
+    const char *variants[]={"scalar","pair","triple","pair","scalar"};
     for (int run=0; run<5; run++) {
-        if (variants[run]) require(setenv("DS4_METAL_DISABLE_Q8_TOKEN_PAIR",variants[run],1)==0);
+        if (!strcmp(variants[run],"scalar")) require(setenv("DS4_METAL_DISABLE_Q8_TOKEN_PAIR","1",1)==0);
         else require(unsetenv("DS4_METAL_DISABLE_Q8_TOKEN_PAIR")==0);
+        if (!strcmp(variants[run],"pair")) require(setenv("DS4_METAL_DISABLE_Q8_TOKEN_TRIPLE","1",1)==0);
+        else require(unsetenv("DS4_METAL_DISABLE_Q8_TOKEN_TRIPLE")==0);
         require(ds4_gpu_tensor_fill_f32(a,NAN,n+16) && ds4_gpu_tensor_fill_f32(b,NAN,n+16));
         require(ds4_gpu_begin_commands());
         require(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(a,map,2*stride,0,d,o,x,t));
@@ -50,16 +52,18 @@ static void check(uint32_t d, uint32_t o, uint32_t t) {
             for (uint64_t i=n; i<n+16; i++) require(isnan(actual[i]));
             if (!run) memcpy(refs[m],actual,n*4);
             else if (memcmp(refs[m],actual,n*4)) {
-                fprintf(stderr,"Mismatch D=%u O=%u T=%u variant=%s matrix=%d\n",d,o,t,variants[run] ? variants[run] : "default",m);
+                fprintf(stderr,"Mismatch D=%u O=%u T=%u variant=%s matrix=%d\n",d,o,t,variants[run],m);
                 exit(1);
             }
         }
     }
     /* Compare fused rounding with the original exact matvec followed by
      * the model's BF16 boundary, including odd token counts and guards. */
-    for (int paired=0; paired<2; paired++) {
+    for (int paired=0; paired<3; paired++) {
         if (paired) unsetenv("DS4_METAL_DISABLE_Q8_TOKEN_PAIR");
         else setenv("DS4_METAL_DISABLE_Q8_TOKEN_PAIR","1",1);
+        if (paired == 1) setenv("DS4_METAL_DISABLE_Q8_TOKEN_TRIPLE","1",1);
+        else unsetenv("DS4_METAL_DISABLE_Q8_TOKEN_TRIPLE");
         require(ds4_gpu_tensor_fill_f32(a,NAN,n+16) && ds4_gpu_tensor_fill_f32(b,NAN,n+16));
         require(ds4_gpu_begin_commands());
         require(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(a,map,2*stride,0,d,o,x,t));
@@ -71,7 +75,7 @@ static void check(uint32_t d, uint32_t o, uint32_t t) {
         require(memcmp(refs[0],actual,n*4)==0);
         for (uint64_t i=n;i<n+16;i++) require(isnan(actual[i]));
     }
-    printf("PASS Q8 D=%u O=%u T=%u exact paired outputs, guards intact\n",d,o,t);
+    printf("PASS Q8 D=%u O=%u T=%u exact scalar/pair/triple outputs, guards intact\n",d,o,t);
     ds4_gpu_tensor_free(a); ds4_gpu_tensor_free(b); ds4_gpu_tensor_free(x);
     free(input); free(actual); free(refs[0]); free(refs[1]);
 }
@@ -79,9 +83,11 @@ int main(void) {
     require(ds4_gpu_init());
     const uint32_t shapes[][3]={{32,1,1},{32,1,2},{64,48,3},{96,63,4},{128,65,5},
         {5120,512,2},{5120,512,3},{5120,512,4},{5120,512,5},{5120,512,6},
-        {1024,8192,2},{5120,65568,2},{5120,65568,3},{2304,5120,2},{128,65,7}};
+        {1024,8192,2},{5120,65568,2},{5120,65568,3},{5120,65568,5},
+        {5120,65568,6},{2304,5120,2},{128,65,7}};
     for (unsigned i=0; i<sizeof(shapes)/sizeof(*shapes); i++) check(shapes[i][0],shapes[i][1],shapes[i][2]);
     unsetenv("DS4_METAL_DISABLE_Q8_TOKEN_PAIR");
+    unsetenv("DS4_METAL_DISABLE_Q8_TOKEN_TRIPLE");
     ds4_gpu_cleanup();
     for (unsigned i=0; i<map_count; i++) free(maps[i]);
     return 0;

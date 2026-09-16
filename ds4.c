@@ -40243,6 +40243,7 @@ typedef struct ds41_dspark {
     uint32_t cache_pos;
     uint64_t allocation_bytes;
     float *logits;
+    float confidence0;
 } ds41_dspark;
 
 #define DS41_VERIFY_ROWS 6u
@@ -42600,7 +42601,9 @@ static bool ds41_dspark_propose(ds41_gpu_graph *target, const ds4_model *base,
         float *bias = d->logits + (size_t)5 * DS4_N_VOCAB;
         float confidence = 0;
         if (ok) ok = ds4_gpu_tensor_read(d->confidence, 0, &confidence, sizeof(confidence));
-        if (ok && !(sigmoid_stable(confidence) >= threshold)) break;
+        const float probability = sigmoid_stable(confidence);
+        if (ok && i == 0) d->confidence0 = probability;
+        if (ok && !(probability >= threshold)) break;
         /* Confidence needs only hidden states and the Markov embedding.
          * Abstaining rows need neither vocabulary projection nor readback;
          * project the head only for rows that will become proposals. */
@@ -85156,7 +85159,9 @@ static int ds41_session_spec_cycle(ds4_session *s, int first_token, int limit,
         s->dspark_stats.total_ms += (now_sec() - started) * 1000.;
     }
     if (getenv("DS4_DSPARK_SPEC_LOG"))
-        fprintf(stderr, "ds4: V4.1 DSpark proposed=%d accepted=%d pos=%u\n", count, matched, g->pos);
+        fprintf(stderr, "ds4: V4.1 DSpark proposed=%d accepted=%d pos=%u confidence0=%.6f draft_ms=%.3f target_ms=%.3f\n", count, matched, g->pos,
+            prepare ? g->dspark->confidence0 : -1.f,
+            (proposed_at - started) * 1000., (now_sec() - proposed_at) * 1000.);
     return emitted;
 }
 #endif

@@ -19788,8 +19788,13 @@ static int ds4_gpu_matmul_q8_0_decode_rows_impl(
         const bool token_pair = n_rows >= 2 && n_rows <= 6 &&
             ds4_gpu_device_is_pre_m5_apple_silicon() &&
             !getenv("DS4_METAL_DISABLE_Q8_TOKEN_PAIR");
+        /* Three rows reuse the large vocabulary projection's weight read.
+         * Four rows still use two pairs: two triples add unused arithmetic
+         * without eliminating a weight pass. */
+        const bool triple = token_pair && (n_rows == 3 || n_rows >= 5) &&
+            !getenv("DS4_METAL_DISABLE_Q8_TOKEN_TRIPLE");
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline(token_pair ? (round_bf16 ? "kernel_mul_mv_q8_0_f32_token_pair_bf16" : "kernel_mul_mv_q8_0_f32_token_pair") :
+            ds4_gpu_get_mul_mv_pipeline(triple ? (round_bf16 ? "kernel_mul_mv_q8_0_f32_token_triple_bf16" : "kernel_mul_mv_q8_0_f32_token_triple") : token_pair ? (round_bf16 ? "kernel_mul_mv_q8_0_f32_token_pair_bf16" : "kernel_mul_mv_q8_0_f32_token_pair") :
                 round_bf16 ? "kernel_mul_mv_q8_0_f32_bf16" : dispatch.function_name, dispatch.nsg);
         if (!pipeline) return 0;
 
@@ -19807,7 +19812,7 @@ static int ds4_gpu_matmul_q8_0_decode_rows_impl(
                 MTLSizeMake(((NSUInteger)out_dim +
                              (NSUInteger)dispatch.nr0 - 1u) /
                                 (NSUInteger)dispatch.nr0,
-                            (NSUInteger)(token_pair ? (n_rows + 1u) / 2u : n_rows),
+                            (NSUInteger)(triple ? (n_rows + 2u) / 3u : token_pair ? (n_rows + 1u) / 2u : n_rows),
                             1)
              threadsPerThreadgroup:
                 MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1)];

@@ -40298,10 +40298,12 @@ static bool ds41_verify_capture(ds41_verify_state *v, ds41_gpu_graph *row,
     bool ok = true;
     if (il == 2 || il == 8 || il == 14) {
         unsigned owner = il == 2 ? 0 : il == 8 ? 1 : 2;
+#ifdef __APPLE__
         if (!getenv("DS4_METAL_DISABLE_V41_POOL_SNAPSHOT"))
             return ds4_gpu_dsv41_pool_snapshot(v->previous_kv[owner],
                 v->previous_score[owner], row->previous_kv[owner],
                 row->previous_score[owner], index) != 0;
+#endif
         ok = ok && ds4_gpu_tensor_copy(v->previous_kv[owner], (uint64_t)index * 512u * 4u,
             row->previous_kv[owner], 0, 512u * 4u) &&
             ds4_gpu_tensor_copy(v->previous_score[owner], (uint64_t)index * 512u * 4u,
@@ -40669,6 +40671,7 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
                               const ds4_tensor *weight, const ds4_gpu_tensor *in,
                               uint32_t count, bool round) {
     const uint32_t width = (uint32_t)weight->dim[0], outputs = (uint32_t)weight->dim[1];
+#ifdef __APPLE__
     if (count == 1 && round && weight->type == DS4_TENSOR_Q8_0 &&
         !getenv("DS4_METAL_DISABLE_V41_ROW_BF16"))
         return ds41_matmul(out, m, weight, in, true);
@@ -40676,6 +40679,7 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
         !getenv("DS4_METAL_DISABLE_V41_BATCH_Q8_BF16"))
         return ds4_gpu_dsv41_q8_rows_bf16(out, m->map, m->size,
             weight->abs_offset, width, outputs, in, count) != 0;
+#endif
     bool ok;
     /* Small decode batches retain scalar reductions before BF16 and sparse
      * routing boundaries. Preserve Metal's separate vocabulary-head dispatch. */
@@ -40808,6 +40812,7 @@ static bool ds41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
 static bool ds41_sum_partial_batch(ds41_gpu_graph *g, ds4_gpu_tensor *x,
                                    uint32_t il, uint32_t count) {
     if (g->tp_world != 2) return true;
+#ifdef __APPLE__
     if (g->tp_verify_ring) {
         const uint32_t step = g->tp_verify_step++, slot = step % 2u;
         const uint64_t bytes = (uint64_t)count * DS4_N_EMBD * sizeof(float);
@@ -40818,6 +40823,7 @@ static bool ds41_sum_partial_batch(ds41_gpu_graph *g, ds4_gpu_tensor *x,
                                g->tp_rank ? out : in, count * DS4_N_EMBD);
     }
 
+#endif
     /* Q is dead after attention; its expert-output alias is dead after the
      * routed reduction. Reuse it for the peer, without another large buffer. */
     ds4_gpu_tensor *peer = g->batch.q;
@@ -41025,18 +41031,23 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     if ((!prepared && (!ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
         !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
         !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0))) ||
-        ((prepared_inputs & DS41_ATTN_WINDOW_UNDO) ?
+        (
+#ifdef __APPLE__
+        (prepared_inputs & DS41_ATTN_WINDOW_UNDO) ?
             !ds4_gpu_dsv41_window_push(g->window[il], g->verify->window_undo[il],
                 g->kv, pos % 128u, pos - g->verify->start) :
+#endif
             !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
                 g->kv, 0, 512u * 4u)) ||
         !ds41_attention_publish_impl(g, m, l, il, auxiliary) ||
         !ds41_attention_select_published_impl(g, m, l, il, auxiliary)) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
+#ifdef __APPLE__
     if (prepared_inputs & DS41_ATTN_STAGE_VERIFY)
         return ds4_gpu_dsv41_verify_attention_stage(g->verify->attention_kv,
             g->window[il], (pos + 1u) % 128u, g->compressed[owner], g->selected_comp,
             attended, pos - g->verify->start) != 0;
+#endif
     bool direct_stage = false;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     direct_stage = n_comp && !g->quality && ds4_gpu_device_is_pre_m5_apple_silicon() &&
@@ -41069,7 +41080,9 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     ds4_gpu_tensor *out = g->block;
     if (g->tp_world == 2) {
         out = g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN];
+#ifdef __APPLE__
         ds4_gpu_tp_flag_fold_request(il, DS4_TP_GATE_ATTN);
+#endif
     }
     return ds41_attention_output(g, m, l, out) &&
            ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
@@ -41170,8 +41183,13 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     /* Keep the shared expert's BF16 boundary, then include it exactly once
      * in the existing F32 reduction. Alternate ownership across layers. */
     if (shared_owner && g->tp_rank == (il & 1u) &&
+#ifdef __APPLE__
         !ds4_gpu_add_tensor_tp_flag(routed, routed, g->shared,
-            DS4_N_EMBD, il, DS4_TP_GATE_FFN)) return false;
+            DS4_N_EMBD, il, DS4_TP_GATE_FFN)
+#else
+        !ds4_gpu_add_tensor(routed, routed, g->shared, DS4_N_EMBD)
+#endif
+        ) return false;
     return true;
 }
 
@@ -42466,6 +42484,7 @@ static bool ds41_graph_prefill(ds41_gpu_graph *g, const ds4_model *m,
     return ds41_graph_prefill_sweep(g, m, w, tokens, count, progress, progress_ud,
                                    total, cancel, cancel_ud, false, false);
 }
+#ifdef __APPLE__
 static bool ds41_dspark_ready(const ds41_gpu_graph *g) {
     const ds41_dspark *d = g->dspark;
     if (!d || g->pos < 2 || !g->valid || g->image_count) return false;
@@ -42664,6 +42683,8 @@ static bool ds41_dspark_propose(ds41_gpu_graph *target, const ds4_model *base,
     return ok;
 }
 
+#endif
+
 static ds41_gpu_graph *ds41_batch_workspace(ds41_gpu_graph *const *graphs, int count) {
     if (!graphs || count < 2 || count > DS4_TP_BATCH_MAX_ROWS) return NULL;
     ds41_gpu_graph *largest = NULL;
@@ -42710,6 +42731,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                                    uint32_t prefill_rows,
                                    const ds4_model *model, const ds4_weights *weights,
                                    ds41_verify_state *verify) {
+#ifndef __APPLE__
+    if (verify) return false;
+#endif
     if (!graphs || !tokens || count < 2 || count > DS4_TP_BATCH_MAX_ROWS ||
         (verify ? (prefill_rows != (uint32_t)count || count > (int)DS41_VERIFY_ROWS) :
                   prefill_rows > (uint32_t)count)) return false;
@@ -42824,6 +42848,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         /* Each row stages its keys while its causal ring state is still live.
          * Fixed 128/640-key rows can share a dispatch without padding or
          * changing the scalar attention's split-K reduction. */
+#ifdef __APPLE__
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         const bool batch_attention = verify && batch_finish && positions[0] >= 127u &&
             (!ratio || (positions[0] + 1u) / ratio >= DS4_N_INDEXER_TOP_K) &&
@@ -42831,6 +42856,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             !getenv("DS4_METAL_DISABLE_V41_VERIFY_ATTN_BATCH") &&
             !getenv("DS4_METAL_DISABLE_V41_DIRECT_KV_STAGE") &&
             !getenv("DS4_METAL_FLASH_NWG");
+#else
+        const bool batch_attention = false;
+#endif
         for (int i = 0; ok && i < count; i++) {
             ds41_gpu_graph row = *graphs[i];
             row.pos = positions[i];
@@ -42849,21 +42877,25 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                 (batch_output || ds41_attention_output(&row, model, l, row.block));
             if (ok && verify) ok = ds41_verify_capture(verify, &row, il, (uint32_t)i);
         }
+#ifdef __APPLE__
         if (ok && batch_attention)
             ok = ds4_gpu_dsv41_verify_attention(active.heads, model->map, model->size,
                 l->attn_sinks->abs_offset + (uint64_t)g->tp_rank *
                     (DS4_N_HEAD / g->tp_world) * sizeof(float),
                 active.q, verify->attention_kv, ratio ? DS4_N_INDEXER_TOP_K : 0u,
                 DS4_N_HEAD / g->tp_world, rows) != 0;
+#endif
         if (ok && batch_finish)
             ok = ds4_gpu_dsv41_quantize(active.heads,
                     DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM, rows, DS4_V41_BF16) &&
                 ds4_gpu_dsv41_rope(active.heads, DS4_N_HEAD_DIM, DS4_N_HEAD / g->tp_world,
                     rows, positions[0], ds4_layer_compress_ratio(il) != 0, true);
+#ifdef __APPLE__
         if (ok && batch_output)
             ok = ds4_gpu_dsv41_attention_output_verify(active.block, active.low,
                 model->map, model->size, l->attn_output_a->abs_offset,
                 l->attn_output_b->abs_offset, active.heads, rows, g->tp_world, g->tp_rank);
+#endif
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
         DS41_VERIFY_STAGE(1);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
@@ -42967,6 +42999,7 @@ static bool ds41_graph_short_prefill(ds41_gpu_graph *g, const ds4_model *m,
     if (!ok) g->valid = false;
     return ok;
 }
+#ifdef __APPLE__
 static bool ds41_verify_run(ds41_gpu_graph *g, const ds4_model *model,
                              const ds4_weights *weights, const int *tokens, uint32_t count) {
     if (count < 2 || count > DS41_VERIFY_ROWS || count > g->ctx - g->pos ||
@@ -43040,6 +43073,7 @@ static bool ds41_verify_commit(ds41_gpu_graph *g, uint32_t count, float *logits)
     return ok;
 }
 
+#endif /* __APPLE__: DSpark verification */
 #undef DS41_PREFILL_ROWS
 #undef DS41_PREFILL_ALIASES
 #undef DS41_PREFILL_STORAGE
@@ -71287,6 +71321,7 @@ static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cach
         host, ds4_gpu_recommended_working_set_size());
 }
 
+#ifdef __APPLE__
 static bool ds41_session_prepare_verify(ds4_session *s) {
     ds41_gpu_graph *g = &s->ds41_graph;
     if (g->verify) return true;
@@ -71297,7 +71332,8 @@ static bool ds41_session_prepare_verify(ds4_session *s) {
     s->engine->ds41_session_bytes += DS41_VERIFY_BYTES;
     return true;
 }
-#endif
+#endif /* __APPLE__: DSpark verifier admission */
+#endif /* DS4_HAS_DEEPSEEK41_GPU */
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     return ds4_engine_open_internal(out, opt, NULL);
@@ -71477,13 +71513,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
                  false) &&
             opt->distributed.role == DS4_DISTRIBUTED_NONE &&
             !load_slice && !opt->glm_mtp &&
+            (!opt->dspark || e->backend == DS4_BACKEND_METAL) &&
             !opt->first_token_test && !opt->metal_graph_test &&
             ((!opt->mtp_path || !opt->mtp_path[0]) || opt->dspark) &&
             (!opt->directional_steering_file || !opt->directional_steering_file[0]) &&
             e->power_percent == 100 && opt->context_size <= 1048576;
         if (!supported) {
             fprintf(stderr, "ds4: V4.1 requires Metal or single-GPU CUDA per rank (optional network tensor parallelism); "
-                            "steering and legacy diagnostics are not supported (maximum context 1048576)\n");
+                            "DSpark requires Metal; steering and legacy diagnostics are not supported (maximum context 1048576)\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;

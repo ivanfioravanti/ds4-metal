@@ -421,6 +421,17 @@ request per point; use the repeated greedy measurements above to estimate
 the optimization gain, rather than attributing sampled sweep differences
 entirely to the implementation.
 
+The branch was then rebased onto main `f396751`. Metal-only draft/verification
+encoders remain guarded from the new V4.1 CUDA path; ordinary CUDA output
+projection and short-prefill behavior are retained. Both Macs rebuilt, and
+the attention tests, short/16K/32K single/TP oracles, and resident/SSD state
+checks passed again. Post-rebase screening measured 27.35 tok/s single-node
+and 31.17 tok/s TP on the same 7,956-token/512-output greedy workload. CPU,
+non-Apple GPU, and ROCm C syntax checks passed; the non-Apple object introduced
+no external symbols relative to main. These source checks are not CUDA
+hardware validation. The post-rebase regression run retained the same nine
+known assertions and no new ones; the seven targeted tests also passed again.
+
 ## DeepSeek Flash: DSpark
 
 DSpark is a separate support GGUF, not a standalone language model. It proposes

@@ -357,6 +357,70 @@ varies, and isolated better points do not overturn the repeated greedy result.
 | 128K | 24.81 / 23.85 | 26.68 / 27.49 |
 | 256K | 20.69 / 21.23 | 24.53 / 23.56 |
 
+### Batched attention and expert-kernel investigation
+
+The pre-M5 Metal verifier now stages each candidate's causal keys before the
+next candidate changes the raw ring, then batches fixed 128/640-key attention
+rows through the existing vector kernel. The split-K reduction and key order
+are unchanged. Unsupported short shapes retain the scalar path. The drafter
+stages its shared past-plus-five-draft keys once per stage and batches all five
+queries. Its noncausal draft attention remains distinct from target verification.
+The verifier adds 3.75 MiB of causal-key staging storage per workspace.
+
+Controlled 7,956-token prompt / 512 greedy output comparisons on two M3 Ultra
+80-core, 512 GiB Macs used the original Q4_K support drafter, confidence 0.6,
+327,680-token allocation, and three alternating before/after trials per mode.
+These timings exclude prefill; medians are not claims about other prompts.
+
+| Configuration | Original DSpark | Batched attention | Change |
+| --- | ---: | ---: | ---: |
+| Single node | 27.14 tok/s | 27.34 tok/s | +0.74% |
+| Two nodes, TP RDMA | 30.73 tok/s | 31.15 tok/s | +1.37% |
+
+Single-node drafting fell from 2,045 to 1,920 ms per 512 outputs; TP drafting
+fell from 2,067 to 1,944 ms. TP verification fell from 9,448 to 9,335 ms. The
+verifier-only ablation did not help single-node throughput (27.14 to 27.09),
+but improved TP (30.64 to 30.97). The combined gain remains modest.
+Proposal and acceptance counts were unchanged: TP computed five draft hidden
+positions on each eligible attempt, submitted 234 candidates, and accepted 194
+across 318 cycles. Confidence abstentions still consume draft computation.
+At fixed acceptance and otherwise unchanged execution, subtracting the entire
+1.94-second draft cost from the 16.43-second generation time would reach only
+about 35.3 tok/s. That estimate explains why verification and accepted tokens
+per cycle matter more than further small drafter savings.
+
+A GPU encoder trace identified the Q4 verifier gate/up and down projections as
+major remaining costs. Trace pass boundaries perturb execution; kernel spans
+are diagnostic rankings, not removable production time. Two further experiments
+were rejected and are absent from the release path:
+
+- Sharing matching expert weights across two verifier tokens preserved exact
+  gate/up/weighted-activation/output values for zero through six overlapping
+  routes, and passed full-model single/TP oracles. It regressed single-node
+  medians from 27.35 to 26.38 tok/s; the first TP pair regressed 31.30 to 30.05.
+- Fixed-inner-dimension Q4 expert specializations passed the same raw tests,
+  but a TP screening pair measured 31.24 versus 31.15 tok/s. They were not kept.
+
+`make test-deepseek41-attention` compares scalar and batched attention bit for
+bit for 32/64 heads, two through six verifier rows, raw-ring wrap and staged-key
+isolation, and ten drafter key counts spanning padding boundaries. Diagnostic
+ablations are `DS4_METAL_DISABLE_V41_VERIFY_ATTN_BATCH=1` and
+`DS4_METAL_DISABLE_V41_DRAFT_ATTN_BATCH=1`; normal operation needs neither.
+
+Validation also passed single-node and TP RDMA full-model oracles, a TCP TP
+oracle, forced six-row verification at 16K/32K, sampled RNG/frontier checks,
+and ordinary resident/SSD state comparisons. The regression run retained the
+same nine previously recorded assertions, with no new assertion failures;
+seven additional targeted tests passed. CUDA runtime was not tested.
+
+The cold HTTP context sweep completed all ten sizes from 512 through 256K on
+both single-node and TP RDMA, with 128 output tokens at every point. At the
+254,680-token prompt, single-node prefill/decode measured 628.04/21.10 tok/s
+and TP measured 643.82/24.85 tok/s. These were one unseeded temperature-0.7
+request per point; use the repeated greedy measurements above to estimate
+the optimization gain, rather than attributing sampled sweep differences
+entirely to the implementation.
+
 ## DeepSeek Flash: DSpark
 
 DSpark is a separate support GGUF, not a standalone language model. It proposes

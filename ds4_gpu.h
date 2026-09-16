@@ -85,6 +85,21 @@ int ds4_gpu_dsv41_attention_output_verify(
     ds4_gpu_tensor *out, ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
     uint64_t out_a_offset, uint64_t out_b_offset, const ds4_gpu_tensor *heads,
     uint32_t rows, uint32_t world, uint32_t rank);
+/* The five draft queries share one noncausal cache/KV staging pass. */
+int ds4_gpu_dsv41_draft_attention(ds4_gpu_tensor *heads,
+    const void *model_map, uint64_t model_size, uint64_t sinks_offset,
+    const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw, uint32_t n_raw,
+    const ds4_gpu_tensor *draft_kv);
+/* Stage each verifier row before later candidates overwrite its ring keys.
+ * Batched attention then uses the ordinary per-head reduction tree. */
+int ds4_gpu_dsv41_verify_attention_stage(ds4_gpu_tensor *staged,
+    const ds4_gpu_tensor *raw, uint32_t raw_start,
+    const ds4_gpu_tensor *comp, const ds4_gpu_tensor *ids,
+    uint32_t n_comp, uint32_t row);
+int ds4_gpu_dsv41_verify_attention(ds4_gpu_tensor *heads,
+    const void *model_map, uint64_t model_size, uint64_t sinks_offset,
+    const ds4_gpu_tensor *q, const ds4_gpu_tensor *staged,
+    uint32_t n_comp, uint32_t n_head, uint32_t rows);
 int ds4_gpu_dsv41_pool_snapshot(ds4_gpu_tensor *saved_kv, ds4_gpu_tensor *saved_score,
         const ds4_gpu_tensor *kv, const ds4_gpu_tensor *score, uint32_t row);
 int ds4_gpu_dsv41_window_push(ds4_gpu_tensor *window, ds4_gpu_tensor *undo,

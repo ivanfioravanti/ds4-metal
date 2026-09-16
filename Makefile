@@ -247,6 +247,13 @@ test-q8-decode-rows: tests/test_q8_decode_rows
 	DS4_METAL_Q8_MV_NSG=2 ./tests/test_q8_decode_rows
 	DS4_METAL_Q8_MV_NSG=4 ./tests/test_q8_decode_rows
 
+tests/test_deepseek41_attention: tests/test_deepseek41_attention.c $(CORE_OBJS)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
+
+.PHONY: test-deepseek41-attention
+test-deepseek41-attention: tests/test_deepseek41_attention
+	./tests/test_deepseek41_attention
+
 tests/test_deepseek41_graph.o: tests/test_deepseek41_graph.c ds4.c ds4_gpu.h ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
@@ -1089,7 +1096,7 @@ clean:
 	rm -f tests/test_cuda_ssd_repack
 	rm -f tests/test_deepseek41_gguf
 	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli
-	rm -f tests/test_deepseek41_prefill tests/test_deepseek41_dspark tests/test_q8_decode_rows
+	rm -f tests/test_deepseek41_prefill tests/test_deepseek41_dspark tests/test_deepseek41_attention tests/test_q8_decode_rows
 	rm -f tests/test_metal_tp_bulk
 	rm -f tests/test_cuda_q8_scratch
 	rm -f tests/test_cuda_dspark_moe

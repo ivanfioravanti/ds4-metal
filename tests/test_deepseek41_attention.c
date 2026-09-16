@@ -1,5 +1,5 @@
 /* Exact batched DSpark attention against the scalar kernel, including
- * causal ring staging and the drafter's shared noncausal keys. */
+ * causal ring staging, shared draft keys, and fused vocabulary selection. */
 #define _DARWIN_C_SOURCE
 #include "ds4_gpu.h"
 #include <stdio.h>
@@ -80,6 +80,36 @@ static int draft_cases(void *map) {
  return 0;
 }
 
+static void selection_cases(void) {
+    const uint32_t sizes[] = {1, 31, 256, 1023, 1024, 1025, 129280};
+    for (size_t c = 0; c < sizeof(sizes) / sizeof(*sizes); c++) {
+        const uint32_t n = sizes[c];
+        for (unsigned ties = 0; ties < 3; ties++) {
+            ds4_gpu_tensor *a = floats(n), *b = floats(n), *sum = floats(n);
+            ds4_gpu_tensor *scratch = ds4_gpu_tensor_alloc(((n + 1023u) / 1024u) * 8u);
+            ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(8), *ref = ds4_gpu_tensor_alloc(4);
+            CHECK(scratch && out && ref);
+            float *x = ds4_gpu_tensor_contents(a), *y = ds4_gpu_tensor_contents(b);
+            if (ties == 1) for (uint32_t i = 0; i < n; i++) { x[i] = 1; y[i] = 0; }
+            if (ties == 2) { x[0] = x[n - 1] = 1000; y[0] = y[n - 1] = 0; }
+            const uint32_t guard = 0x12345678u;
+            CHECK(ds4_gpu_tensor_write(out, 4, &guard, 4));
+            CHECK(ds4_gpu_begin_commands());
+            CHECK(ds4_gpu_add_tensor(sum, a, b, n));
+            CHECK(ds4_gpu_argmax_tensor(ref, sum, n));
+            CHECK(ds4_gpu_dsv41_add_argmax(out, scratch, a, b, n));
+            CHECK(ds4_gpu_end_commands());
+            uint32_t actual[2], expected;
+            CHECK(ds4_gpu_tensor_read(out, 0, actual, sizeof(actual)));
+            CHECK(ds4_gpu_tensor_read(ref, 0, &expected, sizeof(expected)));
+            CHECK(actual[0] == expected && actual[1] == guard);
+            printf("PASS draft selection n=%u ties=%u token=%u, guard intact\n", n, ties, expected);
+            ds4_gpu_tensor_free(a); ds4_gpu_tensor_free(b); ds4_gpu_tensor_free(sum);
+            ds4_gpu_tensor_free(scratch); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(ref);
+        }
+    }
+}
+
 int main(void) {
  CHECK(ds4_gpu_init());
  void *map=0;CHECK(!posix_memalign(&map,getpagesize(),getpagesize()));memset(map,0,getpagesize());
@@ -87,5 +117,6 @@ int main(void) {
  CHECK(ds4_gpu_set_model_map(map,getpagesize()));
  CHECK(verify_cases(map)==0);
  CHECK(draft_cases(map)==0);
+ selection_cases();
  ds4_gpu_cleanup();free(map);return 0;
 }

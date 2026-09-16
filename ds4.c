@@ -40256,6 +40256,7 @@ typedef struct ds41_verify_state {
     ds4_engram_history history[DS41_VERIFY_ROWS];
     uint32_t start, count;
     float *host_logits;
+    const float *ready_logits;
 } ds41_verify_state;
 
 static void ds41_verify_free(ds41_verify_state *v) {
@@ -42533,6 +42534,15 @@ static bool ds41_dspark_update_cache(ds41_gpu_graph *target, const ds4_model *m,
     return ok;
 }
 
+static bool ds41_dspark_confidence(ds41_dspark *d, const ds4_model *m,
+        const ds4_dspark_weights *dw, unsigned row, int previous) {
+    return ds4_gpu_embed_token_hc_tensor(d->markov_embed, m->map, m->size,
+        dw->stage[2].markov_w1->abs_offset, DS4_N_VOCAB, (uint32_t)previous, 256, 1) &&
+        ds4_gpu_tensor_copy(d->confidence_input, 0, d->scratch.rows_view[row].x, 0, DS4_N_EMBD * 4u) &&
+        ds4_gpu_tensor_copy(d->confidence_input, DS4_N_EMBD * 4u, d->markov_embed, 0, 256u * 4u) &&
+        ds41_matmul(d->confidence, m, dw->stage[2].confidence_proj, d->confidence_input, false);
+}
+
 static bool ds41_dspark_propose(ds41_gpu_graph *target, const ds4_model *base,
                                  const ds4_weights *weights, const ds4_model *m,
                                  const ds4_dspark_weights *dw, int seed, float threshold,
@@ -42556,9 +42566,11 @@ static bool ds41_dspark_propose(ds41_gpu_graph *target, const ds4_model *base,
     for (unsigned i = 0; ok && i < 5; i++) {
         ds41_prefill_row *r = &g->rows_view[i];
         ok = ds4_gpu_tensor_write(r->pre, 0, initial_pre, sizeof(initial_pre)) &&
-            ds4_gpu_embed_token_hc_tensor(r->residual, base->map, base->size,
+            ((i > 1 && !getenv("DS4_METAL_DISABLE_V41_DRAFT_NOISE_REUSE")) ?
+             ds4_gpu_tensor_copy(r->residual, 0, g->rows_view[1].residual, 0, DS4_N_EMBD * 4u * sizeof(float)) :
+             ds4_gpu_embed_token_hc_tensor(r->residual, base->map, base->size,
                 weights->token_embd->abs_offset, DS4_N_VOCAB,
-                i ? dw->noise_token_id : (uint32_t)seed, DS4_N_EMBD, 4);
+                i ? dw->noise_token_id : (uint32_t)seed, DS4_N_EMBD, 4));
     }
     for (unsigned stage = 0; ok && stage < 3; stage++) {
         const ds4_layer_weights *l = &dw->stage[stage].block;
@@ -42619,17 +42631,18 @@ static bool ds41_dspark_propose(ds41_gpu_graph *target, const ds4_model *base,
         ok = ds41_hc_sum_bf16(r->x, r->residual, r->ffn_split, true) &&
             ds41_norm(r->norm, r->x, m, dw->stage[2].norm);
     }
+    /* The first confidence input is ready in this submission; later rows
+     * depend on the preceding selected token. */
+    const bool first_confidence = !getenv("DS4_METAL_DISABLE_V41_DRAFT_FIRST_CONFIDENCE");
+    if (ok && first_confidence) ok = ds41_dspark_confidence(d, m, dw, 0, seed);
     if (!ds4_gpu_end_commands()) ok = false;
     const bool gpu_select = !getenv("DS4_METAL_DISABLE_V41_DRAFT_GPU_SELECT");
     int previous = seed;
     for (unsigned i = 0; ok && i < 5; i++) {
-        ok = ds4_gpu_begin_commands() &&
-            ds4_gpu_embed_token_hc_tensor(d->markov_embed, m->map, m->size,
-                dw->stage[2].markov_w1->abs_offset, DS4_N_VOCAB, (uint32_t)previous, 256, 1) &&
-            ds4_gpu_tensor_copy(d->confidence_input, 0, g->rows_view[i].x, 0, DS4_N_EMBD * 4u) &&
-            ds4_gpu_tensor_copy(d->confidence_input, DS4_N_EMBD * 4u, d->markov_embed, 0, 256u * 4u) &&
-            ds41_matmul(d->confidence, m, dw->stage[2].confidence_proj, d->confidence_input, false);
-        if (!ds4_gpu_end_commands()) ok = false;
+        if (i || !first_confidence) {
+            ok = ds4_gpu_begin_commands() && ds41_dspark_confidence(d, m, dw, i, previous);
+            if (!ds4_gpu_end_commands()) ok = false;
+        }
         float *bias = d->logits + (size_t)5 * DS4_N_VOCAB;
         float confidence = 0;
         if (ok) ok = ds4_gpu_tensor_read(d->confidence, 0, &confidence, sizeof(confidence));
@@ -42653,9 +42666,10 @@ static bool ds41_dspark_propose(ds41_gpu_graph *target, const ds4_model *base,
                 ds4_gpu_tensor *head = ds4_gpu_tensor_view(d->head_logits,
                     lazy_head ? 0 : (uint64_t)i * DS4_N_VOCAB * 4u,
                     (uint64_t)DS4_N_VOCAB * 4u);
-                ok = head && ds4_gpu_add_tensor(d->markov_logits,
-                    d->markov_logits, head, DS4_N_VOCAB) &&
-                    ds4_gpu_argmax_tensor(d->confidence, d->markov_logits, DS4_N_VOCAB);
+                ok = head && (!getenv("DS4_METAL_DISABLE_V41_DRAFT_FUSED_SELECT") ?
+                    ds4_gpu_dsv41_add_argmax(d->confidence, d->confidence_input, d->markov_logits, head, DS4_N_VOCAB) :
+                    ds4_gpu_add_tensor(d->markov_logits, d->markov_logits, head, DS4_N_VOCAB) &&
+                    ds4_gpu_argmax_tensor(d->confidence, d->markov_logits, DS4_N_VOCAB));
                 ds4_gpu_tensor_free(head);
             }
             if (!ds4_gpu_end_commands()) ok = false;
@@ -43030,7 +43044,14 @@ static bool ds41_verify_run(ds41_gpu_graph *g, const ds4_model *model,
     if (tp_ring && !ds4_tp_batch_block_end(g_tp_block_ctx)) ok = false;
     if (ok && tp_ring && g->tp_verify_step != 2u * DS4_N_LAYER) ok = false;
     g->tp_verify_ring = false;
-    if (ok) ok = ds4_gpu_tensor_read(v->logits, 0, v->host_logits, (uint64_t)count * DS4_N_VOCAB * 4u);
+    /* The command buffer is complete. Reading Metal shared storage avoids
+     * copying every candidate vocabulary row before CPU verification. */
+    v->ready_logits = !getenv("DS4_METAL_DISABLE_V41_VERIFY_LOGITS_VIEW") ?
+        ds4_gpu_tensor_contents(v->logits) : NULL;
+    if (!v->ready_logits) {
+        if (ok) ok = ds4_gpu_tensor_read(v->logits, 0, v->host_logits, (uint64_t)count * DS4_N_VOCAB * 4u);
+        v->ready_logits = v->host_logits;
+    }
     if (!ok) g->valid = false;
     return ok;
 }
@@ -43068,7 +43089,7 @@ static bool ds41_verify_commit(ds41_gpu_graph *g, uint32_t count, float *logits)
     if (ok) {
         g->pos = v->start + count;
         g->history = v->history[index];
-        memcpy(logits, v->host_logits + (size_t)index * DS4_N_VOCAB, DS4_N_VOCAB * 4u);
+        memcpy(logits, v->ready_logits + (size_t)index * DS4_N_VOCAB, DS4_N_VOCAB * 4u);
     } else g->valid = false;
     return ok;
 }
@@ -85112,7 +85133,7 @@ static int ds41_session_verify_drafts(ds4_session *s, int seed, const int *draft
     int emitted = 1, correction = -1;
     if (ok) {
         for (int i = 0; i < count; i++) {
-            const float *logits = g->verify->host_logits + (size_t)i * DS4_N_VOCAB;
+            const float *logits = g->verify->ready_logits + (size_t)i * DS4_N_VOCAB;
             const int next = sampling ? ds4_sample_logits(logits, DS4_N_VOCAB,
                 sampling->temperature, sampling->top_k, sampling->top_p, sampling->min_p, sampling->rng) :
                 ds41_logits_argmax(e, logits, ignore_eos, think_mode);

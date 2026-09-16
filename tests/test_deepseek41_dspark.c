@@ -32,7 +32,8 @@ int main(int argc, char **argv) {
     ds4_tokens prompt = {0};
     int rc = 1;
     const bool long_context = getenv("DS4_TEST_V41_LONG_CONTEXT") != NULL;
-    const int context = long_context ? 65536 : 4096;
+    const bool context_8k = getenv("DS4_TEST_V41_8K") != NULL;
+    const int context = context_8k ? 16384 : long_context ? 65536 : 4096;
     ds4_engine_options opt = {.model_path = argv[1], .mtp_path = argv[2],
         .backend = DS4_BACKEND_METAL, .context_size = context, .power_percent = 100, .dspark = true};
     if (argc == 8) {
@@ -61,17 +62,18 @@ int main(int argc, char **argv) {
     CHECK(ds4_session_create(&control, e, context) == 0);
     CHECK(ds4_session_create(&candidate, e, context) == 0);
     ds4_encode_chat_prompt(e, NULL, text, DS4_THINK_NONE, &prompt);
-    CHECK(prompt.len > (long_context ? 32767 : 2047));
+    CHECK(prompt.len > (context_8k ? 8191 : long_context ? 32767 : 2047));
     const int short_prefixes[] = {18, 127, 128, 129, 511, 2047, 127};
     const int long_prefixes[] = {16383, 32767};
-    const int *prefixes = long_context ? long_prefixes : short_prefixes;
-    const unsigned prefix_count = long_context ? 2 : 7;
+    const int prefixes_8k[] = {4095, 8191};
+    const int *prefixes = context_8k ? prefixes_8k : long_context ? long_prefixes : short_prefixes;
+    const unsigned prefix_count = context_8k || long_context ? 2 : 7;
     const float confidence = e->dspark_confidence_threshold;
     unsigned cycles = 0, accepted_drafts = 0;
     for (unsigned p = 0; p < prefix_count; p++) {
         /* Force all five proposals across a ring wrap, including rejected
          * suffixes. Ordinary confidence filtering rarely exercises six rows. */
-        const bool full_width = long_context || p == 6;
+        const bool full_width = context_8k || long_context || p == 6;
         e->dspark_confidence_threshold = full_width ? 0.f : confidence;
         ds4_session_invalidate(control);
         ds4_session_invalidate(candidate);

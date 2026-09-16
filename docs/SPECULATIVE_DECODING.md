@@ -467,6 +467,78 @@ Recorded comparisons are in [the QA guide](../QA_BEFORE_RELEASES.md).
 
 For the tested Strix Halo coding configuration, use `--dspark --dspark-confidence 0.7` with the default five-token draft cap and scheduler. Client sampling is temperature `1.0`, `top_p=0.95`, `min_p=0`, and `top_k=0`; high reasoning was also checked on coding and tool-use requests. This uses opportunistic sampling as described below; exact-mode throughput is not qualified by these measurements. `--mtp-draft` controls legacy autoregressive MTP, not the DSpark draft width.
 
+## DeepSeek V4.1 Metal: bounded speculative decode experiments
+
+The September 16, 2026 round tested ten additional ideas on two 80-core
+M3 Ultras over TP RDMA, using the V4.1 Flash Q4 target and Q4_K DSpark
+support model. Prompts were limited to 8K. This is a native greedy DSpark
+decode comparison, not a cold HTTP prefill benchmark.
+
+| Candidate | Screen and decision |
+| --- | --- |
+| Position-dependent confidence | Three threshold combinations: 28.07–31.34 tokens/s; removed. Longer drafts cost more verification than they saved. |
+| Submit first confidence with draft stages | Retained; removes a command submission without changing the dependency chain. |
+| Concurrent vocabulary and Markov projections | 32.30 tokens/s; no established improvement, removed. |
+| Fused vocabulary addition and argmax | Retained; preserves finite-logit addition and lowest-index tie selection. |
+| Read completed shared verifier logits directly | Retained; copies only the committed vocabulary row. |
+| Reuse identical noise-token embeddings | Retained; copies the first noise embedding to the remaining rows. |
+| Coalesce verifier undo snapshots | 32.11 tokens/s; removed. |
+| Concurrent drafter cache projections | 32.29 tokens/s; no established improvement, removed. |
+| Verifier command flush interval | Intervals 1, 2, 4: 32.21–32.42 tokens/s; repeat confirmation did not justify retaining. |
+| Verifier Q4 gate/up kernel geometry | NSG 1, 4, 8: 32.14–32.41 tokens/s; repeat confirmation did not justify retaining. |
+
+The screen used 7,956 prompt tokens and 256 generated tokens, 16 settings
+and five interleaved controls. Controls ranged from 31.05 to 32.35 tokens/s;
+small differences in that screen alone are not evidence of a speedup.
+Confirmation used 512 generated tokens and three alternating trials per
+configuration. Baseline throughput was 31.00, 30.90, 31.08 tokens/s;
+the four retained changes together reached 31.22, 31.22, 31.29 tokens/s.
+Median improvement is **0.71%**, from **31.00 to 31.22 tokens/s**.
+Adding the flush/geometry settings reduced the median to 31.13 tokens/s.
+
+Median draft time fell from 1,947.362 to 1,868.519 ms (4.05%); verification
+was essentially unchanged, 9,375.393 versus 9,379.625 ms. Both configurations
+used 318 cycles, proposed 234 tokens and accepted 194 for 512 outputs.
+The 50 tokens/s goal was not reached. Eliminating the entire measured
+draft phase would still only yield approximately 35 tokens/s on this trace;
+verification cost and useful tokens per cycle need more substantial work.
+
+The retained changes are enabled by default. Independent diagnostic
+fallbacks are `DS4_METAL_DISABLE_V41_DRAFT_FIRST_CONFIDENCE=1`,
+`DS4_METAL_DISABLE_V41_DRAFT_FUSED_SELECT=1`,
+`DS4_METAL_DISABLE_V41_VERIFY_LOGITS_VIEW=1`, and
+`DS4_METAL_DISABLE_V41_DRAFT_NOISE_REUSE=1`.
+Setting all four restores this round's baseline execution paths.
+
+`DS4_TEST_V41_8K=1` selects 4K/8K boundary cases in the V4.1 DSpark oracle
+without running the larger `DS4_TEST_V41_LONG_CONTEXT` cases. The Metal
+attention test also checks fused selection against the existing GPU
+addition/argmax for 21 random, tied and boundary-size cases.
+
+Validation on the retained paths passed all 51 attention/selection cases,
+short and 4K/8K single-node and TP oracles (including greedy tokens, sampled
+tokens, RNG and target state), and ordinary resident/SSD state comparisons.
+CPU-only, non-Apple and ROCm-preprocessor C syntax checks passed; CUDA
+hardware was not available for runtime validation.
+
+The final native sweep generated 256 greedy tokens per point. Before/after
+output text hashes matched at all five contexts within each execution mode.
+These single trials complement, rather than replace, the repeated 8K test.
+
+| Prompt tokens | Single before | Single after | TP before | TP after |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 28.68 | 28.82 | 33.48 | 33.58 |
+| 1,024 | 27.32 | 27.51 | 31.60 | 31.65 |
+| 2,048 | 27.76 | 27.93 | 31.25 | 31.66 |
+| 4,096 | 27.73 | 27.98 | 31.84 | 31.97 |
+| 8,192 | 25.52 | 25.80 | 30.17 | 30.51 |
+
+The session-snapshot regression passed. The server unit group still fails
+the pre-existing `DS4_THINK_MAX` / 32,768-context expectation; the identical
+failure is recorded in the preceding round's post-rebase baseline log.
+No server or thinking-policy code changed in this round. The full long-context
+regression suite was not repeated because experiments were capped at 8K.
+
 ## GLM: built-in MTP
 
 GLM's draft block is already in its main GGUF:

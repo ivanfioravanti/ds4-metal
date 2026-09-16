@@ -81,6 +81,10 @@ int ds4_gpu_flush_commands(void);
 int ds4_gpu_commands_active(void);
 #include "ds4_deepseek41_gpu.h"
 #ifdef __APPLE__
+/* Exact sum and lowest-index argmax for finite draft vocabulary logits.
+ * Scratch holds ceil(count/1024) pairs of F32 score and U32 token. */
+int ds4_gpu_dsv41_add_argmax(ds4_gpu_tensor *out, ds4_gpu_tensor *scratch,
+    const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t count);
 int ds4_gpu_dsv41_attention_output_verify(
     ds4_gpu_tensor *out, ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
     uint64_t out_a_offset, uint64_t out_b_offset, const ds4_gpu_tensor *heads,

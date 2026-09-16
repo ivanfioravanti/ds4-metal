@@ -326,3 +326,43 @@ kernel void kernel_dsv41_pool_snapshot(device uint *saved_kv,
     saved_kv[gid] = kv[gid];
     saved_score[gid] = score[gid];
 }
+
+struct ds41_select_pair { float value; uint index; };
+inline ds41_select_pair ds41_select_reduce(float value, uint index,
+        threadgroup float *values, threadgroup uint *indices, ushort lane, ushort simd) {
+    float best = simd_max(value);
+    uint id = simd_min(value == best ? index : 0xffffffffu);
+    if (!lane) { values[simd] = best; indices[simd] = id; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    best = lane < 8 ? values[lane] : -INFINITY;
+    id = lane < 8 ? indices[lane] : 0xffffffffu;
+    float maximum = simd_max(best);
+    return {maximum, simd_min(best == maximum ? id : 0xffffffffu)};
+}
+kernel void kernel_dsv41_add_argmax_partial(constant uint &count [[buffer(0)]],
+        device const float *a [[buffer(1)]], device const float *b [[buffer(2)]],
+        device ds41_select_pair *out [[buffer(3)]], uint group [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]],
+        ushort simd [[simdgroup_index_in_threadgroup]]) {
+    float best = -INFINITY; uint id = 0xffffffffu;
+    for (uint i = group * 1024u + tid; i < min(count, (group + 1u) * 1024u); i += 256u) {
+        float value = a[i] + b[i];
+        if (value > best || (value == best && i < id)) { best = value; id = i; }
+    }
+    threadgroup float values[8]; threadgroup uint indices[8];
+    ds41_select_pair result = ds41_select_reduce(best, id, values, indices, lane, simd);
+    if (!tid) out[group] = result;
+}
+kernel void kernel_dsv41_argmax_finish(constant uint &count [[buffer(0)]],
+        device const ds41_select_pair *in [[buffer(1)]], device int *out [[buffer(2)]],
+        ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]],
+        ushort simd [[simdgroup_index_in_threadgroup]]) {
+    float best = -INFINITY; uint id = 0xffffffffu;
+    for (uint i = tid; i < count; i += 256u) {
+        float value = in[i].value; uint index = in[i].index;
+        if (value > best || (value == best && index < id)) { best = value; id = index; }
+    }
+    threadgroup float values[8]; threadgroup uint indices[8];
+    ds41_select_pair result = ds41_select_reduce(best, id, values, indices, lane, simd);
+    if (!tid) out[0] = (int)result.index;
+}

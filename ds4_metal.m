@@ -51122,3 +51122,36 @@ void ds4_gpu_dsv41_end_parallel(void) {
     ds4_gpu_close_batch_encoder();
     g_batch_encoder_concurrent = NO;
 }
+
+int ds4_gpu_dsv41_add_argmax(ds4_gpu_tensor *out, ds4_gpu_tensor *scratch,
+        const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t count) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint32_t groups = (count + 1023u) / 1024u;
+    if (!count || count > 1048576u || ds4_gpu_tensor_bytes(out) < 4u ||
+        ds4_gpu_tensor_bytes(scratch) < (uint64_t)groups * 8u ||
+        ds4_gpu_tensor_bytes(a) < (uint64_t)count * 4u ||
+        ds4_gpu_tensor_bytes(b) < (uint64_t)count * 4u) return 0;
+    @autoreleasepool {
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputePipelineState> partial = ds4_gpu_get_pipeline("kernel_dsv41_add_argmax_partial");
+        id<MTLComputePipelineState> finish = ds4_gpu_get_pipeline("kernel_dsv41_argmax_finish");
+        if (!cb || !partial || !finish) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:partial];
+        [enc setBytes:&count length:sizeof(count) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(a) offset:ds4_gpu_tensor_offset(a) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(b) offset:ds4_gpu_tensor_offset(b) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(scratch) offset:ds4_gpu_tensor_offset(scratch) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(groups,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:finish];
+        [enc setBytes:&groups length:sizeof(groups) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(scratch) offset:ds4_gpu_tensor_offset(scratch) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "draft fused argmax");
+    }
+}

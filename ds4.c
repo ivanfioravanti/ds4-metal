@@ -41728,13 +41728,59 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         ds41_sum_partial_batch(g, b->routed, il, count);
 }
 
+#ifdef __APPLE__
+/* Engram remains disk-only. Fixed-concurrency pread calls hide the latency of
+ * the small random rows needed by speculative verification and fallback.
+ * Each reader owns disjoint output rows; dispatch_apply joins before GPU use. */
+typedef struct {
+    const ds4_engram_table *tables;
+    const uint32_t *ids;
+    float *out;
+    size_t count, readers;
+    bool ok[16];
+} ds41_engram_reads;
+
+static void ds41_engram_read_part(void *context, size_t part) {
+    ds41_engram_reads *b = context;
+    b->ok[part] = true;
+    for (size_t i = b->count * part / b->readers;
+         i < b->count * (part + 1) / b->readers; i++) {
+        const size_t table = (i / DS4_ENGRAM_COLS) % 2;
+        if (!ds4_engram_read(&b->tables[table], b->ids + i, 1,
+                            b->out + i * DS4_ENGRAM_DIM)) {
+            b->ok[part] = false;
+            break;
+        }
+    }
+}
+static bool ds41_engram_parallel(const ds4_engram_table *tables, const uint32_t *ids,
+                                 float *out, unsigned rows) {
+    const unsigned readers = 16;
+    ds41_engram_reads batch = {.tables = tables, .ids = ids, .out = out,
+        .count = rows * 2u * DS4_ENGRAM_COLS, .readers = readers};
+    dispatch_apply_f(readers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                     &batch, ds41_engram_read_part);
+    for (unsigned i = 0; i < readers; i++) if (!batch.ok[i]) return false;
+    return true;
+}
+#endif
+
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
-    for (uint32_t i = 0; !ds41_image_at(g, g->pos) && i < 2; i++) {
+#ifdef __APPLE__
+    /* The TP worker has no drafter, but its allocated verifier identifies
+     * the same speculative session after the first verification command. */
+    const bool parallel = (g->dspark || g->verify) && !ds41_image_at(g, g->pos) &&
+        !getenv("DS4_METAL_DISABLE_V41_DSPARK_ENGRAM_PARALLEL");
+    if (parallel && !ds41_engram_parallel(g->table, &ids[0][0], &g->rows[0][0], 1)) return false;
+#else
+    const bool parallel = false;
+#endif
+    for (uint32_t i = 0; !parallel && !ds41_image_at(g, g->pos) && i < 2; i++) {
         if (!ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i])) return false;
     }
     const float initial_pre[] = {1, 0, 0, 0};
@@ -42799,21 +42845,31 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         ok = queries[i] && heads[i];
     }
     const float initial_pre[] = {1, 0, 0, 0};
+    uint32_t batch_ids[DS4_TP_BATCH_MAX_ROWS][2][DS4_ENGRAM_COLS];
+    const bool parallel_engram = verify &&
+        !getenv("DS4_METAL_DISABLE_V41_DSPARK_ENGRAM_PARALLEL");
+    const double inputs_started = verify && getenv("DS4_V41_DSPARK_TRACE") ? now_sec() : 0.;
     for (int i = 0; ok && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
-        uint32_t ids[2][DS4_ENGRAM_COLS];
+        uint32_t (*ids)[DS4_ENGRAM_COLS] = batch_ids[i];
         const bool continued = i > 0 && (uint32_t)i < prefill_rows;
         positions[i] = s->pos + (continued ? (uint32_t)i : 0u);
         history[i] = continued ? history[i - 1] : s->history;
         ok = ds4_engram_hash(&s->engram, &history[i], &tokens[i], NULL, 1, &ids[0][0]);
         float (*disk_rows)[DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] =
             engram && (uint32_t)i < prefill_rows ? engram[i] : s->rows;
-        for (unsigned table = 0; ok && table < 2; table++)
+        for (unsigned table = 0; ok && !parallel_engram && table < 2; table++)
             ok = ds4_engram_read(&s->table[table], ids[table], DS4_ENGRAM_COLS, disk_rows[table]);
         if (ok) ok = ds4_gpu_tensor_write(g->rows_view[i].pre, 0, initial_pre, sizeof(initial_pre)) &&
             ds4_gpu_embed_token_hc_tensor(g->rows_view[i].residual, model->map, model->size,
                 weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i], DS4_N_EMBD, DS4_N_HC);
     }
+#ifdef __APPLE__
+    if (ok && parallel_engram)
+        ok = ds41_engram_parallel(g->table, &batch_ids[0][0][0], &engram[0][0][0], rows);
+#endif
+    if (inputs_started) fprintf(stderr, "ds4: verify input rows=%u parallel=%u ms=%.3f\n",
+        rows, parallel_engram, (now_sec() - inputs_started) * 1000.);
     if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
     uint32_t il = 0;
     for (; ok && il < DS4_N_LAYER; il++) {
@@ -85115,7 +85171,8 @@ static int ds41_session_verify_drafts(ds4_session *s, int seed, const int *draft
                                        int *accepted, char *err, size_t errlen) {
     ds4_engine *e = s->engine;
     ds41_gpu_graph *g = &s->ds41_graph;
-    const bool timing = ds4_dspark_stats_enabled();
+    const bool detail = getenv("DS4_V41_DSPARK_TRACE") != NULL;
+    const bool timing = ds4_dspark_stats_enabled() || detail;
     const double verify_started = timing ? now_sec() : 0;
     int tokens[DS41_VERIFY_ROWS] = {seed};
     for (int i = 0; i < count; i++) tokens[i + 1] = drafts[i];
@@ -85129,7 +85186,9 @@ static int ds41_session_verify_drafts(ds4_session *s, int seed, const int *draft
         snprintf(err, errlen, "tp: V4.1 verify command failed");
         return -1;
     }
+    const double prepared_at = detail ? now_sec() : 0;
     bool ok = ds41_verify_run(g, &e->model, &e->weights, tokens, (uint32_t)count + 1u);
+    const double computed_at = detail ? now_sec() : 0;
     int emitted = 1, correction = -1;
     if (ok) {
         for (int i = 0; i < count; i++) {
@@ -85148,11 +85207,17 @@ static int ds41_session_verify_drafts(ds4_session *s, int seed, const int *draft
             if (!ignore_eos && drafts[i] == eos) break;
         }
     }
+    const double selected_at = detail ? now_sec() : 0;
     if (tp && !ds4_tp_send_verify_commit(e->tp.ctx,
             !ok ? DS4_TP_VERIFY_ROLLBACK_REPLAY :
             emitted == count + 1 ? DS4_TP_VERIFY_COMMIT_FULL : DS4_TP_VERIFY_COMMIT_PREFIX,
             ok ? emitted : 0)) ok = false;
     if (ok) ok = ds41_verify_commit(g, (uint32_t)emitted, s->logits);
+    const double committed_at = detail ? now_sec() : 0;
+    if (detail) fprintf(stderr, "ds4: V4.1 verify detail rows=%d emitted=%d prepare=%.3f compute=%.3f select=%.3f commit=%.3f ms\n",
+        count + 1, emitted, (prepared_at - verify_started) * 1000.,
+        (computed_at - prepared_at) * 1000., (selected_at - computed_at) * 1000.,
+        (committed_at - selected_at) * 1000.);
     /* VERIFY commits are ordered on the control stream, without an ACK. */
     if (!ok) {
         ds4_session_invalidate(s);

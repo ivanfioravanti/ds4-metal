@@ -1399,6 +1399,13 @@ static int tp_rdma_block_post_layer(ds4_tp *tp, uint32_t layer) {
 
 static int tp_rdma_block_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows) {
     ds4_tp_rdma *r = &tp->rdma;
+    const bool profile = getenv("DS4_V41_DSPARK_RDMA_PROFILE") != NULL;
+    const double began = profile ? tp_now_sec() : 0.;
+    static double post_ms[2], wait_ms[2];
+    if (profile && layer == 0) {
+        memset(post_ms, 0, sizeof(post_ms));
+        memset(wait_ms, 0, sizeof(wait_ms));
+    }
     if (!r->block_active || rows != r->block_rows || layer >= r->block_layers ||
         layer + 1u != r->block_posted) {
         fprintf(stderr, "ds4-tp: verify-block gate out of order (layer %u rows %u, posted %u/%u rows %u)\n",
@@ -1451,6 +1458,7 @@ static int tp_rdma_block_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows
         }
     }
     pthread_mutex_unlock(&r->post_lock);
+    const double posted = profile ? tp_now_sec() : 0.;
     const uint64_t want = (uint64_t)(layer + 1u) * rows;
     double deadline = 0.0;
     uint32_t peer_poll = 0;
@@ -1466,6 +1474,13 @@ static int tp_rdma_block_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows
                     layer, (unsigned long long)r->block_recv_done, (unsigned long long)want);
             ok = 0;
         }
+    }
+    if (profile) {
+        post_ms[layer % 2u] += (posted - began) * 1000.;
+        wait_ms[layer % 2u] += (tp_now_sec() - posted) * 1000.;
+        if (layer + 1u == r->block_layers)
+            fprintf(stderr, "ds4-tp: block cost rows=%u gates=%u attention_post=%.3f attention_peer_wait=%.3f ffn_post=%.3f ffn_peer_wait=%.3f ms\n",
+                rows, r->block_layers, post_ms[0], wait_ms[0], post_ms[1], wait_ms[1]);
     }
     return ok;
 }

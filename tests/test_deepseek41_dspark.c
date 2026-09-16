@@ -19,7 +19,56 @@ static bool same_frontier(ds4_session *a, ds4_session *b) {
     return true;
 }
 
+/* Exercise read ordering and failures without loading a model or using Metal. */
+static int test_parallel_engram(void) {
+    char err[256] = {0};
+    ds4_engram_table tables[2] = {{.fd = -1}, {.fd = -1}};
+    enum { ROWS = 64, REQUESTS = 6 * 2 * DS4_ENGRAM_COLS };
+    uint32_t ids[REQUESTS];
+    const size_t capacity = REQUESTS * DS4_ENGRAM_DIM * sizeof(float);
+    float *actual = malloc(capacity + 16), *expected = malloc(capacity);
+    int rc = 1;
+    CHECK(actual && expected);
+    for (unsigned t = 0; t < 2; t++) {
+        char path[] = "/tmp/ds41-engram-read-XXXXXX";
+        tables[t] = (ds4_engram_table){.fd = mkstemp(path), .offset = 37u + t, .rows = ROWS};
+        CHECK(tables[t].fd >= 0);
+        CHECK(unlink(path) == 0);
+        for (unsigned row = 0; row < ROWS; row++) {
+            uint8_t raw[DS4_ENGRAM_ROW_BYTES];
+            memset(raw, 127, sizeof(raw));
+            for (unsigned j = 0; j < DS4_ENGRAM_DIM; j++) raw[j] = (j + row + t * 17u) % 126u;
+            CHECK(pwrite(tables[t].fd, raw, sizeof(raw),
+                (off_t)(tables[t].offset + row * sizeof(raw))) == sizeof(raw));
+        }
+    }
+    for (unsigned i = 0; i < REQUESTS; i++) ids[i] = (i * 17u + i / 7u) % ROWS;
+    for (unsigned rows = 1; rows <= 6; rows++) {
+        const size_t count = rows * 2u * DS4_ENGRAM_COLS;
+        memset(actual, 0xa5, capacity + 16);
+        for (size_t i = 0; i < count; i++)
+            CHECK(ds4_engram_read(&tables[(i / DS4_ENGRAM_COLS) % 2], ids + i, 1,
+                                  expected + i * DS4_ENGRAM_DIM));
+        CHECK(ds41_engram_parallel(tables, ids, actual, rows));
+        CHECK(!memcmp(actual, expected, count * DS4_ENGRAM_DIM * sizeof(float)));
+        const uint8_t *guard = (const uint8_t *)actual + count * DS4_ENGRAM_DIM * sizeof(float);
+        for (unsigned i = 0; i < 16; i++) CHECK(guard[i] == 0xa5);
+    }
+    ids[0] = ROWS;
+    CHECK(!ds41_engram_parallel(tables, ids, actual, 6));
+    ids[0] = 0;
+    CHECK(ftruncate(tables[1].fd, 0) == 0);
+    CHECK(!ds41_engram_parallel(tables, ids, actual, 6));
+    fprintf(stderr, "V4.1 parallel Engram: 1–6 rows, exact bytes, output guards and read failures PASS\n");
+    rc = 0;
+done:
+    for (unsigned t = 0; t < 2; t++) ds4_engram_table_close(&tables[t]);
+    free(actual); free(expected);
+    return rc;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--engram-reads")) return test_parallel_engram();
     if (argc != 4 && argc != 8) {
         fprintf(stderr, "usage: %s TARGET.gguf DRAFT.gguf PROMPT.txt [LISTEN PORT RDMA_DEVICE_OR_tcp GID]\n", argv[0]);
         return 2;

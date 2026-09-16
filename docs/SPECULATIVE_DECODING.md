@@ -539,6 +539,95 @@ failure is recorded in the preceding round's post-rebase baseline log.
 No server or thinking-policy code changed in this round. The full long-context
 regression suite was not repeated because experiments were capped at 8K.
 
+## DeepSeek V4.1: verifier I/O investigation
+
+A subsequent investigation of the same 7,956-token prompt and 512 greedy
+outputs found a substantial avoidable cost in the Metal DSpark path:
+**Engram reads were serial even during speculative verification.** Each token
+requires 24 small rows from each of two disk-only tables. The file deliberately
+uses uncached reads; 48 sequential reads per token delayed GPU submission.
+
+The original TP trace split into 9.367 seconds of verification computation
+(including input I/O), 5.127 seconds of ordinary fallback evaluations, and
+1.870 seconds of drafting. Verification preparation/control, token selection,
+and commit together cost only 0.023 seconds. There were 153 zero-draft cycles,
+so the previously unclassified time was mostly ordinary fallback work, not
+rollback overhead.
+
+Further diagnostic runs established:
+
+- Native verifier GPU execution totaled 7.052 seconds, including GPU-side TP
+  waits. The span between first GPU start and last GPU finish totaled 7.109
+  seconds across blocks. These native timings did not add submission boundaries.
+- Input preparation took 2.121 seconds across 165 blocks, explaining most of
+  the remaining verifier wall time. Sixteen bounded readers reduced it to
+  0.238 seconds while preserving the exact decoded table values.
+- Coordinator RDMA posting plus peer waiting totaled 0.600 seconds across
+  those blocks; the peer recorded 0.700 seconds. Peer waiting includes load
+  imbalance, not just transfer latency, and overlaps the GPU-stage timings.
+- GPU stage samples for a two-row block measured 17.69 ms in experts plus
+  their TP gate, 10.78 ms in attention plus its gate, 7.43 ms in mixing/QKV,
+  2.02 ms in FFN mixing, and 1.00 ms in the vocabulary head. Stage sampling
+  splits command buffers, so these are directional comparisons, not an exact
+  additive decomposition of an uninstrumented run.
+
+The retained implementation runs up to sixteen read tasks with disjoint
+output regions, joins them before GPU consumption, and reports failure if
+any read fails. It applies to the verifier and ordinary fallback evaluations
+inside DSpark sessions. A TP worker without a drafter recognizes that session
+by its allocated verifier. The table remains disk-only, with no full-table
+mapping or new cache. GPU arithmetic, confidence thresholds, and draft width
+are unchanged. `DS4_METAL_DISABLE_V41_DSPARK_ENGRAM_PARALLEL=1` restores the
+serial baseline on both nodes.
+
+Initial single-trial screening:
+
+| Configuration | TP tokens/s |
+| --- | ---: |
+| Serial reads | 31.18 |
+| Eight readers, verifier only | 35.06 |
+| Sixteen readers, verifier only | 35.48 |
+| Sixteen readers, verifier and fallback | 37.25 |
+
+All four used 318 cycles, 234 proposed tokens, and 194 accepted drafts.
+The combined single-node screen reached 32.29 tokens/s. Repeated release
+measurements are recorded below.
+
+Release confirmation alternated three TP trials per path with diagnostic
+logging disabled. Before: **31.25, 31.22, 30.62 tokens/s**; after: **37.20,
+37.31, 37.32 tokens/s**. Medians improved **31.22 → 37.31 tokens/s (+19.5%)**.
+Median verification time fell from 9.372 to 7.443 seconds; total speculative
+cycle time fell from 16.390 to 13.716 seconds. Drafting stayed approximately
+1.85 seconds. A single paired single-node trial improved **27.40 → 32.31
+tokens/s (+17.9%)**. Every paired generated output was byte-identical.
+The final session-snapshot check also passed. The **50 tokens/s goal remains
+unmet**; small-batch expert/attention GPU work and useful proposals per cycle
+are the next substantial opportunities. Confidence should be re-evaluated
+against the cheaper verifier before assuming the previous optimum still holds.
+
+Two other hypotheses were rejected. Removing the confidence filter forced
+five proposals per cycle but accepted only 255 of 1,281 proposals (19.91%),
+reducing throughput to 16.24 tokens/s; confidence 0.3 reached 26.16 versus
+31.39 at the default 0.6. Porting the scalar expert down-projection tile to
+verification produced 30.62 or 31.38 tokens/s, with a 31.39 control. Neither
+kernel variant was retained.
+
+For follow-up diagnosis, `DS4_V41_DSPARK_TRACE=1` reports verifier input
+preparation and compute/select/commit wall times; combine it with
+`DS4_DSPARK_SPEC_LOG=1` for per-cycle proposal and fallback timings.
+`DS4_V41_DSPARK_RDMA_PROFILE=1` reports per-block posting and peer-wait totals.
+The temporary GPU timestamp instrumentation was removed after profiling.
+Run `tests/test_deepseek41_dspark --engram-reads` for a model-free test of
+1–6-row byte equivalence, output guards, invalid IDs, and read failures.
+
+Validation of the retained path passed the model-free parallel-read test,
+Engram unit tests, 51 attention/selection cases, short and 4K/8K single-node
+and TP exact oracles (greedy tokens, sampled tokens, RNG and target state),
+ordinary resident/SSD state comparisons, and seven targeted regressions.
+CPU-only, non-Apple and ROCm-preprocessor C syntax checks passed. CUDA runtime
+was not tested. The pre-existing server thinking-mode assertion from the
+preceding round is unrelated and was not changed; no long-context suite ran.
+
 ## GLM: built-in MTP
 
 GLM's draft block is already in its main GGUF:

@@ -193,15 +193,16 @@ void kernel_mul_mv_q8_0_f32_impl(
 
 // Two token rows share each quantized weight load while retaining the
 // scalar K walk and reduction tree for each output independently.
-kernel void kernel_mul_mv_q8_0_f32_token_pair(
+template<bool ROUND_BF16>
+void kernel_mul_mv_q8_0_f32_token_pair_impl(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0,
         device const char * src1,
         device char * dst,
-        threadgroup char * shmem [[threadgroup(0)]],
-        uint3 tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+        threadgroup char * shmem,
+        uint3 tgpig,
+        ushort tiisg,
+        ushort sgitg) {
     constexpr short NR0 = N_R0_Q8_0;
     constexpr short NQ = 8;
     const short NSG = FC_mul_mv_nsg;
@@ -235,12 +236,36 @@ kernel void kernel_mul_mv_q8_0_f32_token_pair(
             sum1[row] += q1 * d;
         }
     }
-    helper_mv_reduce_and_write<NR0>((device float *)dst + (uint64_t)token * args.ne0,
+    helper_mv_reduce_and_write<NR0, ROUND_BF16>((device float *)dst + (uint64_t)token * args.ne0,
         sum0, r0, args.ne01, tiisg, sgitg, shmem);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (token + 1 < args.ne11)
-        helper_mv_reduce_and_write<NR0>((device float *)dst + (uint64_t)(token + 1) * args.ne0,
+        helper_mv_reduce_and_write<NR0, ROUND_BF16>((device float *)dst + (uint64_t)(token + 1) * args.ne0,
             sum1, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
+kernel void kernel_mul_mv_q8_0_f32_token_pair(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device char * dst,
+        threadgroup char * shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_token_pair_impl<false>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+kernel void kernel_mul_mv_q8_0_f32_token_pair_bf16(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device char * dst,
+        threadgroup char * shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_token_pair_impl<true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 // Decode-time Q8_0 matrix-vector multiply. DS4 uses this for Q8_0 dense

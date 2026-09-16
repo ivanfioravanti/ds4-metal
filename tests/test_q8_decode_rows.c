@@ -55,6 +55,22 @@ static void check(uint32_t d, uint32_t o, uint32_t t) {
             }
         }
     }
+    /* Compare fused rounding with the original exact matvec followed by
+     * the model's BF16 boundary, including odd token counts and guards. */
+    for (int paired=0; paired<2; paired++) {
+        if (paired) unsetenv("DS4_METAL_DISABLE_Q8_TOKEN_PAIR");
+        else setenv("DS4_METAL_DISABLE_Q8_TOKEN_PAIR","1",1);
+        require(ds4_gpu_tensor_fill_f32(a,NAN,n+16) && ds4_gpu_tensor_fill_f32(b,NAN,n+16));
+        require(ds4_gpu_begin_commands());
+        require(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(a,map,2*stride,0,d,o,x,t));
+        require(ds4_gpu_dsv41_quantize(a,o,t,DS4_V41_BF16));
+        require(ds4_gpu_dsv41_q8_rows_bf16(b,map,2*stride,0,d,o,x,t));
+        require(ds4_gpu_end_commands());
+        require(ds4_gpu_tensor_read(a,0,refs[0],n*4));
+        require(ds4_gpu_tensor_read(b,0,actual,(n+16)*4));
+        require(memcmp(refs[0],actual,n*4)==0);
+        for (uint64_t i=n;i<n+16;i++) require(isnan(actual[i]));
+    }
     printf("PASS Q8 D=%u O=%u T=%u exact paired outputs, guards intact\n",d,o,t);
     ds4_gpu_tensor_free(a); ds4_gpu_tensor_free(b); ds4_gpu_tensor_free(x);
     free(input); free(actual); free(refs[0]); free(refs[1]);

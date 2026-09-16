@@ -115,6 +115,69 @@ greedy benchmark above. Ordinary HTTP results are from the prior sweep.
 Rates are tokens/s. Small differences in this single-trial HTTP sweep should
 not be interpreted as statistically established gains.
 
+### Verification follow-up
+
+The follow-up kept the same target/draft weights, confidence 0.6, and proposal
+and acceptance counts. Three rotating repetitions compared ordinary decode,
+the preceding DSpark path with the new diagnostic switches disabled, and the
+optimized path. The raw prompt had 7,956 tokens, generation had 512 greedy
+tokens, and context allocation was 327,680.
+
+| Configuration | Ordinary tokens/s | DSpark before tokens/s | DSpark after tokens/s | Verification before seconds | Verification after seconds |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Single Mac | 25.52 | 25.84 | 26.62 | 11.75 | 11.19 |
+| TP RDMA | 30.09 | 28.97 | 30.22 | 10.18 | 9.50 |
+
+Rates are median overall generation throughput. Verification time includes
+prefix commit but excludes ordinary one-token steps and sampled correction
+evaluation. The existing `verify` counter now reports this separately from
+`target`, which includes both verification and ordinary target work.
+The TP lead over ordinary decoding is marginal (0.43%); the three-run ranges
+overlap. The single-Mac lead over ordinary decoding is 4.31%.
+
+The verifier batches Q/K preparation, independent compressor/indexer
+projections, and attention-output rounding/rotation. Cache publication,
+pooling and index scoring stay causal. Small Q8 batches fuse their exact BF16
+output boundary. TP overlaps independent Q/K projection and normalization
+levels and vectorizes the checked payload checksum. Tiny Q4 MoE batches use
+the scalar decoder's smaller thread-group layout. Final HC/norm inputs are
+batched, redundant frontier copies are omitted, and raw-window undo plus KV
+publication use one integer compute dispatch instead of two blit encoders.
+
+The short oracle checks 448 greedy and 64 sampled outputs, RNG, full logits,
+and live state, including forced six-row verification and rejected suffixes
+across ring wraparound. Single-Mac, RDMA and TCP checks passed. The optional
+`DS4_TEST_V41_LONG_CONTEXT=1` oracle allocates 65,536 context and forces six-row
+batches at prefixes 16,383 and 32,767; both single-Mac and RDMA checks passed.
+Supply a prompt containing more than 32,767 model tokens for that test.
+Exact Q8/BF16 operator checks and buffer guards passed with both thread-group
+layouts. Normal resident and SSD decode each passed 130 exact-state checks.
+CPU-only syntax and targeted regressions passed; `make test` retained the
+same nine pre-existing assertions with no new failures. Runtime validation
+was on M3 Ultra, with no CUDA hardware run.
+
+The HTTP sweep also exposed a terminal-boundary replay: after a speculative
+stop token, the server rebuilt the entire 127,224-token prompt before sending
+the final response, adding about 181 seconds after generation had finished.
+Terminal rewinds now leave the shortened checkpoint invalid and defer its
+rebuild until a later sync needs it. Resampling and continuing generation
+still rebuild immediately. Six forced speculative stop boundaries per
+topology, including follow-up requests, matched ordinary greedy responses;
+the server regression suite passed. The final HTTP sweep includes this fix.
+
+The matching cold HTTP sweep again covered 512 through 256K nominal context,
+128 output tokens, temperature 0.7, and one unseeded request per point. At the
+final 254,680-token prompt:
+
+| Configuration | Prior ordinary decode | DSpark before this follow-up | DSpark after | DSpark prefill after |
+| --- | ---: | ---: | ---: | ---: |
+| Single Mac | 20.66 | 20.42 | 20.45 | 628.57 |
+| TP RDMA | 23.37 | 22.06 | 23.44 | 645.37 |
+
+Rates are tokens/s. The ordinary HTTP comparator is the prior sweep; unlike
+the repeated native comparison, small HTTP differences are not established
+statistical gains.
+
 ## DeepSeek Flash: DSpark
 
 DSpark is a separate support GGUF, not a standalone language model. It proposes

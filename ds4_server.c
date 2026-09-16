@@ -12486,11 +12486,12 @@ static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
     return ok;
 }
 
-/* A recurrent cache cannot always be truncated in place. Match the agent's
- * boundary handling and rebuild the retained prefix when rewind invalidates
- * it, retaining image conditioning as well. */
+/* A recurrent cache cannot always be truncated in place. Rebuild before
+ * continuing generation, retaining image conditioning. At a terminal boundary
+ * leave the shortened checkpoint invalid: the next sync will rebuild if needed,
+ * without replaying a long prompt before returning an already complete response. */
 static int server_generation_rewind(server *s, server_slot *slot,
-                                     const request *r, int pos,
+                                     const request *r, int pos, bool resume,
                                      char *err, size_t errlen) {
     pthread_mutex_lock(&s->inference_mu);
     ds4_session_rewind(slot->session, pos);
@@ -12498,7 +12499,7 @@ static int server_generation_rewind(server *s, server_slot *slot,
     ds4_tokens_copy(&prefix, ds4_session_tokens(slot->session));
     bool rebuild = ds4_session_common_prefix(slot->session, &prefix) != prefix.len;
     pthread_mutex_unlock(&s->inference_mu);
-    int rc = rebuild ? server_session_sync_multimodal(s, slot, &prefix,
+    int rc = rebuild && resume ? server_session_sync_multimodal(s, slot, &prefix,
         r->images, r->image_count, err, errlen) : 0;
     ds4_tokens_free(&prefix);
     return rc;
@@ -14097,7 +14098,8 @@ decode_again:
             /* Logits after a rewind belong to the discarded suffix. Re-eval
              * the last kept token before sampling under a different mode. */
             int pos = block_start + kept - (resample ? 1 : 0);
-            if (server_generation_rewind(s, slot, &j->req, pos, err, sizeof(err)) != 0 ||
+            if (server_generation_rewind(s, slot, &j->req, pos,
+                    resample || !stop_decode, err, sizeof(err)) != 0 ||
                 (resample && server_eval_token(s, slot, toks[kept - 1], err, sizeof(err)) != 0)) {
                 finish = "error";
                 stop_decode = true;

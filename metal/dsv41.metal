@@ -307,3 +307,13 @@ kernel void kernel_dsv41_sparse_kv_stage(
         dst[gid] = half4(comp[(ulong)ids[row - args[0]] * 128u + col]);
     }
 }
+
+// Save the overwritten ring row and publish its replacement without leaving
+// the compute encoder. Integer loads/stores preserve every payload bit.
+kernel void kernel_dsv41_window_push(device uint *window,
+        device uint *undo, device const uint *kv,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= 512u) return;
+    undo[gid] = window[gid];
+    window[gid] = kv[gid];
+}

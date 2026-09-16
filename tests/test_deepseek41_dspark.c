@@ -31,8 +31,10 @@ int main(int argc, char **argv) {
     ds4_session *control = NULL, *candidate = NULL;
     ds4_tokens prompt = {0};
     int rc = 1;
+    const bool long_context = getenv("DS4_TEST_V41_LONG_CONTEXT") != NULL;
+    const int context = long_context ? 65536 : 4096;
     ds4_engine_options opt = {.model_path = argv[1], .mtp_path = argv[2],
-        .backend = DS4_BACKEND_METAL, .context_size = 4096, .power_percent = 100, .dspark = true};
+        .backend = DS4_BACKEND_METAL, .context_size = context, .power_percent = 100, .dspark = true};
     if (argc == 8) {
         char *end = NULL;
         long port = strtol(argv[5], &end, 10);
@@ -50,23 +52,26 @@ int main(int argc, char **argv) {
         ds4_tp_identity id = {.gguf_bytes = ds4_engine_model_bytes(e),
             .model_id = ds4_engine_model_id(e), .n_layer = ds4_engine_layer_count(e),
             .n_embd = ds4_engine_embd_dim(e), .n_vocab = ds4_engine_vocab_size(e),
-            .quant_bits = ds4_engine_routed_quant_bits(e), .ctx_size = 4096};
+            .quant_bits = ds4_engine_routed_quant_bits(e), .ctx_size = context};
         ds4_engine_tp_gate_schedule(e, &id.gate_slot_start, &id.gate_slot_step,
             &id.gates_per_token, id.gate_slot_mask);
         CHECK(ds4_tp_create(&tp, &opt.tp, &id, err, sizeof(err)));
         CHECK(ds4_engine_tp_bind(e, tp, err, sizeof(err)));
     }
-    CHECK(ds4_session_create(&control, e, 4096) == 0);
-    CHECK(ds4_session_create(&candidate, e, 4096) == 0);
+    CHECK(ds4_session_create(&control, e, context) == 0);
+    CHECK(ds4_session_create(&candidate, e, context) == 0);
     ds4_encode_chat_prompt(e, NULL, text, DS4_THINK_NONE, &prompt);
-    CHECK(prompt.len > 2047);
-    const int prefixes[] = {18, 127, 128, 129, 511, 2047, 127};
+    CHECK(prompt.len > (long_context ? 32767 : 2047));
+    const int short_prefixes[] = {18, 127, 128, 129, 511, 2047, 127};
+    const int long_prefixes[] = {16383, 32767};
+    const int *prefixes = long_context ? long_prefixes : short_prefixes;
+    const unsigned prefix_count = long_context ? 2 : 7;
     const float confidence = e->dspark_confidence_threshold;
     unsigned cycles = 0, accepted_drafts = 0;
-    for (unsigned p = 0; p < sizeof(prefixes) / sizeof(prefixes[0]); p++) {
+    for (unsigned p = 0; p < prefix_count; p++) {
         /* Force all five proposals across a ring wrap, including rejected
          * suffixes. Ordinary confidence filtering rarely exercises six rows. */
-        const bool full_width = p == 6;
+        const bool full_width = long_context || p == 6;
         e->dspark_confidence_threshold = full_width ? 0.f : confidence;
         ds4_session_invalidate(control);
         ds4_session_invalidate(candidate);

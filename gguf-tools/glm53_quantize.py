@@ -39,6 +39,7 @@ QTYPE_Q8_K = 15
 QTYPE_IQ2_XXS = 16
 QTYPE_I8 = 24
 QTYPE_BF16 = 30
+QTYPE_MXFP4 = 39
 
 QTYPE_NAMES = {
     QTYPE_F32: "F32",
@@ -50,6 +51,7 @@ QTYPE_NAMES = {
     QTYPE_IQ2_XXS: "IQ2_XXS",
     QTYPE_I8: "I8",
     QTYPE_BF16: "BF16",
+    QTYPE_MXFP4: "MXFP4",
 }
 
 QTYPE_LAYOUT = {
@@ -62,6 +64,7 @@ QTYPE_LAYOUT = {
     QTYPE_IQ2_XXS: (256, 66),
     QTYPE_I8: (1, 1),
     QTYPE_BF16: (1, 2),
+    QTYPE_MXFP4: (32, 17),
 }
 
 LAYER_PREFIX = "model.language_model.layers"

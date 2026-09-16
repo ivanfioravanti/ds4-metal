@@ -10,6 +10,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "gguf-tools"))
 from deepseek41_dspark import DraftSource, build_plan
+from glm53_quantize import QTYPE_MXFP4
 
 
 def main(directory):
@@ -20,6 +21,11 @@ def main(directory):
         plan = build_plan(db, config)
         assert len(plan) == 81
         assert all(a.offset + a.nbytes <= b.offset for a, b in zip(plan, plan[1:]))
+        native = build_plan(db, config, "mxfp4")
+        for old, new in zip(plan, native):
+            assert old.name == new.name and old.shape == new.shape
+            assert new.qtype == (QTYPE_MXFP4 if old.is_expert else old.qtype)
+        assert all(a.offset + a.nbytes <= b.offset for a, b in zip(native, native[1:]))
         original = copy.deepcopy(db.tensors)
         cases = [
             ("wrong block size", lambda c, t: c.update(dspark_block_size=6)),

@@ -21,7 +21,7 @@ import time
 from deepseek41_metadata import GGUF_ALIGNMENT, metadata
 from glm53_quantize import (
     SourceDB, TensorPlan, Quantizer, Imatrix, QTYPE_F32, QTYPE_F16,
-    QTYPE_Q8_0, QTYPE_Q2_K, QTYPE_Q4_K, QTYPE_IQ2_XXS, QTYPE_I8, align,
+    QTYPE_Q8_0, QTYPE_Q2_K, QTYPE_Q4_K, QTYPE_IQ2_XXS, QTYPE_I8, QTYPE_MXFP4, align,
     conversion_signature, kv_string, load_resume_state, print_plan,
     qtype_nbytes, save_resume_state, tensor_header,
 )
@@ -158,6 +158,29 @@ def build_plan(db, config, quant="q2"):
 
 
 class NativeQuantizer(Quantizer):
+    def repack_mxfp4(self, db, name):
+        # Source FP4 packs adjacent values; GGUF packs two 16-value halves.
+        # Preserve codes and E8M0 scales without another quantization step.
+        np = self.np
+        info, scale = db.info(name), db.info(scale_name(name))
+        shape = info["shape"]
+        if (info["dtype"] != "I8" or len(shape) != 2 or
+                min(shape) <= 0 or shape[1] % 16 or
+                scale["dtype"] != "F8_E8M0" or
+                scale["shape"] != [shape[0], shape[1] // 16]):
+            raise ValueError(f"{name}: invalid native FP4 layout")
+        weights = np.frombuffer(db.read(name), dtype=np.uint8).reshape(*shape)
+        scales = np.frombuffer(db.read(scale_name(name)), dtype=np.uint8).reshape(scale["shape"])
+        if np.any(scales == 255):
+            raise ValueError(f"{name}: nonfinite scale")
+        codes = np.empty((weights.size // 16, 32), dtype=np.uint8)
+        codes[:, 0::2] = weights.reshape(-1, 16) & 15
+        codes[:, 1::2] = weights.reshape(-1, 16) >> 4
+        packed = np.empty((len(codes), 17), dtype=np.uint8)
+        packed[:, 0] = scales.reshape(-1)
+        packed[:, 1:] = codes[:, :16] | (codes[:, 16:] << 4)
+        return packed.tobytes()
+
     def to_f32(self, db, name, row_start=0, row_count=None):
         if ".engram.embed." in name:
             raise ValueError("Engram must never be materialized as a whole float tensor")
@@ -268,7 +291,10 @@ def write_gguf(args, plan, records, db):
                 write_engram(fp, item, db, quantizer.np)
             elif item.is_expert:
                 def convert(expert):
-                    values = quantizer.to_f32(db, item.source.format(expert=expert))
+                    source = item.source.format(expert=expert)
+                    if item.qtype == QTYPE_MXFP4:
+                        return quantizer.repack_mxfp4(db, source), False
+                    values = quantizer.to_f32(db, source)
                     importance = imatrix.expert(item.name, expert, item.shape[0], item.expert_count)
                     return quantizer.encode(values, item.qtype, importance), importance is None
                 for start in range(0, item.expert_count, args.threads):

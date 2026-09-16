@@ -23,7 +23,7 @@ from deepseek41_quantize import (NativeQuantizer, validate_scales, write_engram,
 from deepseek41_metadata import GGUF_ALIGNMENT, engram_layout, metadata
 import deepseek41_validate_gguf as artifact_audit
 from glm53_quantize import (
-    TensorPlan, QTYPE_F32, QTYPE_I8, QTYPE_IQ2_XXS, QTYPE_Q2_K, QTYPE_Q4_K,
+    TensorPlan, QTYPE_F32, QTYPE_I8, QTYPE_IQ2_XXS, QTYPE_Q2_K, QTYPE_Q4_K, QTYPE_MXFP4,
     align, kv_string, kv_u32, load_tokenizer_records, print_plan, qtype_nbytes,
 )
 
@@ -91,6 +91,51 @@ class ConversionTests(unittest.TestCase):
             self.assertEqual(self.q.encode(actual, qt), self.q.encode(expected, qt))
             weights = np.linspace(.01, 2, 256, dtype=np.float32)
             self.assertEqual(self.q.encode(actual, qt, weights), self.q.encode(expected, qt, weights))
+
+    def test_native_mxfp4_repack(self):
+        # All 256 packed bytes and every finite E8M0 exponent, including zero.
+        weights = np.tile(np.arange(256, dtype=np.uint8), (255, 1))
+        scales = np.repeat(np.arange(255, dtype=np.uint8)[:, None], 16, axis=1)
+        db = MemoryDB(weights, scales, dtype="I8")
+        packed = np.frombuffer(self.q.repack_mxfp4(db, db.name), np.uint8).reshape(255, 16, 17)
+        np.testing.assert_array_equal(packed[:, :, 0], scales)
+        # Independent scalar unpacking catches adjacent-vs-half nibble errors.
+        for row in range(255):
+            for col in range(512):
+                block, lane = divmod(col, 32)
+                actual = (int(packed[row, block, 1 + lane % 16]) >> (4 * (lane // 16))) & 15
+                expected = (int(weights[row, col // 2]) >> (4 * (col % 2))) & 15
+                self.assertEqual(actual, expected)
+        scales[0, 0] = 255
+        with self.assertRaisesRegex(ValueError, "nonfinite"):
+            self.q.repack_mxfp4(db, db.name)
+        scales[0, 0] = 0
+        db.tensors[db.name]["dtype"] = "BF16"
+        with self.assertRaisesRegex(ValueError, "layout"):
+            self.q.repack_mxfp4(db, db.name)
+        db.tensors[db.name]["dtype"] = "I8"
+        db.tensors[scale_name(db.name)]["shape"] = [255, 15]
+        with self.assertRaisesRegex(ValueError, "layout"):
+            self.q.repack_mxfp4(db, db.name)
+
+    def test_native_mxfp4_writer(self):
+        db = MemoryDB(np.arange(64, dtype=np.uint8).reshape(2, 32),
+                      np.array([[0, 127], [128, 254]], dtype=np.uint8),
+                      name="mtp.0.ffn.experts.0.w1.weight", dtype="I8")
+        item = TensorPlan("mtp.0.ffn_gate_exps.weight", (64, 2, 1), QTYPE_MXFP4,
+                          "experts", source="mtp.0.ffn.experts.{expert}.w1.weight",
+                          expert_layer=0, expert_part="gate", expert_count=1)
+        item.nbytes = qtype_nbytes(item.qtype, item.shape)
+        records = [kv_u32("general.alignment", GGUF_ALIGNMENT)]
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            args = types.SimpleNamespace(out=str(Path(tmp) / "draft.gguf"), imatrix=None,
+                                         quants_library=self.q.lib._name, threads=2, resume=False)
+            with mock.patch.object(NativeQuantizer, "to_f32", side_effect=AssertionError("lossy path")):
+                write_gguf(args, [item], records, db)
+            start, size = print_plan([item], records, [], GGUF_ALIGNMENT)
+            result = Path(args.out).read_bytes()
+            self.assertEqual(len(result), start + size)
+            self.assertEqual(result[start:start + item.nbytes], self.q.repack_mxfp4(db, db.name))
 
     def test_engram_pack(self):
         rng = np.random.default_rng(17)

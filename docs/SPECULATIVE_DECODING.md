@@ -291,6 +291,72 @@ These are single unseeded requests with previous sweeps as comparators;
 sampled text and stop lengths can differ. Use the alternating greedy runs
 for the controlled estimate of this kernel change.
 
+### Native FP4 draft fidelity and TP projection experiment
+
+The V4.1 support converter accepts `--expert-type mxfp4` to preserve the source
+routed experts without the additional Q4_K quantization. It reorders adjacent
+FP4 nibbles into GGUF's two 16-value halves and keeps the E8M0 scales unchanged.
+Attention, shared experts, confidence and Markov tensors keep the existing
+recipe. The target Q4 model is unchanged. Q4_K remains the converter default;
+native FP4 was not faster on the controlled continuation benchmark below.
+
+```sh
+uv run --with numpy python gguf-tools/deepseek41_dspark.py \
+  --hf /tmp/ds41-draft-source --source-revision "$revision" \
+  --expert-type mxfp4 --out /tmp/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf
+```
+
+On two M3 Ultras, three alternating runs per variant used 7,956 cold raw prompt
+tokens, 512 greedy output tokens, a 327,680-token allocation, and confidence 0.6.
+The runtime was commit `912e4b0` for both draft formats.
+
+| Draft expert format | Single median tok/s | TP RDMA median tok/s | Single accepted / cycle | TP accepted / cycle |
+| --- | ---: | ---: | ---: | ---: |
+| Q4_K | 27.22 | 30.82 | 198 / 314 | 194 / 318 |
+| Native FP4 | 27.13 | 30.44 | 197 / 315 | 194 / 318 |
+
+Native FP4 submitted 242 TP proposals versus 234 for Q4_K, with the same 194
+accepted drafts. The additional rejected work outweighed any benefit of the
+lossless source representation. The support file is smaller: 8,032,485,376 bytes
+versus 8,457,158,656 bytes. This preserves the native **draft expert weights**;
+it does not make the target Q4 model lossless or establish higher target quality.
+
+A separate experiment extended three-row Q8 weight reuse to TP attention's
+partial output projection. Exact kernel and live target-state checks passed,
+but the three-run median was 30.80 versus 30.82 tok/s. That runtime change was
+removed; the existing paired TP projection remains in use.
+
+The converter's synthetic tests cover every nibble value and finite scale byte,
+malformed layouts, and writing without float requantization. A full conversion
+was byte-identical to an independently repacked support artifact, whose other
+tensors were copied from the existing Q4_K support file. Live single and TP
+checks compare greedy and sampled tokens, RNG state, logits and cache state
+against ordinary target decoding within each hardware configuration.
+
+The native FP4 support file also passed exact 16K/32K-prefix oracles on both
+Macs, including forced six-row verification and sampled RNG/cache comparisons.
+The regression suite reproduced the nine known assertions with zero new
+failures; seven additional targeted tests passed. No runtime changes remain.
+
+The follow-up HTTP sweep used 512–256K nominal cold contexts, temperature 0.7,
+one unseeded request per point and a 128-token output cap. All twenty requests
+reached the cap. Actual prompt counts matched the prior Q4_K sweep (453 through
+254,680 tokens). These sampled comparisons are descriptive: generated content
+varies, and isolated better points do not overturn the repeated greedy result.
+
+| Nominal context | Single Q4_K / FP4 tok/s | TP Q4_K / FP4 tok/s |
+| --- | ---: | ---: |
+| 512 | 31.88 / 29.13 | 33.00 / 34.89 |
+| 1K | 30.30 / 29.68 | 34.18 / 34.01 |
+| 2K | 29.70 / 29.67 | 34.80 / 33.44 |
+| 4K | 26.95 / 30.24 | 29.44 / 34.20 |
+| 8K | 29.74 / 28.23 | 31.23 / 30.86 |
+| 16K | 27.26 / 28.16 | 32.95 / 31.18 |
+| 32K | 25.43 / 25.59 | 29.82 / 31.94 |
+| 64K | 24.13 / 24.42 | 28.46 / 28.52 |
+| 128K | 24.81 / 23.85 | 26.68 / 27.49 |
+| 256K | 20.69 / 21.23 | 24.53 / 23.56 |
+
 ## DeepSeek Flash: DSpark
 
 DSpark is a separate support GGUF, not a standalone language model. It proposes

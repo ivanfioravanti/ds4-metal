@@ -14,7 +14,7 @@ import sys
 
 from deepseek41_quantize import write_gguf, scale_name
 from glm53_quantize import (SourceDB, TensorPlan, load_index,
-    load_safetensors_header, QTYPE_F32, QTYPE_F16, QTYPE_Q8_0, QTYPE_Q4_K,
+    load_safetensors_header, QTYPE_F32, QTYPE_F16, QTYPE_Q8_0, QTYPE_Q4_K, QTYPE_MXFP4,
     align, qtype_nbytes, kv_string, kv_u32, kv_u32_array, print_plan)
 from deepseek41_metadata import GGUF_ALIGNMENT
 
@@ -39,7 +39,10 @@ class DraftSource(SourceDB):
             raise ValueError('incomplete DSpark source shards')
 
 
-def build_plan(db, config):
+def build_plan(db, config, expert_type="q4_k"):
+    if expert_type not in ("q4_k", "mxfp4"):
+        raise ValueError("unsupported draft expert type")
+    expert_qtype = QTYPE_MXFP4 if expert_type == "mxfp4" else QTYPE_Q4_K
     expected = dict(dim=5120, n_layers=40, n_mtp_layers=3, dspark_block_size=5,
                     dspark_noise_token_id=128799, dspark_markov_rank=256,
                     dspark_n_routed_experts=128, dspark_n_activated_experts=3,
@@ -97,7 +100,7 @@ def build_plan(db, config):
                 if db.info(name)['dtype'] != 'I8':
                     raise ValueError(f'{name}: expected packed FP4')
             plan.append(TensorPlan(f'{p}.ffn_{part}_exps.weight', (*reversed(shape), ne),
-                QTYPE_Q4_K, 'experts', source=pattern, expert_layer=stage, expert_part=part, expert_count=ne))
+                expert_qtype, 'experts', source=pattern, expert_layer=stage, expert_part=part, expert_count=ne))
     regular('mtp.0.main_proj.weight', 'mtp.0.main_proj.weight', (d, 3 * d), QTYPE_Q8_0)
     regular('mtp.0.main_norm.weight', 'mtp.0.main_norm.weight', (d,), QTYPE_F32)
     regular('mtp.2.norm.weight', 'mtp.2.norm.weight', (d,), QTYPE_F32)
@@ -119,6 +122,8 @@ def main():
     parser.add_argument('--out', required=True)
     parser.add_argument('--source-revision', required=True)
     parser.add_argument('--threads', type=int, default=4)
+    parser.add_argument('--expert-type', choices=['q4_k', 'mxfp4'], default='q4_k',
+                        help='mxfp4 preserves native expert codes and scales losslessly')
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
     suffix = 'dylib' if sys.platform == 'darwin' else 'so'
@@ -133,7 +138,7 @@ def main():
     with open(os.path.join(args.hf, 'inference/config.json')) as fp:
         config = json.load(fp)
     db = DraftSource(args.hf)
-    plan = build_plan(db, config)
+    plan = build_plan(db, config, args.expert_type)
     records = [kv_string('general.architecture', 'deepseek41-dspark'),
         kv_string('general.name', 'DeepSeek V4.1 Flash DSpark'),
         kv_string('general.source.url', 'https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash'),

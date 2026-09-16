@@ -40294,6 +40294,10 @@ static bool ds41_verify_capture(ds41_verify_state *v, ds41_gpu_graph *row,
     bool ok = true;
     if (il == 2 || il == 8 || il == 14) {
         unsigned owner = il == 2 ? 0 : il == 8 ? 1 : 2;
+        if (!getenv("DS4_METAL_DISABLE_V41_POOL_SNAPSHOT"))
+            return ds4_gpu_dsv41_pool_snapshot(v->previous_kv[owner],
+                v->previous_score[owner], row->previous_kv[owner],
+                row->previous_score[owner], index) != 0;
         ok = ok && ds4_gpu_tensor_copy(v->previous_kv[owner], (uint64_t)index * 512u * 4u,
             row->previous_kv[owner], 0, 512u * 4u) &&
             ds4_gpu_tensor_copy(v->previous_score[owner], (uint64_t)index * 512u * 4u,
@@ -42509,6 +42513,10 @@ static bool ds41_dspark_propose(ds41_gpu_graph *target, const ds4_model *base,
     ds41_gpu_graph *g = &d->scratch;
     const uint32_t pos = target->pos, raw = pos < 128u ? pos : 128u;
     const float initial_pre[] = {1, 0, 0, 0};
+    const bool batch_heads = !getenv("DS4_METAL_DISABLE_V41_DRAFT_HEAD_ROTATION") &&
+        !getenv("DS4_METAL_DISABLE_V41_DRAFT_ATTN_OUT");
+    const bool batch_expand = !getenv("DS4_METAL_DISABLE_V41_DRAFT_EXPAND");
+    const bool batch_norm = !getenv("DS4_METAL_DISABLE_V41_DRAFT_HEAD_INPUT");
     *draft_count = 0;
     if (target->tp_world == 2) ds4_gpu_tp_suspend_expert_sharding(1);
     bool ok = ds4_gpu_begin_commands() && ds41_dspark_update_cache(target, m, dw);
@@ -42547,11 +42555,15 @@ static bool ds41_dspark_propose(ds41_gpu_graph *target, const ds4_model *base,
             ok = ds4_gpu_attention_decode_heads_tensor(row.heads, m->map, m->size,
                 l->attn_sinks->abs_offset, row.q, d->cache[stage], raw, 128, 0,
                 b->kv, 0, 5, NULL, 0, DS4_N_HEAD, 512) &&
-                ds41_bf16(row.heads, DS4_N_HEAD * 512u) &&
-                ds4_gpu_dsv41_rope(row.heads, 512, DS4_N_HEAD, 1, pos + i, false, true) &&
+                (batch_heads || (ds41_bf16(row.heads, DS4_N_HEAD * 512u) &&
+                 ds4_gpu_dsv41_rope(row.heads, 512, DS4_N_HEAD, 1, pos + i, false, true))) &&
                 (!getenv("DS4_METAL_DISABLE_V41_DRAFT_ATTN_OUT") ||
                  (ds41_attention_output(&row, m, l, row.block) && ds41_bf16(row.block, DS4_N_EMBD)));
         }
+        /* Draft attention rows are independent; batch their output boundary. */
+        if (ok && batch_heads)
+            ok = ds4_gpu_dsv41_quantize(b->heads, DS4_N_HEAD * 512u, 5, DS4_V41_BF16) &&
+                ds4_gpu_dsv41_rope(b->heads, 512, DS4_N_HEAD, 5, pos, false, true);
         if (ok && !getenv("DS4_METAL_DISABLE_V41_DRAFT_ATTN_OUT"))
             ok = ds4_gpu_dsv41_attention_output_verify(b->block, b->low, m->map, m->size,
                 l->attn_output_a->abs_offset, l->attn_output_b->abs_offset, b->heads, 5, 1, 0) &&
@@ -42560,16 +42572,22 @@ static bool ds41_dspark_propose(ds41_gpu_graph *target, const ds4_model *base,
             ds41_moe_batch(g, m, l, 40u + stage, 5, false) &&
             ds4_gpu_add_tensor(b->block, b->routed, b->shared, 5u * DS4_N_EMBD) &&
             ds4_gpu_dsv41_quantize(b->block, DS4_N_EMBD, 5, DS4_V41_BF16) &&
-            ds4_gpu_hc_expand_split_tensor(b->residual, b->block, b->after_attn,
+            (batch_expand ? ds41_hc_expand_batch(b->residual, b->block, b->after_attn,
+                b->ffn_split, 5) :
+             ds4_gpu_hc_expand_split_tensor(b->residual, b->block, b->after_attn,
                 b->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-            ds4_gpu_dsv41_quantize(b->residual, DS4_N_HC * DS4_N_EMBD, 5, DS4_V41_BF16);
+             ds4_gpu_dsv41_quantize(b->residual, DS4_N_HC * DS4_N_EMBD, 5, DS4_V41_BF16));
     }
-    for (unsigned i = 0; ok && i < 5; i++) {
+    if (ok && batch_norm)
+        ok = ds41_hc_sum_batch(g->batch.x, g->batch.residual, g->batch.ffn_split, true, 5) &&
+            ds41_norm_batch(g->batch.norm, g->batch.x, m, dw->stage[2].norm, 5);
+    for (unsigned i = 0; ok && !batch_norm && i < 5; i++) {
         ds41_prefill_row *r = &g->rows_view[i];
         ok = ds41_hc_sum_bf16(r->x, r->residual, r->ffn_split, true) &&
             ds41_norm(r->norm, r->x, m, dw->stage[2].norm);
     }
     if (!ds4_gpu_end_commands()) ok = false;
+    const bool gpu_select = !getenv("DS4_METAL_DISABLE_V41_DRAFT_GPU_SELECT");
     int previous = seed;
     for (unsigned i = 0; ok && i < 5; i++) {
         ok = ds4_gpu_begin_commands() &&
@@ -42594,10 +42612,21 @@ static bool ds41_dspark_propose(ds41_gpu_graph *target, const ds4_model *base,
                 ok = ds41_matmul(d->head_logits, base, weights->output, g->rows_view[i].norm, false);
             else if (ok && i == 0)
                 ok = ds41_matmul_batch(d->head_logits, base, weights->output, g->batch.norm, 5, false);
+            /* Preserve the float addition and lowest-index tie break, but
+             * return only the selected token instead of two vocabulary rows. */
+            if (ok && gpu_select) {
+                ds4_gpu_tensor *head = ds4_gpu_tensor_view(d->head_logits,
+                    lazy_head ? 0 : (uint64_t)i * DS4_N_VOCAB * 4u,
+                    (uint64_t)DS4_N_VOCAB * 4u);
+                ok = head && ds4_gpu_add_tensor(d->markov_logits,
+                    d->markov_logits, head, DS4_N_VOCAB) &&
+                    ds4_gpu_argmax_tensor(d->confidence, d->markov_logits, DS4_N_VOCAB);
+                ds4_gpu_tensor_free(head);
+            }
             if (!ds4_gpu_end_commands()) ok = false;
-            if (ok) ok = ds4_gpu_tensor_read(d->markov_logits, 0, bias,
+            if (ok && !gpu_select) ok = ds4_gpu_tensor_read(d->markov_logits, 0, bias,
                                             (uint64_t)DS4_N_VOCAB * 4u);
-            if (ok && (lazy_head || i == 0))
+            if (ok && !gpu_select && (lazy_head || i == 0))
                 ok = ds4_gpu_tensor_read(d->head_logits, 0,
                     d->logits + (lazy_head ? (size_t)i * DS4_N_VOCAB : 0),
                     (uint64_t)(lazy_head ? 1 : 5) * DS4_N_VOCAB * 4u);
@@ -42605,8 +42634,11 @@ static bool ds41_dspark_propose(ds41_gpu_graph *target, const ds4_model *base,
         if (ok) {
             const float *logits = d->logits + (size_t)i * DS4_N_VOCAB;
             int best = 0;
-            for (uint32_t token = 1; token < DS4_N_VOCAB; token++)
+            if (gpu_select)
+                ok = ds4_gpu_tensor_read(d->confidence, 0, &best, sizeof(best));
+            else for (uint32_t token = 1; token < DS4_N_VOCAB; token++)
                 if (logits[token] + bias[token] > logits[best] + bias[best]) best = (int)token;
+            if (!ok) break;
             drafts[i] = previous = best;
             *draft_count = i + 1u;
         }

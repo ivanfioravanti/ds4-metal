@@ -178,6 +178,55 @@ Rates are tokens/s. The ordinary HTTP comparator is the prior sweep; unlike
 the repeated native comparison, small HTTP differences are not established
 statistical gains.
 
+### Draft and snapshot follow-up
+
+The next round batches the draft's attention-output BF16/rotation and final
+HC reduction/normalization, and uses the existing fused HC expansion boundary.
+Draft-token selection adds the vocabulary and Markov logits on the GPU and
+uses the existing lowest-index argmax, reading back one token instead of two
+full vocabulary rows. The verifier captures both recurrent pooling buffers
+with one integer compute dispatch instead of two blit encoders. Target and
+draft weights, confidence 0.6, proposal width and sampling remain unchanged.
+
+Three rotating repetitions compare ordinary decode, the preceding DSpark
+path with these five diagnostic switches disabled, and the optimized path.
+The cold raw prefix has 7,956 tokens, generation has 512 greedy tokens, and
+context allocation is 327,680. Acceptance counts are checked against the
+preceding path. Median measurements:
+
+| Configuration | Ordinary tokens/s | DSpark before tokens/s | DSpark after tokens/s | Draft before seconds | Draft after seconds |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Single Mac | 25.51 | 26.60 | 26.83 | 2.278 | 2.103 |
+| TP RDMA | 29.97 | 30.21 | 30.49 | 2.291 | 2.132 |
+
+Drafting time fell 7.7% on one Mac and 6.9% with TP. Verification/commit time
+stayed effectively flat: single-Mac 11.19 to 11.19 seconds, TP 9.50 to 9.52
+seconds per 512 outputs.
+
+Full-logit, live-cache, RNG and output checks passed on single-Mac and RDMA,
+including forced six-row verification, rejected suffixes and ring wraparound.
+The long oracle checks prefixes 16,383 and 32,767; TCP fallback and normal
+resident/SSD regression checks are also included. The full regression suite
+retains the nine known assertions with no new failures. Runtime validation
+is on M3 Ultra; CUDA hardware was not available.
+
+The cold HTTP sweep uses the same ten prompts from 512 through 256K nominal
+context, 128 output-token cap, temperature 0.7, and one unseeded request per
+point. At the final 254,680-token prompt:
+
+| Configuration | Previous DSpark decode | New DSpark decode | New prefill |
+| --- | ---: | ---: | ---: |
+| Single Mac | 20.45 | 19.83 | 628.51 |
+| TP RDMA | 23.44 | 23.45 | 644.57 |
+
+The new TP 256K request stopped naturally after 98 output tokens; all other
+new points reached the 128-token cap.
+
+Rates are tokens/s. The HTTP results are single sampled requests and use
+previous sweeps as comparators; small differences are not established
+statistical gains. Use the rotating greedy measurements for the controlled
+before/after comparison.
+
 ## DeepSeek Flash: DSpark
 
 DSpark is a separate support GGUF, not a standalone language model. It proposes

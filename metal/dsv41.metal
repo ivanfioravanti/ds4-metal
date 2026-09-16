@@ -317,3 +317,12 @@ kernel void kernel_dsv41_window_push(device uint *window,
     undo[gid] = window[gid];
     window[gid] = kv[gid];
 }
+
+// Capture both recurrent pooling buffers without switching to a blit encoder.
+kernel void kernel_dsv41_pool_snapshot(device uint *saved_kv,
+        device uint *saved_score, device const uint *kv,
+        device const uint *score, uint gid [[thread_position_in_grid]]) {
+    if (gid >= 512u) return;
+    saved_kv[gid] = kv[gid];
+    saved_score[gid] = score[gid];
+}

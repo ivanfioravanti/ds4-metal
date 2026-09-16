@@ -85,6 +85,8 @@ int ds4_gpu_dsv41_attention_output_verify(
     ds4_gpu_tensor *out, ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
     uint64_t out_a_offset, uint64_t out_b_offset, const ds4_gpu_tensor *heads,
     uint32_t rows, uint32_t world, uint32_t rank);
+int ds4_gpu_dsv41_pool_snapshot(ds4_gpu_tensor *saved_kv, ds4_gpu_tensor *saved_score,
+        const ds4_gpu_tensor *kv, const ds4_gpu_tensor *score, uint32_t row);
 int ds4_gpu_dsv41_window_push(ds4_gpu_tensor *window, ds4_gpu_tensor *undo,
         const ds4_gpu_tensor *kv, uint32_t slot, uint32_t row);
 int ds4_gpu_parallel_ffn_finish(void);

@@ -48241,6 +48241,33 @@ int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
     }
 }
 
+int ds4_gpu_dsv41_pool_snapshot(ds4_gpu_tensor *saved_kv, ds4_gpu_tensor *saved_score,
+        const ds4_gpu_tensor *kv, const ds4_gpu_tensor *score, uint32_t row) {
+    if (row >= 6u ||
+        !dsv41_tensor_has_floats(saved_kv, (uint64_t)(row + 1u) * 512u) ||
+        !dsv41_tensor_has_floats(saved_score, (uint64_t)(row + 1u) * 512u) ||
+        !dsv41_tensor_has_floats(kv, 512u) || !dsv41_tensor_has_floats(score, 512u)) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_pool_snapshot");
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:ds4_gpu_tensor_buffer(saved_kv)
+                offset:ds4_gpu_tensor_offset(saved_kv) + (NSUInteger)row * 512u * 4u atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(saved_score)
+                offset:ds4_gpu_tensor_offset(saved_score) + (NSUInteger)row * 512u * 4u atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(kv) offset:ds4_gpu_tensor_offset(kv) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(score) offset:ds4_gpu_tensor_offset(score) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(2, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 verifier pool snapshot");
+    }
+}
+
 int ds4_gpu_dsv41_window_push(ds4_gpu_tensor *window, ds4_gpu_tensor *undo,
         const ds4_gpu_tensor *kv, uint32_t slot, uint32_t row) {
     if (slot >= 128u || row >= 6u ||

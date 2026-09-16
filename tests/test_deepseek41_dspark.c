@@ -21,7 +21,7 @@ static bool same_frontier(ds4_session *a, ds4_session *b) {
 
 int main(int argc, char **argv) {
     if (argc != 4 && argc != 8) {
-        fprintf(stderr, "usage: %s TARGET.gguf DRAFT.gguf PROMPT.txt [LISTEN PORT RDMA_DEVICE GID]\n", argv[0]);
+        fprintf(stderr, "usage: %s TARGET.gguf DRAFT.gguf PROMPT.txt [LISTEN PORT RDMA_DEVICE_OR_tcp GID]\n", argv[0]);
         return 2;
     }
     char err[256] = {0}, *text = NULL;
@@ -40,7 +40,8 @@ int main(int argc, char **argv) {
         long gid = strtol(argv[7], &end, 10);
         CHECK(end != argv[7] && !*end && gid >= 0 && gid <= 255);
         opt.tp = (ds4_tp_options){.role = DS4_TP_LEADER, .listen_host = argv[4],
-            .listen_port = (int)port, .transport = DS4_TP_TRANSPORT_RDMA,
+            .listen_port = (int)port, .transport = !strcmp(argv[6], "tcp") ?
+                DS4_TP_TRANSPORT_TCP : DS4_TP_TRANSPORT_RDMA,
             .rdma_device = argv[6], .rdma_gid_index = (int)gid, .rdma_gid_index_set = true};
     }
     CHECK(imatrix_read_text_file(argv[3], &text, &bytes));
@@ -59,9 +60,14 @@ int main(int argc, char **argv) {
     CHECK(ds4_session_create(&candidate, e, 4096) == 0);
     ds4_encode_chat_prompt(e, NULL, text, DS4_THINK_NONE, &prompt);
     CHECK(prompt.len > 2047);
-    const int prefixes[] = {18, 127, 128, 129, 511, 2047};
+    const int prefixes[] = {18, 127, 128, 129, 511, 2047, 127};
+    const float confidence = e->dspark_confidence_threshold;
     unsigned cycles = 0, accepted_drafts = 0;
     for (unsigned p = 0; p < sizeof(prefixes) / sizeof(prefixes[0]); p++) {
+        /* Force all five proposals across a ring wrap, including rejected
+         * suffixes. Ordinary confidence filtering rarely exercises six rows. */
+        const bool full_width = p == 6;
+        e->dspark_confidence_threshold = full_width ? 0.f : confidence;
         ds4_session_invalidate(control);
         ds4_session_invalidate(candidate);
         prompt.len = prefixes[p];
@@ -76,6 +82,8 @@ int main(int argc, char **argv) {
             int n = ds4_session_eval_speculative_argmax_ignoring_eos(candidate, seed,
                 cap, -1, DS4_THINK_NONE, tokens, cap, err, sizeof(err));
             CHECK(n > 0 && n <= cap);
+            if (full_width && cap == 6)
+                CHECK(candidate->ds41_graph.verify && candidate->ds41_graph.verify->count == 6);
             for (int i = 0; i < n; i++) {
                 CHECK(tokens[i] == ds4_session_argmax_ignoring_eos(control, DS4_THINK_NONE));
                 CHECK(ds4_session_eval(control, tokens[i], err, sizeof(err)) == 0);
@@ -85,8 +93,10 @@ int main(int argc, char **argv) {
             accepted_drafts += n - 1;
             cycles++;
         }
-        fprintf(stderr, "V4.1 DSpark prefix=%d: 64 identical greedy tokens and exact target frontiers PASS\n", prefixes[p]);
+        fprintf(stderr, "V4.1 DSpark prefix=%d%s: 64 identical greedy tokens and exact target frontiers PASS\n",
+                prefixes[p], full_width ? " forced-six-row" : "");
     }
+    e->dspark_confidence_threshold = confidence;
     CHECK(accepted_drafts > 0);
     ds4_session_invalidate(control);
     ds4_session_invalidate(candidate);

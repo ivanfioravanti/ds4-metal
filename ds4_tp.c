@@ -174,6 +174,7 @@ typedef struct {
     bool block_active;
     uint32_t block_rows;
     uint32_t block_layers;
+    uint32_t block_ring_slots;
     uint32_t block_posted;      /* layers whose receives are posted */
     uint64_t block_recv_done;   /* row messages received in this block */
 } ds4_tp_rdma;
@@ -1352,6 +1353,10 @@ static int tp_rdma_ensure_work_requests(ds4_tp_rdma *r) {
 }
 
 /* Verify-block window helpers. */
+static uint32_t tp_rdma_block_slot(const ds4_tp *tp, uint32_t step) {
+    return tp->rdma.block_ring_slots ? step % tp->rdma.block_ring_slots : step;
+}
+
 static int tp_rdma_block_post_layer(ds4_tp *tp, uint32_t layer) {
     ds4_tp_rdma *r = &tp->rdma;
     const uint32_t rows = r->block_rows;
@@ -1363,7 +1368,7 @@ static int tp_rdma_block_post_layer(ds4_tp *tp, uint32_t layer) {
     struct ibv_recv_wr *wr = r->win_rwr;
     memset(wr, 0, (size_t)n * sizeof(*wr));
     const uintptr_t base =
-        (uintptr_t)(tp->slab + ds4_tp_slab_batch_in_offset(tp, layer));
+        (uintptr_t)(tp->slab + ds4_tp_slab_batch_in_offset(tp, tp_rdma_block_slot(tp, layer)));
     uint32_t wi = 0;
     for (uint32_t row = 0; row < rows; row++) {
         for (uint64_t off = 0; off < tp->vec_bytes; ) {
@@ -1416,7 +1421,7 @@ static int tp_rdma_block_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows
         if (ok) {
             memset(wr, 0, (size_t)n * sizeof(*wr));
             const uintptr_t base =
-                (uintptr_t)(tp->slab + ds4_tp_slab_batch_out_offset(tp, layer));
+                (uintptr_t)(tp->slab + ds4_tp_slab_batch_out_offset(tp, tp_rdma_block_slot(tp, layer)));
             uint32_t wi = 0;
             for (uint32_t row = 0; row < rows; row++) {
                 for (uint64_t off = 0; off < tp->vec_bytes; ) {
@@ -2183,7 +2188,8 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
  * send), and from then on each gate posts the next layer's receives and
  * sends its rows without any handshake.  Returns 1 also when RDMA is not
  * in use (the TCP fallback keeps its per-gate headers). */
-int ds4_tp_batch_block_begin(ds4_tp *tp, uint32_t rows, uint32_t n_layers) {
+static int tp_batch_block_begin_impl(ds4_tp *tp, uint32_t rows, uint32_t n_layers,
+                                     uint32_t ring_slots) {
 #ifdef DS4_TP_HAVE_VERBS
     if (!tp->rdma_active || !tp_rdma_big_gate_capable(tp)) return 1;
     if (getenv("DS4_TP_DISABLE_VERIFY_WINDOW")) return 1;
@@ -2194,6 +2200,7 @@ int ds4_tp_batch_block_begin(ds4_tp *tp, uint32_t rows, uint32_t n_layers) {
     r->block_active = true;
     r->block_rows = rows;
     r->block_layers = n_layers;
+    r->block_ring_slots = ring_slots;
     r->block_posted = 0;
     r->block_recv_done = 0;
     const int ok = tp_rdma_block_post_layer(tp, 0);
@@ -2204,9 +2211,21 @@ int ds4_tp_batch_block_begin(ds4_tp *tp, uint32_t rows, uint32_t n_layers) {
         fprintf(stderr, "ds4-tp: verify window armed: %u rows x %u layers\n", rows, n_layers);
     return 1;
 #else
-    (void)tp; (void)rows; (void)n_layers;
+    (void)tp; (void)rows; (void)n_layers; (void)ring_slots;
     return 1;
 #endif
+}
+
+int ds4_tp_batch_block_begin(ds4_tp *tp, uint32_t rows, uint32_t n_layers) {
+    return tp_batch_block_begin_impl(tp, rows, n_layers, 0);
+}
+
+/* Two slots suffice: when gate k arrives, its GPU has finished reading
+ * gate k-1. Posting k+1 into that old slot is therefore safe. This avoids
+ * enlarging the registered slab for models with two gates per layer. */
+int ds4_tp_batch_block_begin_ring(ds4_tp *tp, uint32_t rows, uint32_t n_gates) {
+    if (!tp || tp->n_layer < 2) return 0;
+    return tp_batch_block_begin_impl(tp, rows, n_gates, 2);
 }
 
 /* End of the verify block: every gate must have been exchanged (all
@@ -2289,6 +2308,14 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes) {
     if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
 #ifdef DS4_TP_HAVE_VERBS
+    if (tp->rdma.block_active && tp->rdma.block_ring_slots) {
+        const uint32_t slot = tp_rdma_block_slot(tp, layer);
+        if (bytes != (uint64_t)tp->rdma.block_rows * tp->vec_bytes ||
+            out != tp->slab + ds4_tp_slab_batch_out_offset(tp, slot) ||
+            in != tp->slab + ds4_tp_slab_batch_in_offset(tp, slot)) return 0;
+        return tp_rdma_block_gate_exchange(tp, layer, tp->rdma.block_rows);
+    }
+
     static int dbg = -1;
     if (dbg < 0) dbg = getenv("DS4_TP_BIG_GATE_DEBUG") != NULL;
     const double t_start = dbg ? tp_now_sec() : 0.0;

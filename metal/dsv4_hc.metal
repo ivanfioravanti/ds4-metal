@@ -1156,7 +1156,7 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16(
     const uint n  = (uint)args.n;
     const uint n4 = n >> 2;
 
-    device const float4 *x4 = (device const float4 *)x;
+    device const float4 *x4 = (device const float4 *)x + (uint64_t)tgpig.y * n4;
 
     threadgroup float *norm_shmem = (threadgroup float *)shmem;        // NW slots
     threadgroup float *mv_shmem   = (threadgroup float *)shmem + NW;   // NW*NR0 slots
@@ -1218,7 +1218,7 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16(
     }
 
     // Supported 16384/20480-wide residuals have no scalar matvec tail.
-    device float * dst_f32 = (device float *) dst;
+    device float * dst_f32 = (device float *) dst + (uint64_t)tgpig.y * args.out_dim;
     helper_mv_reduce_and_write<NR0>(dst_f32, sumf_mv, r0, args.out_dim,
                                     tiisg, sgitg, (threadgroup char *)mv_shmem);
 }

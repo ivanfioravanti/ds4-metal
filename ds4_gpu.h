@@ -81,6 +81,10 @@ int ds4_gpu_flush_commands(void);
 int ds4_gpu_commands_active(void);
 #include "ds4_deepseek41_gpu.h"
 #ifdef __APPLE__
+int ds4_gpu_dsv41_attention_output_verify(
+    ds4_gpu_tensor *out, ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+    uint64_t out_a_offset, uint64_t out_b_offset, const ds4_gpu_tensor *heads,
+    uint32_t rows, uint32_t world, uint32_t rank);
 int ds4_gpu_parallel_ffn_finish(void);
 /* Execute an armed V4.1 shared expert without routed work (serial control). */
 int ds4_gpu_dsv41_shared_expert_only(void);
@@ -444,6 +448,10 @@ int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
 void ds4_gpu_print_memory_report(const char *label);
 
 #include "ds4_gpu_tp.h"
+#ifdef __APPLE__
+int ds4_gpu_tp_verify_gate_encode(uint32_t step, uint32_t rows,
+        const ds4_gpu_tensor *out, ds4_gpu_tensor *in, uint64_t bytes);
+#endif
 /* Skip the whole-file model residency set (TP sharding: only the
  * owned ranges are warmed; the rest must never be paged in). Call before
  * the model is mapped. */
@@ -1138,6 +1146,11 @@ int ds4_gpu_rms_norm_plain_rows_tensor(
 
 
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
+int ds4_gpu_dsv41_hc_mix_rows(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t offset, uint32_t rows, float eps);
+int ds4_gpu_dsv41_norm_rows_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n, uint32_t rows, float eps);
 int ds4_gpu_dsv41_norm_bf16(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,

@@ -191,6 +191,58 @@ void kernel_mul_mv_q8_0_f32_impl(
     helper_mv_reduce_and_write<NR0, ROUND_BF16>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
+// Two token rows share each quantized weight load while retaining the
+// scalar K walk and reduction tree for each output independently.
+kernel void kernel_mul_mv_q8_0_f32_token_pair(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device char * dst,
+        threadgroup char * shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NR0 = N_R0_Q8_0;
+    constexpr short NQ = 8;
+    const short NSG = FC_mul_mv_nsg;
+    const int r0 = tgpig.x * NR0;
+    const int token = tgpig.y * 2;
+    const int second = min(token + 1, args.ne11 - 1);
+    device const float * y0 = (device const float *)(src1 + (uint64_t)token * args.nb11);
+    device const float * y1 = (device const float *)(src1 + (uint64_t)second * args.nb11);
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row)
+        ax[row] = (device const block_q8_0 *)(src0 + (uint64_t)(r0 + row) * args.nb01);
+    float sum0[NR0] = {0.f}, sum1[NR0] = {0.f};
+    const short ix = tiisg / (N_SIMDWIDTH / NQ);
+    const short il = tiisg % (N_SIMDWIDTH / NQ);
+    for (int ib = sgitg * NQ + ix; ib < args.ne00 / QK8_0; ib += NSG * NQ) {
+        float yl0[NQ], yl1[NQ];
+        FOR_UNROLL (short i = 0; i < NQ; ++i) {
+            yl0[i] = y0[ib * QK8_0 + il * NQ + i];
+            yl1[i] = y1[ib * QK8_0 + il * NQ + i];
+        }
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const int8_t * qs = ax[row][ib].qs + il * NQ;
+            float q0 = 0.f, q1 = 0.f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                const float q = qs[i];
+                q0 += q * yl0[i];
+                q1 += q * yl1[i];
+            }
+            const float d = ax[row][ib].d;
+            sum0[row] += q0 * d;
+            sum1[row] += q1 * d;
+        }
+    }
+    helper_mv_reduce_and_write<NR0>((device float *)dst + (uint64_t)token * args.ne0,
+        sum0, r0, args.ne01, tiisg, sgitg, shmem);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (token + 1 < args.ne11)
+        helper_mv_reduce_and_write<NR0>((device float *)dst + (uint64_t)(token + 1) * args.ne0,
+            sum1, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
 // Decode-time Q8_0 matrix-vector multiply. DS4 uses this for Q8_0 dense
 // projections such as shared experts and output-side small matvecs.
 [[host_name("kernel_mul_mv_q8_0_f32")]]

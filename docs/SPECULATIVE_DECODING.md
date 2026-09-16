@@ -63,28 +63,54 @@ This is opt-in experimental support, not a guaranteed speedup. Small verifier
 batches and rejected drafts can cost more than ordinary decode; benchmark both
 modes with the same prompt and sampling settings.
 
-On two M3 Ultra Macs (80 GPU cores and 512 GiB each), a V4.1 Flash Q4 trial
-with a 7,956-token cold prefix and 512 greedy generated tokens measured these
-median overall decode rates across three alternating runs (327,680 allocated
-context, confidence 0.6):
+On two M3 Ultra Macs (80 GPU cores and 512 GiB each), the September 16,
+2026 optimization round used a 7,956-token cold prefix, 512 greedy output
+tokens, 327,680 allocated context, and confidence 0.6. Rates below are median
+overall generation throughput from three runs. Ordinary and optimized DSpark
+runs alternated; the initial DSpark column is the earlier three-run baseline.
 
-| Configuration | Ordinary decode | DSpark |
-| --- | ---: | ---: |
-| Single Mac | 25.63 tokens/s | 22.18 tokens/s |
-| Two Macs, TP RDMA | 30.12 tokens/s | 20.92 tokens/s |
+| Configuration | Ordinary decode | Initial DSpark | Optimized DSpark |
+| --- | ---: | ---: | ---: |
+| Single Mac | 25.58 | 22.18 | 25.85 |
+| Two Macs, TP RDMA | 30.09 | 20.92 | 28.95 |
 
-These measurements favor ordinary decode. Draft acceptance alone is insufficient:
-the draft and small-batch target verifier must together cost less than serial
-target decoding. V4.1 DSpark remains disabled by default.
+Rates are tokens/s. The single-Mac gain over ordinary decode is modest
+(about 1.1%); TP still trails ordinary decode by about 3.8%. DSpark remains
+opt-in. Confidence 0.6 beat 0.45, 0.75 and 0.9 after optimization; shorter
+draft caps and shallower command-buffer queues did not improve this workload.
 
-The matching cold HTTP sweep covered 512 through 256K nominal context with
-128 output tokens, temperature 0.7, and one unseeded trial per configuration
+The drafter now rejects low-confidence rows before vocabulary projection and
+projects only requested proposal rows. Draft and verifier attention outputs
+are batched; small Q8 batches share weight reads while retaining scalar
+reductions. Small-batch HC and normalization fuse their existing BF16
+boundaries. Solo verification submits layers while the CPU encodes subsequent
+work. Rollback saves only overwritten raw-KV ring rows, reducing verifier
+storage by about 59.5 MiB. TP verification reuses a two-slot RDMA receive
+window and ordinary decode's checked-payload publication and GPU release
+polling, avoiding per-gate control handshakes and shared-event releases.
+
+Proposal and acceptance counts were unchanged. In TP, 318 draft cycles
+accepted 194 extra tokens; 153 cycles proposed nothing. Generating 512 tokens
+therefore evaluated 552 target rows, including rejected proposals. Improving
+small-batch target verification remains more useful than merely raising the
+reported acceptance percentage.
+
+`make test-q8-decode-rows` checks exact Q8 output and buffer guards with solo
+and TP thread-group sizes. The full DSpark oracle checks greedy and sampled
+output, logits, RNG, and live target state on single-Mac, RDMA and TCP paths.
+
+The matching cold HTTP sweeps covered 512 through 256K
+nominal context with 128 output tokens, temperature 0.7, and one unseeded trial per configuration
 and context. At the final 254,680-token prompt:
 
-| Configuration | Ordinary prefill | DSpark prefill | Ordinary decode | DSpark decode |
-| --- | ---: | ---: | ---: | ---: |
-| Single Mac | 629.17 | 628.95 | 20.66 | 17.12 |
-| TP RDMA | 645.15 | 644.40 | 23.37 | 18.04 |
+| Configuration | Prior ordinary prefill | Optimized DSpark prefill | Prior ordinary decode | Initial DSpark decode | Optimized DSpark decode |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Single Mac | 629.17 | 628.52 | 20.66 | 17.12 | 20.42 |
+| TP RDMA | 645.15 | 644.55 | 23.37 | 18.04 | 22.06 |
+
+Optimized TP reached 30.48–31.89 tokens/s at nominal 512–16K contexts in
+this chat workload. Its longer accepted draft batches differ from the raw
+greedy benchmark above. Ordinary HTTP results are from the prior sweep.
 
 Rates are tokens/s. Small differences in this single-trial HTTP sweep should
 not be interpreted as statistically established gains.

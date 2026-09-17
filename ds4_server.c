@@ -738,6 +738,8 @@ typedef struct {
     /* Distinguish the Responses hosted tool from a normal function that
      * happens to be named "tool_search". */
     bool responses_tool_search;
+    /* Responses freeform tool: answers as custom_tool_call with a raw body. */
+    bool responses_custom;
     char **prop;
     char **prop_schema;
     int len;
@@ -1696,6 +1698,123 @@ done:
     return out;
 }
 
+/* Responses clients may register a freeform ("custom") tool whose body is raw
+ * text instead of JSON arguments; Codex code mode declares its `exec` tool that
+ * way. The prompt formats only understand named parameters, so render one
+ * required `input` string. Without this the tool is dropped from the schema
+ * list and every call to it is rejected as an undeclared name. */
+static char *responses_custom_schema_from_tool(const char *raw,
+                                               const char *namespace,
+                                               char **wire_name) {
+    const char *p = raw;
+    json_ws(&p);
+    if (*p != '{') return NULL;
+    p++;
+
+    char *type = NULL;
+    char *name = NULL;
+    char *description = NULL;
+    char *out = NULL;
+
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto done;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto done;
+        }
+        p++;
+        if (!strcmp(key, "type")) {
+            if (!json_string_replace(&p, &type)) {
+                free(key);
+                goto done;
+            }
+        } else if (!strcmp(key, "name")) {
+            if (!json_string_replace(&p, &name)) {
+                free(key);
+                goto done;
+            }
+        } else if (!strcmp(key, "description")) {
+            if (!json_string_replace(&p, &description)) {
+                free(key);
+                goto done;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto done;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+
+    if (type && !strcmp(type, "custom") && name && name[0]) {
+        buf prompt_name = {0};
+        if (namespace && namespace[0]) buf_puts(&prompt_name, namespace);
+        buf_puts(&prompt_name, name);
+
+        buf b = {0};
+        buf_puts(&b, "{\"name\":");
+        json_escape(&b, prompt_name.ptr ? prompt_name.ptr : name);
+        buf_puts(&b, ",\"description\":");
+        json_escape(&b, description ? description : "");
+        buf_puts(&b,
+                 ",\"parameters\":{\"type\":\"object\",\"properties\":{\"input\":"
+                 "{\"type\":\"string\",\"description\":\"Complete freeform body "
+                 "for this tool, passed through verbatim.\"}},"
+                 "\"required\":[\"input\"]}}");
+        out = buf_take(&b);
+        if (wire_name) *wire_name = xstrdup(name);
+        buf_free(&prompt_name);
+    }
+
+done:
+    free(type);
+    free(name);
+    free(description);
+    return out;
+}
+
+/* Flag the order just registered from a freeform schema so the response layer
+ * answers with custom_tool_call instead of function_call. */
+static void tool_schema_orders_mark_custom(tool_schema_orders *orders,
+                                           const char *schema_json) {
+    const char *p = schema_json;
+    char *name = NULL;
+    json_ws(&p);
+    if (*p != '{') return;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) break;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            break;
+        }
+        p++;
+        if (!strcmp(key, "name")) {
+            free(key);
+            json_string_replace(&p, &name);
+            break;
+        }
+        free(key);
+        if (!json_skip_value(&p)) break;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (name) {
+        int idx = tool_schema_orders_find_index(orders, name);
+        if (idx >= 0) orders->v[idx].responses_custom = true;
+        free(name);
+    }
+}
+
 static bool parse_schema_properties(const char *json, tool_schema_order *order) {
     const char *p = json;
     json_ws(&p);
@@ -1868,9 +1987,15 @@ static bool append_responses_namespace_tool_schemas(buf *schemas,
         char *wire_name = NULL;
         char *schema =
             responses_namespace_function_schema_from_tool(tool_raw, name, &wire_name);
+        bool custom = false;
+        if (!schema) {
+            schema = responses_custom_schema_from_tool(tool_raw, name, &wire_name);
+            custom = schema != NULL;
+        }
         if (schema) {
             append_raw_json_line(schemas, schema);
             tool_schema_orders_add_json_wire(orders, schema, name, wire_name, false);
+            if (custom) tool_schema_orders_mark_custom(orders, schema);
             appended = true;
         }
         free(schema);
@@ -1914,14 +2039,21 @@ static bool parse_tools_value(const char **p, char **out, tool_schema_orders *or
             tool_schema_orders_add_json(orders, function);
         } else if (!append_responses_namespace_tool_schemas(&schemas, orders, raw)) {
             char *special = responses_special_schema_from_tool(raw);
+            char *custom = special ? NULL
+                                   : responses_custom_schema_from_tool(raw, NULL, NULL);
             if (special) {
                 append_raw_json_line(&schemas, special);
                 tool_schema_orders_add_json_wire(orders, special,
                                                  NULL, NULL, true);
+            } else if (custom) {
+                append_raw_json_line(&schemas, custom);
+                tool_schema_orders_add_json(orders, custom);
+                tool_schema_orders_mark_custom(orders, custom);
             } else {
                 append_raw_json_line(&schemas, raw);
                 tool_schema_orders_add_json(orders, raw);
             }
+            free(custom);
             free(special);
         }
         free(function);
@@ -8475,6 +8607,24 @@ static bool responses_sse_message_done(int fd, responses_stream *st,
     return ok;
 }
 
+/* A custom_tool_call carries one raw string, but the prompt formats can only
+ * express named parameters, so the model answers with {"input":"..."}. Recover
+ * that body, falling back to the lone string argument when the model named it
+ * something else. */
+static char *tool_call_freeform_input(const char *arguments) {
+    json_args args = {0};
+    if (!json_args_parse(arguments, &args)) return NULL;
+    char *out = NULL;
+    for (int i = 0; i < args.len && !out; i++) {
+        if (args.v[i].is_string && args.v[i].key && !strcmp(args.v[i].key, "input"))
+            out = xstrdup(args.v[i].value ? args.v[i].value : "");
+    }
+    if (!out && args.len == 1 && args.v[0].is_string)
+        out = xstrdup(args.v[0].value ? args.v[0].value : "");
+    json_args_free(&args);
+    return out;
+}
+
 /* Item identity per tool call must be stable across added/done/completed. */
 typedef struct {
     char fc_id[40];
@@ -8492,12 +8642,13 @@ static bool responses_tool_call_is_tool_search(const tool_call *tc,
 /* The internal tool_call doesn't track whether it came from a function_call or
  * a custom_tool_call (or what tool kind is registered). For round-trip
  * correctness with the rare custom_tool_call clients, we preserve any provided
- * call_id verbatim and pre-assign a stable fc_id; the discriminator currently
- * defaults to function_call because Codex CLI registers all its tools as
- * function tools. */
+ * call_id verbatim and pre-assign a stable fc_id. The discriminator comes from
+ * the registered tool kind: a Responses freeform tool answers as
+ * custom_tool_call, everything else as function_call. */
 static void responses_tool_items_build(responses_tool_item **out,
                                        const tool_calls *calls,
-                                       int starting_output_index) {
+                                       int starting_output_index,
+                                       const tool_schema_orders *orders) {
     *out = NULL;
     if (!calls || calls->len == 0) return;
     responses_tool_item *items = xmalloc((size_t)calls->len * sizeof(*items));
@@ -8509,7 +8660,9 @@ static void responses_tool_items_build(responses_tool_item **out,
         } else {
             responses_random_id(items[i].call_id, sizeof(items[i].call_id), "call_");
         }
-        items[i].is_custom = false;
+        const tool_schema_order *order =
+            tool_schema_orders_find(orders, calls->v[i].name);
+        items[i].is_custom = order && order->responses_custom;
         items[i].output_index = starting_output_index + i;
     }
     *out = items;
@@ -8549,7 +8702,9 @@ static void responses_append_function_call_item(buf *b, const tool_call *tc,
     if (!with_args) {
         buf_puts(b, "\"\"");
     } else if (item->is_custom) {
-        json_escape(b, tc->arguments ? tc->arguments : "");
+        char *freeform = tool_call_freeform_input(tc->arguments);
+        json_escape(b, freeform ? freeform : (tc->arguments ? tc->arguments : ""));
+        free(freeform);
     } else {
         append_json_object_string(b, tc->arguments);
     }
@@ -8897,7 +9052,7 @@ static bool responses_sse_finish_live(int fd, const request *r,
         st->message_item_closed = true;
     }
     responses_tool_item *items = NULL;
-    responses_tool_items_build(&items, calls, st->next_output_index);
+    responses_tool_items_build(&items, calls, st->next_output_index, &r->tool_orders);
     if (items && calls) st->next_output_index += calls->len;
     bool ok = true;
     if (items && calls) {
@@ -8929,7 +9084,7 @@ static bool responses_final_response(int fd, bool enable_cors,
     responses_random_id(message_id, sizeof(message_id), "msg_");
 
     responses_tool_item *items = NULL;
-    responses_tool_items_build(&items, calls, 0);
+    responses_tool_items_build(&items, calls, 0, &r->tool_orders);
 
     long now = (long)time(NULL);
     const char *status = responses_status_for_finish(finish);

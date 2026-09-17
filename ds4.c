@@ -41338,9 +41338,46 @@ static bool ds41_hc_mix_batch(ds41_prefill_row *b, const ds4_model *m,
             DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
 }
 
+/* The residual sum consumes the preceding sublayer's mixer, so it can run
+ * alongside the next mixer projection. Join before their independent
+ * Sinkhorn and normalization consumers; preserve every BF16 boundary. */
+static bool ds41_hc_prepare_batch(ds41_prefill_row *b, const ds4_model *m,
+        const ds4_layer_weights *l, bool ffn, uint32_t il, uint32_t count,
+        bool speculative) {
+    const ds4_gpu_tensor *input = ffn ? b->after_attn : b->residual;
+    const ds4_gpu_tensor *pre = ffn ? b->attn_split : il ? b->ffn_split : b->pre;
+    const ds4_tensor *norm = ffn ? l->ffn_norm : l->attn_norm;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    const ds4_tensor *fn = ffn ? l->hc_ffn_fn : l->hc_attn_fn;
+    if (speculative && count >= 2 && count <= 6 && fn->type == DS4_TENSOR_F16 &&
+        ds41_batch_bf16_fused(count) && !getenv("DS4_METAL_DISABLE_V41_BATCH_HC_MIX") &&
+        !getenv("DS4_METAL_DISABLE_V41_SPEC_HC_OVERLAP") && ds4_gpu_dsv41_begin_parallel()) {
+        bool ok = ds4_gpu_dsv41_hc_mix_rows(b->mix, input, m->map, m->size,
+                fn->abs_offset, count, DS4_RMS_EPS) &&
+            ds41_hc_sum_batch(b->x, input, pre, ffn || il != 0, count);
+        ds4_gpu_dsv41_end_parallel();
+        if (!ok) return false;
+        const ds4_tensor *scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale;
+        const ds4_tensor *base = ffn ? l->hc_ffn_base : l->hc_attn_base;
+        bool parallel = ds4_gpu_dsv41_begin_parallel() != 0;
+        ok = ds4_gpu_hc_split_sinkhorn_tensor(ffn ? b->ffn_split : b->attn_split,
+                b->mix, m->map, m->size, scale->abs_offset, base->abs_offset,
+                DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS) &&
+            ds41_norm_batch(b->norm, b->x, m, norm, count);
+        if (parallel) ds4_gpu_dsv41_end_parallel();
+        return ok;
+    }
+#else
+    (void)speculative;
+#endif
+    return ds41_hc_mix_batch(b, m, l, ffn, count) &&
+        ds41_hc_sum_batch(b->x, input, pre, ffn || il != 0, count) &&
+        ds41_norm_batch(b->norm, b->x, m, norm, count);
+}
+
 static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                                          const ds4_model *m, const ds4_layer_weights *l,
-                                         uint32_t il, uint32_t count) {
+                                         uint32_t il, uint32_t count, bool speculative) {
     if (ds41_engram_layer(il)) {
         const uint32_t i = il == 1 ? 0 : 1;
         if (!ds41_matmul_batch(b->engram_kv, m, l->engram_kv, b->engram_rows, count, true) ||
@@ -41349,18 +41386,14 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                 DS4_N_EMBD, count, DS4_RMS_EPS))
             return false;
     }
-    if (!ds41_hc_mix_batch(b, m, l, false, count)) return false;
-    /* V4.1 consumes the preceding sublayer's mixer, not the newly computed one. */
-    return ds41_hc_sum_batch(b->x, b->residual, il ? b->ffn_split : b->pre, il != 0, count) &&
-        ds41_norm_batch(b->norm, b->x, m, l->attn_norm, count);
+    return ds41_hc_prepare_batch(b, m, l, false, il, count,
+        speculative && !g->quality && !g->streaming);
 }
 
 static bool ds41_after_attention_batch(ds41_prefill_row *b, const ds4_model *m,
-                                        const ds4_layer_weights *l, uint32_t count) {
+                                        const ds4_layer_weights *l, uint32_t count, bool speculative) {
     return ds41_hc_expand_batch(b->after_attn, b->block, b->residual, b->attn_split, count) &&
-        ds41_hc_mix_batch(b, m, l, true, count) &&
-        ds41_hc_sum_batch(b->x, b->after_attn, b->attn_split, true, count) &&
-        ds41_norm_batch(b->norm, b->x, m, l->ffn_norm, count);
+        ds41_hc_prepare_batch(b, m, l, true, 0, count, speculative);
 }
 
 static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
@@ -42416,7 +42449,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
             if (ok && batch_hc)
                 ok = ds41_dspark_capture(g, active.residual, il, start, count) &&
-                    ds41_before_attention_batch(g, &active, m, &w->layer[il], il, count);
+                    ds41_before_attention_batch(g, &active, m, &w->layer[il], il, count, false);
             DS41_STAGE("hc/engram");
             for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
                 row.pos = start + t;
@@ -42461,7 +42494,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                                                    g->batch.low, count, true);
                 }
                 DS41_STAGE("attention output");
-                if (ok && batch_hc) ok = ds41_after_attention_batch(&active, m, l, count);
+                if (ok && batch_hc) ok = ds41_after_attention_batch(&active, m, l, count, false);
                 DS41_STAGE("hc/ffn norm");
                 for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
                     row.pos = start + t;
@@ -42643,7 +42676,7 @@ static bool ds41_dspark_propose(ds41_gpu_graph *target, const ds4_model *base,
         ds41_prefill_row *b = &g->batch;
         /* Stage zero consumes the identity pre-mix; later stages consume
          * the preceding FFN mix. These indices deliberately have no Engram. */
-        if (ok) ok = ds41_before_attention_batch(g, b, m, l, stage ? 40u + stage : 0u, 5);
+        if (ok) ok = ds41_before_attention_batch(g, b, m, l, stage ? 40u + stage : 0u, 5, true);
         if (ok) ok = ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, 5, true) &&
             ds41_norm_batch(b->qr, b->qr, m, l->attn_q_a_norm, 5) &&
             ds41_matmul_batch(b->q, m, l->attn_q_b, b->qr, 5, true) &&
@@ -42679,7 +42712,7 @@ static bool ds41_dspark_propose(ds41_gpu_graph *target, const ds4_model *base,
             ok = ds4_gpu_dsv41_attention_output_verify(b->block, b->low, m->map, m->size,
                 l->attn_output_a->abs_offset, l->attn_output_b->abs_offset, b->heads, 5, 1, 0) &&
                 ds4_gpu_dsv41_quantize(b->block, DS4_N_EMBD, 5, DS4_V41_BF16);
-        if (ok) ok = ds41_after_attention_batch(b, m, l, 5) &&
+        if (ok) ok = ds41_after_attention_batch(b, m, l, 5, !g->quality && !g->streaming) &&
             ds41_moe_batch(g, m, l, 40u + stage, 5, false, true) &&
             ds4_gpu_add_tensor(b->block, b->routed, b->shared, 5u * DS4_N_EMBD) &&
             ds4_gpu_dsv41_quantize(b->block, DS4_N_EMBD, 5, DS4_V41_BF16) &&
@@ -42905,7 +42938,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         }
         for (int i = 0; ok && i < count; i++)
             ok = ds41_dspark_capture(graphs[i], g->rows_view[i].residual, il, positions[i], 1);
-        if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
+        if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows, verify != NULL) &&
             ds41_attention_project_batch(g, model, l, rows);
         /* Rotation and quantization are row independent. Keep raw-window
          * writes inside the causal loop: later rows can wrap over keys that
@@ -42989,7 +43022,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
         DS41_VERIFY_STAGE(1);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
-            ds41_after_attention_batch(&active, model, l, rows);
+            ds41_after_attention_batch(&active, model, l, rows, verify && !g->quality && !g->streaming);
         DS41_VERIFY_STAGE(2);
         if (ok) ok = ds41_moe_batch(g, model, l, il, rows, shared_owner, verify != NULL) &&
             (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,

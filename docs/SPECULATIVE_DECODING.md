@@ -671,6 +671,75 @@ The final session-snapshot test passed. Ordinary decode timing stayed flat:
 single-node 25.57 → 25.63 and TP 30.10 → 30.04 tokens/s (one pair each),
 with byte-identical paired outputs. No tests beyond 8K prompt length ran.
 
+### M3 Ultra speculative HC mixer overlap (September 17)
+
+Ten additional experiments used 7,956 prompt tokens and 512 greedy output
+tokens on two M3 Ultras over TP RDMA. Each experiment was implemented and
+screened separately against interspersed controls (37.28–37.79 tokens/s).
+The first control and some first-use shader variants included pipeline setup;
+small differences in this screening table are not evidence of a repeatable win.
+
+| Experiment | Decode tokens/s | Outcome |
+| --- | ---: | --- |
+| Attention HC mixer overlap | 37.94 | Retained with FFN overlap |
+| FFN HC mixer overlap | 38.08 | Retained with attention overlap |
+| Q/KV rotation overlap | 37.69 | Removed |
+| Compressor/indexer projection overlap | 37.93 | Removed after repeated comparison |
+| Omit unused gate/up stores | 37.59 | Removed |
+| Gate projection token interleaving | 37.54 | Removed |
+| Down projection token interleaving | 37.65 | Removed |
+| Dense Q8 output tile interleaving | 37.33 | Removed |
+| Vectorized Q4 gate/up input loads | 37.28 | Removed |
+| Vectorized Q4 down input loads | 37.44 | Removed |
+
+Two refinements packed candidate tokens across SIMD groups to share weight
+cache lines without increasing per-thread registers. Gate/down variants reached
+37.37/37.52 against 37.77/37.74 controls and were removed. Combined attention
+and FFN overlap reached 38.15; adding auxiliary projection overlap reached
+38.24, and also adding Q/KV rotation overlap reached 38.22 in screening.
+All screening outputs were byte-identical to their controls.
+
+Three trials per variant, with rotated order, isolated the repeatable gain:
+
+| Variant | Trials (tokens/s) | Median |
+| --- | --- | ---: |
+| Previous release scheduling | 37.82, 37.58, 37.61 | 37.61 |
+| Attention + FFN HC overlap | 38.10, 38.35, 38.28 | 38.28 |
+| HC + auxiliary overlap | 37.91, 38.29, 38.28 | 38.28 |
+
+HC overlap improved the median **1.8%**. Auxiliary overlap added no median
+benefit and was removed, along with every experimental kernel. Median draft
+time fell 1.816 → 1.799 seconds and verification 7.362 → 7.170 seconds per
+512 outputs. Counts remained 318 cycles, 234 proposals and 194 accepted drafts;
+all nine outputs matched byte-for-byte. The 50 tokens/s goal remains unmet.
+
+The residual sum consumes the preceding sublayer mixer, allowing it to run
+concurrently with the next mixer projection. After joining, Sinkhorn and
+normalization also run independently and join before downstream consumers.
+Existing kernels, arithmetic and BF16 boundaries are unchanged. This applies
+only to speculative batches of 2–6 rows with supported F16 HC weights on
+M3 Ultra; ordinary prefill/session batching, quality mode, SSD streaming and
+other backends retain serial scheduling. The diagnostic switch
+`DS4_METAL_DISABLE_V41_SPEC_HC_OVERLAP=1` on both TP ranks reproduces the
+previous scheduling while retaining earlier MoE projection improvements.
+
+After removing the auxiliary experiment entirely, final clean-build pairs
+confirmed single-node **32.67 → 33.13 tokens/s (+1.4%)** and TP
+**37.66 → 38.36 tokens/s (+1.9%)**. Ordinary decoding remained flat:
+single-node 25.57 → 25.57 and TP 30.11 → 30.22 tokens/s (one pair each).
+All four final pairs produced byte-identical output.
+
+The final build passed short single-node and 4K/8K single-node/TP oracles,
+including forced six-row batches, exact greedy and sampled tokens, target
+frontiers, RNG state, EOS and context limits, and single-node disk restore.
+A short TP oracle also passed before removing the auxiliary experiment.
+Resident and SSD controls passed exact logits/history/KV comparisons at
+511- and 2,047-token prefixes. The session-snapshot test, local/peer builds,
+and CPU-only, non-Apple and ROCm-preprocessor syntax checks passed.
+CUDA hardware was unavailable and was not tested. No prompt beyond 8K was
+processed in this round. Draft policy and the five-token proposal cap are
+unchanged; verification remains the largest measured phase cost.
+
 ## GLM: built-in MTP
 
 GLM's draft block is already in its main GGUF:

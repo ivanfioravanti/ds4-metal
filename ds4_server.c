@@ -858,6 +858,10 @@ typedef struct {
     tool_replay_stats tool_replay;
 } request;
 
+/* Defined next to the thinking state it reads; the live streams need it long
+ * before that point. */
+static bool generation_starts_inside_thinking(const request *r);
+
 static void tool_call_free(tool_call *tc) {
     free(tc->id);
     free(tc->name);
@@ -7190,7 +7194,7 @@ typedef struct {
 static void openai_stream_start(const request *r, openai_stream *st) {
     memset(st, 0, sizeof(*st));
     st->active = true;
-    st->mode = ds4_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
+    st->mode = generation_starts_inside_thinking(r) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
     st->guard_second_reasoning =
         ds4_think_mode_enabled(r->think_mode) && r->has_tools;
 }
@@ -8219,9 +8223,13 @@ typedef struct {
     int sequence;          /* monotonic per-event sequence_number Codex consumes */
 } responses_stream;
 
+/* The opening mode follows the prompt, not the request flag: a continuation
+ * whose assistant prefix already carries `</think>` produces visible text
+ * from its first token, and THINKING mode would stream that answer as
+ * reasoning and never emit it as output_text. */
 static void responses_stream_init(const request *r, responses_stream *st) {
     memset(st, 0, sizeof(*st));
-    st->mode = ds4_think_mode_enabled(r->think_mode) ? RESP_STREAM_THINKING : RESP_STREAM_TEXT;
+    st->mode = generation_starts_inside_thinking(r) ? RESP_STREAM_THINKING : RESP_STREAM_TEXT;
     responses_random_id(st->response_id, sizeof(st->response_id), "resp_");
     responses_random_id(st->reasoning_id, sizeof(st->reasoning_id), "rs_");
     responses_random_id(st->message_id, sizeof(st->message_id), "msg_");
@@ -9199,7 +9207,7 @@ static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
 
     memset(st, 0, sizeof(*st));
     st->active = ok;
-    st->mode = ds4_think_mode_enabled(r->think_mode) ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
+    st->mode = generation_starts_inside_thinking(r) ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
     st->guard_second_reasoning =
         ds4_think_mode_enabled(r->think_mode) && r->has_tools;
     return ok;
@@ -12111,6 +12119,15 @@ static thinking_state thinking_state_from_prompt(const request *r) {
     return st;
 }
 
+/* Reasoning is opened and closed by the prompt, not by the request flag. When
+ * the rendered assistant prefix already carries `</think>`, generation starts
+ * in the visible answer: requiring a second close inside the generated text
+ * would throw a finished reply away as unterminated reasoning. */
+static bool generation_starts_inside_thinking(const request *r) {
+    return r && ds4_think_mode_enabled(r->think_mode) &&
+           thinking_state_from_prompt(r).inside;
+}
+
 /* A completed tool block inside unclosed reasoning can be recovered without
  * predicting what the model will emit after an injected close marker. Keep a
  * short overlap until the opening appears, then wait for its matching end. */
@@ -13673,6 +13690,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     responses_stream responses_live = {0};
     const bool openai_live_chat = request_uses_openai_live_stream(&j->req);
     const bool responses_live_chat = request_uses_responses_live_stream(&j->req);
+    const bool prompt_opens_thinking = generation_starts_inside_thinking(&j->req);
     long responses_created_at = (long)time(NULL);
     if (j->req.stream) {
         if (progress.stream_failed) {
@@ -14258,7 +14276,7 @@ decode_again:
             text.ptr ? text.ptr : "",
             j->req.has_tools,
             saw_tool_start,
-            ds4_think_mode_enabled(j->req.think_mode),
+            prompt_opens_thinking,
             &final_finish,
             err,
             sizeof(err),
@@ -16829,6 +16847,48 @@ static void test_responses_usage_reports_cache_details(void) {
     TEST_ASSERT(strstr(out, "\"cache_write_tokens\":3") != NULL);
     TEST_ASSERT(strstr(out, "\"output_tokens\":2") != NULL);
     TEST_ASSERT(strstr(out, "\"total_tokens\":12") != NULL);
+
+    free(out);
+    responses_stream_free(&st);
+    close(sv[0]);
+    close(sv[1]);
+    request_free(&r);
+}
+
+/* Regression: a continuation whose prompt already closed `</think>` starts in
+ * the visible answer. Reading the reasoning state from the request flag alone
+ * streamed that answer as reasoning and delivered an empty message. */
+static void test_responses_stream_prompt_closed_thinking_emits_answer(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+
+    r.prompt_text = xstrdup("<|im_start|>assistant\n<think>\n");
+    TEST_ASSERT(generation_starts_inside_thinking(&r));
+    free(r.prompt_text);
+    r.prompt_text = xstrdup("<|im_start|>assistant\n<think>\nplan\n</think>\n\n");
+    TEST_ASSERT(!generation_starts_inside_thinking(&r));
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        request_free(&r);
+        return;
+    }
+
+    responses_stream st;
+    responses_stream_init(&r, &st);
+    st.active = true;
+    const char *raw = "Done.";
+    TEST_ASSERT(responses_sse_stream_update(sv[0], &r, &st, raw, strlen(raw), true));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"type\":\"response.output_text.delta\"") != NULL);
+    TEST_ASSERT(strstr(out, "Done.") != NULL);
+    TEST_ASSERT(strstr(out, "reasoning_summary_text.delta") == NULL);
 
     free(out);
     responses_stream_free(&st);
@@ -22081,6 +22141,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_stream_reroutes_second_reasoning_pass();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
+    test_responses_stream_prompt_closed_thinking_emits_answer();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_glm_tool_stream_suppresses_raw_tool_call();

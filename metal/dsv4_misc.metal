@@ -7008,7 +7008,8 @@ kernel void kernel_dsv4_add2_f32_tp_flag_checked(
 // rounds. The gate is always the first work of its command buffer, so the
 // whole region is fresh. 8192 lines cover roughly 600 ms before `status`
 // reports a timeout, which the service thread reports at the next gate.
-kernel void kernel_dsv4_tp_poll_release(
+template<ushort SCHEDULE>
+kernel void kernel_dsv4_tp_poll_release_impl(
         device const uint * region,
         constant uint & value,
         constant uint & nlines,
@@ -7026,11 +7027,27 @@ kernel void kernel_dsv4_tp_poll_release(
             return;
         }
         uint pause = 0u;
-        if (r >= 160u) pause = 375000u;      /* ~5 ms   x 96 rounds */
-        else if (r >= 96u) pause = 150000u;  /* ~2 ms   x 64 rounds */
-        else if (r >= 64u) pause = 20000u;   /* ~270 us x 32 rounds */
-        else if (r >= 32u) pause = 1200u;    /* ~16 us  x 32 rounds */
-        else if (r >= 16u) pause = 150u;     /* ~2 us   x 16 rounds */
+        if (SCHEDULE == 0) {
+            if (r >= 160u) pause = 375000u;
+            else if (r >= 96u) pause = 150000u;
+            else if (r >= 64u) pause = 20000u;
+            else if (r >= 32u) pause = 1200u;
+            else if (r >= 16u) pause = 150u;
+        } else if (SCHEDULE == 1) {
+            // Move early probes closer together without shortening the total
+            // 46,280,800-iteration backoff budget across 256 fresh-line rounds.
+            if (r >= 160u) pause = 424775u;
+            else if (r >= 128u) pause = 150000u;
+            else if (r >= 96u) pause = 20000u;
+            else if (r >= 48u) pause = 1200u;
+            else if (r >= 16u) pause = 150u;
+        } else {
+            if (r >= 160u) pause = 455250u;
+            else if (r >= 128u) pause = 75000u;
+            else if (r >= 96u) pause = 5000u;
+            else if (r >= 48u) pause = 300u;
+            else if (r >= 16u) pause = 75u;
+        }
         for (uint i = 0; i < pause; i++) {
             spin = fma(spin, 1.000001f, 0.000001f);
             spin = fma(spin, 1.000001f, -0.000001f);
@@ -7039,6 +7056,11 @@ kernel void kernel_dsv4_tp_poll_release(
     if (tid == 0) status[0] = 0xffffffffu;
     if (spin == 0.0f) status[1] = 0u; /* keeps the pause loop alive */
 }
+
+typedef decltype(kernel_dsv4_tp_poll_release_impl<0>) ds4_tp_poll_release_t;
+template [[host_name("kernel_dsv4_tp_poll_release")]] kernel ds4_tp_poll_release_t kernel_dsv4_tp_poll_release_impl<0>;
+template [[host_name("kernel_dsv4_tp_poll_release_fine")]] kernel ds4_tp_poll_release_t kernel_dsv4_tp_poll_release_impl<1>;
+template [[host_name("kernel_dsv4_tp_poll_release_finer")]] kernel ds4_tp_poll_release_t kernel_dsv4_tp_poll_release_impl<2>;
 
 // Ratio-4 compressor pooling without materializing the [n_comp, 8, head_dim]
 // KV and score packs. The row mapping and both reduction loops deliberately

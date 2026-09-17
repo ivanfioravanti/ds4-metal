@@ -10612,7 +10612,26 @@ static uint32_t ds4_gpu_tp_payload_sum(const volatile uint32_t *p, uint32_t word
     return result;
 }
 
+static uint32_t ds4_gpu_tp_payload_sum_wide(const volatile uint32_t *p, uint32_t words) {
+    typedef uint32_t lanes4 __attribute__((vector_size(16), aligned(4)));
+    lanes4 a = {0}, b = {0}, c = {0}, d = {0};
+    uint32_t i = 0;
+    for (; i < (words & ~15u); i += 16u) {
+        a += *(const volatile lanes4 *)(p + i);
+        b += *(const volatile lanes4 *)(p + i + 4u);
+        c += *(const volatile lanes4 *)(p + i + 8u);
+        d += *(const volatile lanes4 *)(p + i + 12u);
+    }
+    lanes4 sum = (a + b) + (c + d);
+    for (; i < (words & ~3u); i += 4u)
+        sum += *(const volatile lanes4 *)(p + i);
+    uint32_t result = sum[0] + sum[1] + sum[2] + sum[3];
+    for (; i < words; i++) result += p[i];
+    return result;
+}
+
 static void *ds4_gpu_tp_service_thread(void *arg) {
+    const bool wide_checksum = getenv("DS4_TEST_TP_WIDE_CHECKSUM") != NULL;
     const bool vector_checksum = !getenv("DS4_METAL_DISABLE_TP_VECTOR_CHECKSUM");
     (void)arg;
     const bool profile = getenv("DS4_TP_GATE_PROFILE") != NULL;
@@ -10690,7 +10709,8 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
             for (;;) {
                 const uint32_t want = __atomic_load_n(&g_tp_check_words[slot], __ATOMIC_ACQUIRE) ^ mix;
                 uint32_t sum = 0;
-                if (vector_checksum) sum = ds4_gpu_tp_payload_sum(payload, words);
+                if (vector_checksum) sum = wide_checksum ? ds4_gpu_tp_payload_sum_wide(payload, words) :
+                    ds4_gpu_tp_payload_sum(payload, words);
                 else for (uint32_t i = 0; i < words; i++) sum += payload[i];
                 if (sum == want) break;
                 if (++tries > 20000000ull || g_tp_shutdown) {
@@ -11226,8 +11246,14 @@ static int ds4_gpu_tp_gate_encode_impl(uint32_t layer, uint32_t gate,
             /* The flag is already published by the flushed buffer; stream the
              * next phase's weights into the cache while the exchange runs. */
             if (!big_bytes) (void)ds4_gpu_tp_encode_gate_prefetch(gate);
-            id<MTLComputePipelineState> poll_pipeline =
-                ds4_gpu_get_pipeline("kernel_dsv4_tp_poll_release");
+            const char *schedule_env = getenv("DS4_TEST_VERIFY_POLL_SCHEDULE");
+            int schedule = schedule_env ? atoi(schedule_env) : 0;
+            // Modes 3/4 include ordinary fallback steps in the DSpark run.
+            if (!big_bytes && schedule < 3) schedule = 0;
+            id<MTLComputePipelineState> poll_pipeline = ds4_gpu_get_pipeline(
+                (schedule == 1 || schedule == 3) ? "kernel_dsv4_tp_poll_release_fine" :
+                (schedule == 2 || schedule == 4) ? "kernel_dsv4_tp_poll_release_finer" :
+                "kernel_dsv4_tp_poll_release");
             if (!poll_pipeline) return 0;
             const uint32_t value = (uint32_t)seq;
             const uint32_t nlines = DS4_TP_POLL_LINES;

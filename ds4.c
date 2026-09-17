@@ -40244,6 +40244,9 @@ typedef struct ds41_dspark {
     uint64_t allocation_bytes;
     float *logits;
     float confidence0;
+    ds41_prefill_row lazy_rows[5];
+    ds4_gpu_tensor *lazy_tokens[5];
+    uint32_t lazy_count[5];
 } ds41_dspark;
 
 #define DS41_VERIFY_ROWS 6u
@@ -40328,6 +40331,12 @@ static void ds41_dspark_free(ds41_dspark *d) {
 #undef DS41_DRAFT_ROW_FREE
     }
     free(g->rows_view);
+    for (unsigned i = 0; i < 5; i++) {
+#define DS41_LAZY_CACHE_FREE(name, width) ds4_gpu_tensor_free(d->lazy_rows[i].name);
+        DS41_PREFILL_ROWS(DS41_LAZY_CACHE_FREE)
+#undef DS41_LAZY_CACHE_FREE
+        ds4_gpu_tensor_free(d->lazy_tokens[i]);
+    }
     ds4_gpu_tensor_free(g->prefill_tokens);
 #define DS41_DRAFT_FREE(name, width) ds4_gpu_tensor_free(g->name);
     DS41_SCRATCH(DS41_DRAFT_FREE)
@@ -42674,15 +42683,29 @@ static bool ds41_dspark_finish_row(ds41_dspark *d, const ds4_model *m,
                                     const ds4_dspark_weights *dw, uint32_t i, uint32_t count) {
     ds41_gpu_graph row = d->scratch;
     ds41_gpu_graph *g = &row;
-    row.batch = (ds41_prefill_row){0};
+    const bool cached = getenv("DS4_TEST_DRAFT_CACHED_VIEWS") != NULL;
+    bool reuse = cached && d->lazy_count[i] == count;
+    row.batch = reuse ? d->lazy_rows[i] : (ds41_prefill_row){0};
     bool ok = true;
 #define DS41_LAZY_VIEW(name, width) \
-    if (ok) ok = (row.batch.name = ds4_gpu_tensor_view(d->scratch.batch.name, \
+    if (ok && !reuse) ok = (row.batch.name = ds4_gpu_tensor_view(d->scratch.batch.name, \
         (uint64_t)i * (width) * sizeof(float), (uint64_t)count * (width) * sizeof(float))) != NULL;
     DS41_PREFILL_ROWS(DS41_LAZY_VIEW)
 #undef DS41_LAZY_VIEW
-    row.prefill_tokens = ds4_gpu_tensor_view(d->scratch.prefill_tokens, i * sizeof(int), count * sizeof(int));
+    row.prefill_tokens = reuse ? d->lazy_tokens[i] : ds4_gpu_tensor_view(d->scratch.prefill_tokens, i * sizeof(int), count * sizeof(int));
     ok = ok && row.prefill_tokens;
+    if (ok && cached && !reuse) {
+        /* These views describe fixed draft workspace slices. Keep their
+         * ownership with the drafter instead of allocating on every proposal. */
+#define DS41_LAZY_REPLACE(name, width) ds4_gpu_tensor_free(d->lazy_rows[i].name);
+        DS41_PREFILL_ROWS(DS41_LAZY_REPLACE)
+#undef DS41_LAZY_REPLACE
+        ds4_gpu_tensor_free(d->lazy_tokens[i]);
+        d->lazy_rows[i] = row.batch;
+        d->lazy_tokens[i] = row.prefill_tokens;
+        d->lazy_count[i] = count;
+        reuse = true;
+    }
     ds41_prefill_row *b = &row.batch;
     ok = ok && ds41_moe_batch(&row, m, &dw->stage[2].block, 42u, count, false, true) &&
         ds4_gpu_add_tensor(b->block, b->routed, b->shared, count * DS4_N_EMBD) &&
@@ -42690,10 +42713,10 @@ static bool ds41_dspark_finish_row(ds41_dspark *d, const ds4_model *m,
         ds41_hc_expand_batch(b->residual, b->block, b->after_attn, b->ffn_split, count) &&
         ds41_hc_sum_batch(b->x, b->residual, b->ffn_split, true, count) &&
         ds41_norm_batch(b->norm, b->x, m, dw->stage[2].norm, count);
-#define DS41_LAZY_FREE(name, width) ds4_gpu_tensor_free(row.batch.name);
+#define DS41_LAZY_FREE(name, width) if (!reuse) ds4_gpu_tensor_free(row.batch.name);
     DS41_PREFILL_ROWS(DS41_LAZY_FREE)
 #undef DS41_LAZY_FREE
-    ds4_gpu_tensor_free(row.prefill_tokens);
+    if (!reuse) ds4_gpu_tensor_free(row.prefill_tokens);
     return ok;
 }
 
@@ -42946,6 +42969,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         (batch_finish ? DS41_ATTN_DEFER_HEADS : 0);
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
+    const bool direct_routed = verify && shared_owner &&
+        getenv("DS4_TEST_VERIFY_ROUTED_DIRECT");
     const char *engram_bank_env = getenv("DS4_TEST_VERIFY_ENGRAM_BANKS");
     const int engram_bank_mode = engram_bank_env ? atoi(engram_bank_env) : 0;
     const bool separate_engram = verify && engram_bank_mode > 0 && rows <= g->prefill_cap / 2u;
@@ -43114,12 +43139,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
             ds41_after_attention_batch(&active, model, l, rows, verify && !g->quality && !g->streaming);
         DS41_VERIFY_STAGE(2);
+        /* The TP combine already leaves the complete FFN result in routed.
+         * It is dead after HC expansion, so quantize it in place and avoid
+         * copying it to another scratch buffer on every verification layer. */
+        ds4_gpu_tensor *ffn_output = direct_routed ? active.routed : active.block;
         if (ok) ok = ds41_moe_batch(g, model, l, il, rows, shared_owner, verify != NULL) &&
-            (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
+            (direct_routed || (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
                 (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
-                ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD)) &&
-            ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
-            ds41_hc_expand_batch(active.residual, active.block, active.after_attn,
+                ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD))) &&
+            ds4_gpu_dsv41_quantize(ffn_output, DS4_N_EMBD, rows, DS4_V41_BF16) &&
+            ds41_hc_expand_batch(active.residual, ffn_output, active.after_attn,
                 active.ffn_split, rows);
         DS41_VERIFY_STAGE(3);
         /* The second Engram upload reuses the first one's input storage. */

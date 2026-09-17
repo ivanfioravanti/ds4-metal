@@ -2,6 +2,7 @@
 
 constant short FC_mul_mv_nsg   [[function_constant(FC_MUL_MV + 0)]];
 constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];
+constant bool FC_mul_mv_joint_rows [[function_constant(FC_MUL_MV + 2)]];
 
 struct ds4_metal_args_mul_mv {
     int ne00;
@@ -121,6 +122,43 @@ static inline void helper_mv_reduce_and_write(
     }
 }
 
+// Independent token rows keep the scalar reduction tree, but use separate
+// scratch banks so their SIMD-group reductions share two barriers.
+template<short NR0, short NT, bool ROUND_BF16>
+static inline void helper_mv_reduce_token_rows(
+        device float *dst, float sum0[NR0], float sum1[NR0], float sum2[NR0],
+        constant ds4_metal_args_mul_mv &args, int r0, int token,
+        ushort tiisg, ushort sgitg, threadgroup char *scratch) {
+    threadgroup float *shared = (threadgroup float *)scratch;
+    constexpr short stride = N_SIMDWIDTH * NR0;
+    for (short row = 0; row < NR0; row++) {
+        if (sgitg == 0)
+            for (short t = 0; t < NT; t++)
+                shared[t * stride + N_SIMDWIDTH * row + tiisg] = 0.f;
+        sum0[row] = simd_sum(sum0[row]);
+        sum1[row] = simd_sum(sum1[row]);
+        if (NT == 3) sum2[row] = simd_sum(sum2[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short row = 0; row < NR0; row++) {
+        if (tiisg == 0) {
+            shared[N_SIMDWIDTH * row + sgitg] = sum0[row];
+            shared[stride + N_SIMDWIDTH * row + sgitg] = sum1[row];
+            if (NT == 3) shared[2 * stride + N_SIMDWIDTH * row + sgitg] = sum2[row];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short t = 0; t < NT; t++) {
+        for (short row = 0; row < NR0 && r0 + row < args.ne01; row++) {
+            float total = simd_sum(shared[t * stride + N_SIMDWIDTH * row + tiisg]);
+            if (tiisg == 0 && sgitg == 0 && token + t < args.ne11) {
+                if (ROUND_BF16) total = ds4_mv_round_bf16(total);
+                dst[(uint64_t)(token + t) * args.ne0 + r0 + row] = total;
+            }
+        }
+    }
+}
+
 template<short NR0, typename args_t, bool ROUND_BF16 = false>
 void kernel_mul_mv_q8_0_f32_impl(
         args_t args,
@@ -236,6 +274,11 @@ void kernel_mul_mv_q8_0_f32_token_pair_impl(
             sum1[row] += q1 * d;
         }
     }
+    if (FC_mul_mv_joint_rows) {
+        helper_mv_reduce_token_rows<NR0, 2, ROUND_BF16>((device float *)dst,
+            sum0, sum1, sum1, args, r0, token, tiisg, sgitg, shmem);
+        return;
+    }
     helper_mv_reduce_and_write<NR0, ROUND_BF16>((device float *)dst + (uint64_t)token * args.ne0,
         sum0, r0, args.ne01, tiisg, sgitg, shmem);
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -316,6 +359,11 @@ void kernel_mul_mv_q8_0_f32_token_triple_impl(
             sum1[row] += q1 * d;
             sum2[row] += q2 * d;
         }
+    }
+    if (FC_mul_mv_joint_rows) {
+        helper_mv_reduce_token_rows<NR0, 3, ROUND_BF16>((device float *)dst,
+            sum0, sum1, sum2, args, r0, token, tiisg, sgitg, shmem);
+        return;
     }
     helper_mv_reduce_and_write<NR0, ROUND_BF16>((device float *)dst + (uint64_t)token * args.ne0,
         sum0, r0, args.ne01, tiisg, sgitg, shmem);

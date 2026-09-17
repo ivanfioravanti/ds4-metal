@@ -6910,6 +6910,44 @@ kernel void kernel_dsv4_tp_flag_set_checked(
     }
 }
 
+// Verification payloads span several rows. Independent groups checksum
+// disjoint words; the last arrival publishes the same modulo-2^32 sum.
+kernel void kernel_dsv4_tp_flag_set_checked_parallel(
+        device atomic_uint &flag,
+        device atomic_uint &check,
+        constant uint &value,
+        device const uint *payload,
+        constant uint &words,
+        device atomic_uint *ctl,
+        constant uint &ntg,
+        threadgroup uint *shmem [[threadgroup(0)]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint tgid [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    uint sum = 0u;
+    for (uint i = tgid * 256u + tid; i < words; i += ntg * 256u)
+        sum += payload[i];
+    sum = simd_sum(sum);
+    if (tiisg == 0) shmem[sgitg] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint subtotal = 0u;
+        for (uint i = 0; i < 8u; i++) subtotal += shmem[i];
+        atomic_fetch_add_explicit(&ctl[1], subtotal, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid == 0) {
+        const uint arrived = atomic_fetch_add_explicit(&ctl[0], 1u, memory_order_relaxed);
+        if (arrived + 1u == ntg) {
+            const uint total = atomic_exchange_explicit(&ctl[1], 0u, memory_order_relaxed);
+            atomic_store_explicit(&ctl[0], 0u, memory_order_relaxed);
+            atomic_store_explicit(&check, total ^ (value * 0x9E3779B9u), memory_order_relaxed);
+            atomic_store_explicit(&flag, value, memory_order_relaxed);
+        }
+    }
+}
+
 // Fused local FFN sum + checked poll-gate flag.  out = a + b for n words
 // (the rank's FFN partial in its slab slot); every threadgroup adds the
 // integer sum of the words it stored to a device accumulator and the

@@ -628,6 +628,49 @@ CPU-only, non-Apple and ROCm-preprocessor C syntax checks passed. CUDA runtime
 was not tested. The pre-existing server thinking-mode assertion from the
 preceding round is unrelated and was not changed; no long-context suite ran.
 
+
+### M3 Ultra speculative projection overlap (September 17)
+
+The router and shared-expert gate/up projections consume the same normalized
+input and write disjoint outputs. Draft and verification batches now dispatch
+these independent projections concurrently on M3 Ultra, joining before route
+selection and SwiGLU. Each projection retains its existing arithmetic. The
+path requires 2–6 rows and supported plain/Q8 weights; ordinary prefill and
+session batching retain their original scheduling. Quality mode, streaming,
+and other backends retain the serial path. Set
+`DS4_METAL_DISABLE_V41_SPEC_MOE_OVERLAP=1` on both TP ranks to reproduce the
+serial control.
+
+The screening round used 26 sequential TP RDMA runs with 7,956 prompt tokens
+and 512 greedy outputs. Confidence thresholds from 0.35 through 0.70 did not
+justify changing the 0.60 default: 0.35/0.40/0.45 reached 34.18/35.89/36.59
+tokens/s; 0.50 repeated at 37.40 and 37.33, essentially tied with controls.
+A one-output-row Q4 expert down-projection tile with 1/2/4/8 SIMD groups
+reached 37.13/37.11/37.18/36.86 against 37.27 controls. Precomputing Q4 input
+sums once per token reached 37.11 and 37.43 against 37.20 and 37.17 controls.
+Both kernel experiments were removed. Projection overlap reached 37.53 and
+37.82 against 37.23 and 37.28 in screening and proceeded to release
+validation. All screening outputs were byte-identical.
+
+The release comparison repeated three alternating TP pairs: serial controls
+were **37.38, 37.36, 37.17**, and overlap runs were **37.71, 37.75, 37.86**
+tokens/s. Medians improved **37.36 → 37.75 tokens/s (+1.0%)**. Median draft
+time fell 1.871 → 1.827 seconds and verification 7.438 → 7.316 seconds per
+512 outputs; cycles/proposals/accepted drafts stayed at 318/234/194. One
+single-node pair improved **32.29 → 32.65 tokens/s (+1.1%)**. Every paired
+output was byte-identical. The 50 tokens/s goal remains unmet; this is a
+small scheduling gain, not a change in draft policy or verifier arithmetic.
+
+Release correctness checks passed the short and 4K/8K single-node and TP
+oracles, including forced six-row batches, greedy and sampled token identity,
+RNG and exact target frontiers, EOS/context limits, and single-node disk
+restore. Ordinary resident and SSD paths passed exact logits/history/KV
+comparisons at 511- and 2,047-token prefixes. CPU-only, non-Apple and
+ROCm-preprocessor syntax checks passed; CUDA hardware was not tested.
+The final session-snapshot test passed. Ordinary decode timing stayed flat:
+single-node 25.57 → 25.63 and TP 30.10 → 30.04 tokens/s (one pair each),
+with byte-identical paired outputs. No tests beyond 8K prompt length ran.
+
 ## GLM: built-in MTP
 
 GLM's draft block is already in its main GGUF:

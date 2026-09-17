@@ -41687,21 +41687,41 @@ static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
     return true;
 }
 
+/* Router and shared projections only read the normalized input. Join their
+ * concurrent dispatches before routing and SwiGLU consume the results. */
+static bool ds41_moe_batch_inputs(ds41_gpu_graph *g, const ds4_model *m,
+                                  const ds4_layer_weights *l, uint32_t count,
+                                  bool shared, bool speculative) {
+    ds41_prefill_row *b = &g->batch;
+    bool parallel = speculative && count >= 2 && count <= 6 && !g->quality && !g->streaming &&
+        ds41_batch_bf16_fused(count) &&
+        (l->ffn_gate_inp->type == DS4_TENSOR_F32 || l->ffn_gate_inp->type == DS4_TENSOR_F16) &&
+        l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
+        !getenv("DS4_METAL_DISABLE_V41_BATCH_Q8_BF16") &&
+        !getenv("DS4_METAL_DISABLE_V41_SPEC_MOE_OVERLAP") &&
+        ds4_gpu_dsv41_begin_parallel();
+    bool ok = ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
+        (parallel || ds41_route_batch(g, m, l, count)) &&
+        (!shared || (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
+                     ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true)));
+    if (parallel) ds4_gpu_dsv41_end_parallel();
+    return ok && (!parallel || ds41_route_batch(g, m, l, count));
+}
+
 static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, uint32_t count,
-                           bool shared_owner) {
+                           bool shared_owner, bool speculative) {
     const uint32_t experts = (uint32_t)l->ffn_gate_exps->dim[2];
     const uint32_t used = g->draft_expert_used ? g->draft_expert_used : DS4_N_EXPERT_USED;
     ds41_prefill_row *b = &g->batch;
     const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
     bool mid_f16 = false;
-    return ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
-        ds41_route_batch(g, m, l, count) &&
+    return ds41_moe_batch_inputs(g, m, l, count,
+        !shared_owner || g->tp_rank == (il & 1u), speculative) &&
         ((shared_owner && g->tp_rank != (il & 1u)) ||
-        (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
-        ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
-        ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
+        (ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
             count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
         ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
         ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true))) &&
@@ -42454,7 +42474,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 }
             }
             if (ok && batch_moe) {
-                ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false);
+                ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false, false);
                 DS41_STAGE("shared/routed ffn");
                 if (ok && batch_hc) {
                     ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
@@ -42660,7 +42680,7 @@ static bool ds41_dspark_propose(ds41_gpu_graph *target, const ds4_model *base,
                 l->attn_output_a->abs_offset, l->attn_output_b->abs_offset, b->heads, 5, 1, 0) &&
                 ds4_gpu_dsv41_quantize(b->block, DS4_N_EMBD, 5, DS4_V41_BF16);
         if (ok) ok = ds41_after_attention_batch(b, m, l, 5) &&
-            ds41_moe_batch(g, m, l, 40u + stage, 5, false) &&
+            ds41_moe_batch(g, m, l, 40u + stage, 5, false, true) &&
             ds4_gpu_add_tensor(b->block, b->routed, b->shared, 5u * DS4_N_EMBD) &&
             ds4_gpu_dsv41_quantize(b->block, DS4_N_EMBD, 5, DS4_V41_BF16) &&
             (batch_expand ? ds41_hc_expand_batch(b->residual, b->block, b->after_attn,
@@ -42971,7 +42991,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
             ds41_after_attention_batch(&active, model, l, rows);
         DS41_VERIFY_STAGE(2);
-        if (ok) ok = ds41_moe_batch(g, model, l, il, rows, shared_owner) &&
+        if (ok) ok = ds41_moe_batch(g, model, l, il, rows, shared_owner, verify != NULL) &&
             (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
                 (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
                 ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD)) &&

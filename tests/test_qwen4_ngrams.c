@@ -1,10 +1,30 @@
 #define DS4_NO_GPU
+#include <sys/types.h>
+#include <unistd.h>
+static ssize_t test_pread(int, void *, size_t, off_t);
+#define pread test_pread
 #ifndef __APPLE__
 #include <pthread.h>
 static int test_pthread_create(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
 #define pthread_create test_pthread_create
 #endif
 #include "../ds4.c"
+#undef pread
+/* Inject failures through the same pread loop used by both readers. Atomic
+ * selection makes exactly one worker fail, without depending on its order. */
+static volatile int read_fault, read_fault_calls;
+static ssize_t test_pread(int fd, void *buf, size_t size, off_t off) {
+    if (read_fault) {
+        const int call = __sync_fetch_and_add(&read_fault_calls, 1);
+        if (!call) {
+            if (read_fault == 3) return 0;
+            errno = read_fault == 1 ? EINTR : EIO;
+            return -1;
+        }
+        if (read_fault == 1 && size > 37) size = 37;
+    }
+    return pread(fd, buf, size, off);
+}
 #ifndef __APPLE__
 #undef pthread_create
 static int thread_budget = -1;
@@ -51,6 +71,53 @@ static void fixture(const char *path, bool bad_alignment, uint32_t type) {
     assert(!fclose(f));
 }
 
+static void exact_read(const ds4_model *m, const uint32_t *rows, size_t n, float *out) {
+    memset(out, 0xa5, (n * 160 + 16) * sizeof(*out));
+    assert(qwen4_ngram_read(m, rows, n, out));
+    for (size_t i = 0; i < n; i++) for (size_t c = 0; c < 160; c++) {
+        uint32_t bits;
+        memcpy(&bits, out + i * 160 + c, 4);
+        assert(bits == (uint32_t)value(rows[i], c) << 16);
+    }
+    for (size_t i = 0; i < 16; i++) {
+        uint32_t bits;
+        memcpy(&bits, out + n * 160 + i, 4);
+        assert(bits == 0xa5a5a5a5u);
+    }
+}
+
+static void reader_recovery_cases(const ds4_model *m, uint32_t *rows, float *out) {
+    /* Each sorted duplicate run straddles a nominal 256-row worker
+     * boundary. An odd permutation checks original-output scattering. */
+    for (size_t i = 0; i < 4096; i++) rows[i] = ((i * 173u % 4096) / 257) * 7;
+    exact_read(m, rows, 4096, out);
+    /* One run crosses all fifteen boundaries and the 4096-row batch. */
+    for (size_t i = 0; i < 4097; i++) rows[i] = 317;
+    exact_read(m, rows, 4097, out);
+    /* Workers cover 62/63 consecutive 320-byte rows (>8192 bytes);
+     * the final row of every partition must be read. */
+    for (size_t i = 0; i < 1000; i++) rows[i] = (i * 173u) % 1000;
+    exact_read(m, rows, 1000, out);
+    /* Disjoint spans and duplicates must not cause gaps to be decoded. */
+    for (size_t i = 0; i < 4096; i++) rows[i] = i % 3 == 0 ? 999 : (i * 173u) % 100 * 7;
+    exact_read(m, rows, 4096, out);
+    for (int fault = 1; fault <= 3; fault++) {
+        read_fault_calls = 0; read_fault = fault;
+        bool ok = qwen4_ngram_read(m, rows, 4096, out);
+        const int error = errno;
+        read_fault = 0;
+        assert(read_fault_calls > 0);
+        assert(fault == 1 ? ok : !ok && error == EIO);
+        if (ok) for (size_t i = 0; i < 4096; i++) for (size_t c = 0; c < 160; c++) {
+            uint32_t bits;
+            memcpy(&bits, out + i * 160 + c, 4);
+            assert(bits == (uint32_t)value(rows[i], c) << 16);
+        }
+        /* The successful retry must refill every destination exactly. */
+        exact_read(m, rows, 4096, out);
+    }
+}
+
 int main(void) {
     char path[] = "/tmp/ds4-qwen-ngrams-XXXXXX";
     int fd = mkstemp(path);
@@ -64,7 +131,7 @@ int main(void) {
     assert(*(const float *)tensor_data(&m, model_find_tensor(&m, "token_embd.weight")) == 1.0f);
     enum { N = 9001 };
     uint32_t *rows = malloc(N * sizeof(*rows));
-    float *out = malloc((size_t)N * 160 * sizeof(*out));
+    float *out = malloc(((size_t)N * 160 + 16) * sizeof(*out));
     assert(rows && out);
     for (size_t i = 0; i < N; i++) rows[i] = (i * 173u) % 1000;
     rows[1] = rows[0]; rows[N-1] = 999;
@@ -80,6 +147,9 @@ int main(void) {
             }
         }
     }
+    reader_recovery_cases(&m, rows, out);
+    for (size_t i = 0; i < N; i++) rows[i] = (i * 173u) % 1000;
+    rows[1] = rows[0]; rows[N-1] = 999;
 #ifndef __APPLE__
     const int budgets[] = {0,1,7};
     for (size_t bi = 0; bi < sizeof(budgets)/sizeof(*budgets); bi++) {
@@ -112,6 +182,10 @@ int main(void) {
     uint32_t last = 999;
     assert(!qwen4_ngram_read(&m, &last, 1, out) && errno == EIO);
     assert(!qwen4_ngram_read(&m,rows,N,out) && errno == EIO);
+    /* Repair the missing byte without reopening the disk-backed model. */
+    const uint8_t final_byte = (uint8_t)(value(999, 159) >> 8);
+    assert(pwrite(fd, &final_byte, 1, 65536 + 320000 - 1) == 1);
+    exact_read(&m, rows, N, out);
     close(fd);
     model_close(&m);
     assert(m.ngram_fd == -1 && !m.ngram_tensor);

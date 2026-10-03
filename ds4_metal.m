@@ -48119,6 +48119,8 @@ enum {
     QWEN4_K_ATTN_DECODE_NPT8,
     QWEN4_K_ATTN_DECODE_NPT4,
     QWEN4_K_ATTN_DECODE_NPT1,
+    QWEN4_K_ATTN_DECODE_NPT8_QH6,
+    QWEN4_K_ATTN_DECODE_NPT8_QH4,
     QWEN4_K_ATTN_MERGE_NPT8,
     QWEN4_K_ATTN_MERGE_NPT4,
     QWEN4_K_ATTN_MERGE_NPT1,
@@ -48224,6 +48226,8 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_attn_decode_npt8",
     "kernel_qwen4_attn_decode_npt4",
     "kernel_qwen4_attn_decode_npt1",
+    "kernel_qwen4_attn_decode_npt8_qh6",
+    "kernel_qwen4_attn_decode_npt8_qh4",
     "kernel_qwen4_attn_merge_npt8",
     "kernel_qwen4_attn_merge_npt4",
     "kernel_qwen4_attn_merge_npt1",
@@ -48558,8 +48562,10 @@ int ds4_gpu_qwen4_hc_norm_tensor(
         if (reuse_env != NULL && strcmp(reuse_env, "1") == 0) {
             reuse = true;
         } else if (reuse_env == NULL || strcmp(reuse_env, "0") != 0) {
-            reuse = n_tokens >= 8192u && n_embd == 2560u && n_hc == 4u && n_inject == 4u &&
-                    (ds4_gpu_device_name_contains("M3 Ultra") || ds4_gpu_device_is_m5_apple_silicon());
+            reuse = n_embd == 2560u && n_hc == 4u && n_inject == 4u &&
+                    ((n_tokens >= 8192u && (ds4_gpu_device_name_contains("M3 Ultra") ||
+                                          ds4_gpu_device_is_m5_apple_silicon())) ||
+                     (n_tokens >= 128u && ds4_gpu_device_name_contains("M5 Ultra")));
         }
     }
     const int kernel = reuse
@@ -48624,11 +48630,12 @@ int ds4_gpu_qwen4_hc_combine_tensor(
 }
 
 /* Diagnostic rollback is read per dispatch, including within one loaded engine. */
-static bool qwen4_prefill_reuse(uint32_t n_tokens) {
+static bool qwen4_prefill_reuse(uint32_t n_tokens, bool allow_m5_ultra) {
     if (n_tokens <= 8u) return false;
     const int override = ds4_gpu_env_bool("DS4_QWEN4_PREFILL_REUSE");
     return override >= 0 ? override > 0 :
-        n_tokens >= 1024u && ds4_gpu_device_name_contains("M3 Ultra");
+        (n_tokens >= 1024u && ds4_gpu_device_name_contains("M3 Ultra")) ||
+        (allow_m5_ultra && n_tokens >= 128u && ds4_gpu_device_name_contains("M5 Ultra"));
 }
 
 int ds4_gpu_qwen4_conv_stream_tensor(
@@ -48647,7 +48654,7 @@ int ds4_gpu_qwen4_conv_stream_tensor(
     }
     const uint64_t blocks = ((uint64_t)n_tokens + 63u) / 64u;
     const uint64_t total = blocks * (conv_kernel - 1u) * n_channels;
-    if (total <= (1u << 28) && qwen4_prefill_reuse(n_tokens)) {
+    if (total <= (1u << 28) && qwen4_prefill_reuse(n_tokens, true)) {
         if (!ds4_gpu_ensure_scratch_buffer(&g_qwen4_conv_halo_buffer, &g_qwen4_conv_halo_bytes,
                                           (NSUInteger)(total * 4u), "convolution block history")) return 0;
         const char *names[] = {"kernel_qwen4_conv_halo", "kernel_qwen4_conv_blocked"};
@@ -49271,12 +49278,23 @@ int ds4_gpu_qwen4_attn_decode_tensor(
         return qwen4_dispatch(QWEN4_K_ATTN_MM, &args, sizeof(args), b, 7,
                               MTLSizeMake(n_head_kv, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
     }
-    const int kd = head_dim == 256u ? QWEN4_K_ATTN_DECODE_NPT8 :
+    int kd = head_dim == 256u ? QWEN4_K_ATTN_DECODE_NPT8 :
                    head_dim == 128u ? QWEN4_K_ATTN_DECODE_NPT4 : QWEN4_K_ATTN_DECODE_NPT1;
+    uint32_t query_groups = 1u;
+    if (n_tokens == 1u && head_dim == 256u && n_head == 24u && n_head_kv == 2u) {
+        /* Smaller groups improve this Ultra shape without changing each
+         * query's key order. Twelve remains the diagnostic rollback. */
+        const uint32_t default_heads = ds4_gpu_device_name_contains("M5 Ultra") ? 4u : 12u;
+        const uint32_t heads = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_ATTN_QUERY_GROUP", default_heads, 0u, 12u);
+        if (heads == 6u || heads == 4u) {
+            query_groups = 12u / heads;
+            kd = heads == 6u ? QWEN4_K_ATTN_DECODE_NPT8_QH6 : QWEN4_K_ATTN_DECODE_NPT8_QH4;
+        }
+    }
     const int km = head_dim == 256u ? QWEN4_K_ATTN_MERGE_NPT8 :
                    head_dim == 128u ? QWEN4_K_ATTN_MERGE_NPT4 : QWEN4_K_ATTN_MERGE_NPT1;
     if (!qwen4_dispatch(kd, &args, sizeof(args), b, 8,
-                        MTLSizeMake(n_splits, n_head_kv, n_tokens), MTLSizeMake(32 * QWEN4_ATTN_NSG, 1, 1), 0)) {
+                        MTLSizeMake(n_splits, n_head_kv * query_groups, n_tokens), MTLSizeMake(32 * QWEN4_ATTN_NSG, 1, 1), 0)) {
         return 0;
     }
     if (n_splits == 1) return 1;
@@ -49762,7 +49780,7 @@ static uint32_t qwen4_moe_mm_nt(uint32_t n_tokens, uint32_t type, const char *en
     const bool down = strstr(env_name, "DOWN") != NULL;
     /* Reuse each decoded down-weight tile across 64 tokens. The K loop and
      * partial-tail accumulation stay unchanged; short batches keep small tiles. */
-    if (down && type == 10u && n_tokens >= 8192u && qwen4_prefill_reuse(n_tokens)) default_nt = 8u;
+    if (down && type == 10u && n_tokens >= 8192u && qwen4_prefill_reuse(n_tokens, false)) default_nt = 8u;
     /* M5: 64-token gate/up and down tiles for the Q4_K / MXFP4 pack at
      * chunk-sized batches (same tile arithmetic; remainders take the
      * 8/16/32-token kernels).  Measured on M5 Max, see
@@ -49891,9 +49909,19 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
         !qwen4_bind_tensor(&b[5], mid, (uint64_t)n_tokens * n_out * ff_dim * sizeof(float), "moe mid")) {
         return 0;
     }
-    const uint32_t nax = qwen4_moe_mm_nax(weight_type);
+    uint32_t nax = qwen4_moe_mm_nax(weight_type);
     const bool nax_fx = qwen4_moe_mm_nax_fx(weight_type);
     const bool nax_comp = qwen4_moe_mm_nax_comp(weight_type);
+    if (nax && !nax_fx && !nax_comp) {
+        /* Most routed experts have fewer than 64 rows at the measured 8K
+         * shape. The narrower existing tile also removes the tail dispatch;
+         * its half operands and ordered 32-element K steps are unchanged. */
+        const uint32_t preferred = nax == 64u && weight_type == 12u && n_tokens >= 128u &&
+            in_dim == 2560u && ff_dim == 640u && n_expert == 512u && n_out == 10u &&
+            ds4_gpu_device_name_contains("M5 Ultra") ? 32u : nax;
+        const uint32_t requested = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_MOE_MID_NAX_WIDTH", preferred, 32u, 64u);
+        nax = requested == 32u || requested == 64u ? requested : preferred;
+    }
     if (nax) {
         args.tail_base = 0;
         const uint64_t mid_count = (uint64_t)n_tokens * n_out * ff_dim;

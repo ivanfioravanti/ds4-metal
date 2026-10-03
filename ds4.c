@@ -57478,6 +57478,109 @@ static bool qwen4_ngram_read(const ds4_model *m, const uint32_t *rows, size_t co
     return ok;
 }
 
+#if defined(__APPLE__) && defined(DS4_HAS_QWEN4_GPU)
+static bool qwen4_cpu_is_m5_ultra;
+static void qwen4_check_cpu_brand(void) {
+    char brand[128] = {0};
+    size_t bytes = sizeof(brand) - 1u;
+    qwen4_cpu_is_m5_ultra = sysctlbyname("machdep.cpu.brand_string", brand, &bytes, NULL, 0) == 0 &&
+        !strcmp(brand, "Apple M5 Ultra");
+}
+
+/* These defaults were measured only on this device and the Q4 model shape.
+ * Cache CPU identity, but consult the selected GPU after initialization. */
+static bool qwen4_ngram_prefill_default(const ds4_model *m, const ds4_weights *w) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    if (!ds4_gpu_device_is_m5_apple_silicon()) return false;
+    pthread_once(&once, qwen4_check_cpu_brand);
+    if (!qwen4_cpu_is_m5_ultra || DS4_N_LAYER != 49u || DS4_N_NEXTN_PREDICT != 1u ||
+        DS4_N_EMBD != 2560u || DS4_N_FF_EXP != 640u || DS4_N_EXPERT != 512u ||
+        DS4_N_EXPERT_USED != 10u || DS4_N_PLE_LAYER != 1u || DS4_N_PLE_NGRAM != 3u ||
+        DS4_N_PLE_HEADS != 16u || DS4_N_PLE_HEAD_DIM != 160u ||
+        !m->ngram_tensor || m->ngram_tensor->type != DS4_TENSOR_BF16) return false;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!l->ffn_gate_exps || l->ffn_gate_exps->type != DS4_TENSOR_Q4_K ||
+            !l->ffn_up_exps || l->ffn_up_exps->type != DS4_TENSOR_Q4_K ||
+            !l->ffn_down_exps || l->ffn_down_exps->type != DS4_TENSOR_MXFP4) return false;
+    }
+    return true;
+}
+
+/* Keep legacy device defaults and explicit overrides. The additional default
+ * is limited to the measured Q4 trunk; the operator checks still select the
+ * supported Q8 projections and F16 hyper-connection injection. */
+static bool qwen4_graph_decode_fusions_enabled(const ds4_model *m, const ds4_weights *w) {
+    if (ds4_gpu_qwen4_decode_fusions_enabled()) return true;
+    return getenv("DS4_QWEN4_DECODE_FUSIONS") == NULL &&
+        DS4_N_HC == 4u && DS4_N_HC_LOWRANK == 320u &&
+        DS4_N_LIN_K_HEAD == 16u && DS4_N_LIN_V_HEAD == 48u &&
+        DS4_N_LIN_HEAD_DIM == 128u && DS4_N_LIN_CONV == 4u &&
+        qwen4_ngram_prefill_default(m, w);
+}
+
+/* Prefill owns two bounded row buffers. A worker hashes only its private
+ * history; the graph advances its real history when that chunk is consumed. */
+typedef struct {
+    dispatch_group_t group;
+    const ds4_model *model;
+    const int *tokens;
+    uint32_t count;
+    int prev[DS4_MAX_PLE_NGRAM];
+    float *rows;
+    int error;
+} qwen4_ngram_prefetch_job;
+
+#ifdef DS4_TEST_HOOKS
+/* Main-thread launch counter: workers receive the error in their own job. */
+static int qwen4_ngram_prefetch_test_fail_after = -1;
+#endif
+
+static void qwen4_ngram_prefetch_read(void *context) {
+    qwen4_ngram_prefetch_job *job = context;
+    if (job->error) return;
+    uint32_t ids[256 * DS4_MAX_PLE_HEADS];
+    for (uint32_t t = 0; t < job->count; t++) {
+        qwen4_ple_step(job->tokens[t], job->prev, ids + (t % 256u) * DS4_N_PLE_HEADS);
+        if (t % 256u == 255u || t + 1u == job->count) {
+            const uint32_t start = t / 256u * 256u;
+            if (!qwen4_ngram_read(job->model, ids, (t - start + 1u) * DS4_N_PLE_HEADS,
+                                  job->rows + (uint64_t)start * DS4_N_EMBD)) {
+                job->error = errno ? errno : EIO;
+                return;
+            }
+        }
+    }
+}
+
+static void qwen4_ngram_prefetch_start(qwen4_ngram_prefetch_job *job, const ds4_model *model,
+                                      const int *tokens, uint32_t count, const int *prev) {
+    job->model = model;
+    job->tokens = tokens;
+    job->count = count;
+    memcpy(job->prev, prev, sizeof(job->prev));
+    job->error = 0;
+#ifdef DS4_TEST_HOOKS
+    if (qwen4_ngram_prefetch_test_fail_after == 0) job->error = EIO;
+    else if (qwen4_ngram_prefetch_test_fail_after > 0) qwen4_ngram_prefetch_test_fail_after--;
+#endif
+    dispatch_group_async_f(job->group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                           job, qwen4_ngram_prefetch_read);
+}
+
+static void qwen4_ngram_prefetch_free(qwen4_ngram_prefetch_job jobs[2]) {
+    /* Cancellation and errors must not leave a worker referencing prompt,
+     * model, private history, or a buffer beyond this sync call's lifetime. */
+    for (unsigned i = 0; i < 2; i++) {
+        if (jobs[i].group) {
+            dispatch_group_wait(jobs[i].group, DISPATCH_TIME_FOREVER);
+            dispatch_release(jobs[i].group);
+        }
+        free(jobs[i].rows);
+    }
+}
+#endif
+
 /* Multimodal rope positions (HF get_rope_index): text tokens share one
  * counter; an image's tokens take (t, t+row, t+col) from the counter at the
  * image start, which then advances by max(rows, cols).  *delta tracks
@@ -57655,6 +57758,10 @@ typedef struct ds4_qwen4_gpu_graph {
     size_t vis_span_count;
     float *host_row;
     float *host_logits;
+#ifdef __APPLE__
+    const float *prefetched_ngrams;  /* Borrowed only during one prefill forward. */
+    uint32_t prefetched_ngram_tokens;
+#endif
     ds4_gpu_tensor *steer_dirs;
     float steer_attn_scale;
     float steer_ffn_scale;
@@ -58130,6 +58237,10 @@ static void qwen4_graph_reset(ds4_qwen4_gpu_graph *g) {
     g->snap0_valid = false;
     g->snap_after_first = false;
     g->snap_after_second = false;
+#ifdef __APPLE__
+    g->prefetched_ngrams = NULL;
+    g->prefetched_ngram_tokens = 0;
+#endif
 }
 
 /* rows > 0 limits the product to a contiguous leading prefix of w. */
@@ -58344,10 +58455,19 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
 }
 
 static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
-                               uint32_t il, uint32_t T) {
+                               uint32_t il, uint32_t T
+#ifdef __APPLE__
+                               , bool decode_fusions
+#endif
+                               ) {
     const uint32_t conv_dim = DS4_N_LIN_CONV_DIM;
     bool paired = false;
-    if (T == 1u && !g->mtp_R && ds4_gpu_qwen4_decode_fusions_enabled() &&
+    if (T == 1u && !g->mtp_R &&
+#ifdef __APPLE__
+        decode_fusions &&
+#else
+        ds4_gpu_qwen4_decode_fusions_enabled() &&
+#endif
         l->lin_qkv->type == DS4_TENSOR_Q8_0 && l->lin_gate->type == DS4_TENSOR_Q8_0) {
         paired = ds4_gpu_qwen4_q8_pair_tensor(g->qkv, g->z, m->map, m->size,
             l->lin_qkv->abs_offset, l->lin_gate->abs_offset, DS4_N_EMBD,
@@ -58664,7 +58784,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     return ok;
 }
 
-/* host side: embedding rows tiled into R and the PLE n-gram gather */
+/* Host side: embedding rows tiled into R and their rotary positions. */
 static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                      const int *tokens, uint32_t T) {
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc;
@@ -58686,6 +58806,19 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
     if (!ds4_gpu_tensor_write(g->R, 0, row, (uint64_t)T * hc_dim * sizeof(float)) ||
         !ds4_gpu_tensor_write(g->pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u))
         return false;
+#ifdef __APPLE__
+    return true;
+}
+
+/* Keep non-Apple backends in the original combined staging function. */
+static bool qwen4_graph_stage_ngrams(ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                                    const int *tokens, uint32_t T) {
+    const uint32_t E = DS4_N_EMBD;
+    float *row = g->host_row;
+    const float *prefetched = NULL;
+    prefetched = g->prefetched_ngrams;
+    if (prefetched && g->prefetched_ngram_tokens != T) return false;
+#endif
     uint32_t ids[256 * DS4_MAX_PLE_HEADS];
     for (uint32_t t = 0; t < T; t++) {
         qwen4_ple_step(tokens[t], g->ple_prev, ids + (t % 256u) * DS4_N_PLE_HEADS);
@@ -58697,7 +58830,11 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
             memcpy(g->snap2_ple_prev, g->ple_prev, sizeof(g->snap2_ple_prev));
             g->snap2_pos = g->pos + 2u;
         }
+#ifdef __APPLE__
+        if (!prefetched && (t % 256u == 255u || t + 1 == T)) {
+#else
         if (t % 256u == 255u || t + 1 == T) {
+#endif
             const uint32_t start = t / 256u * 256u;
             if (!qwen4_ngram_read(m, ids, (t-start+1u) * DS4_N_PLE_HEADS,
                                   row + (uint64_t)start * E)) {
@@ -58706,7 +58843,12 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
             }
         }
     }
+#ifdef __APPLE__
+    return ds4_gpu_tensor_write(g->ple_emb, 0, prefetched ? prefetched : row,
+                                (uint64_t)T * E * sizeof(float)) != 0;
+#else
     return ds4_gpu_tensor_write(g->ple_emb, 0, row, (uint64_t)T * E * sizeof(float)) != 0;
+#endif
 }
 
 /* Forward T tokens at g->pos..; logits (optional) receive the last token's
@@ -58744,7 +58886,18 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         }
     }
     const double t0 = timing ? now_sec() : 0.0;
+#ifdef __APPLE__
+    const bool decode_fusions = T == 1u && !g->mtp_R && qwen4_graph_decode_fusions_enabled(m, w);
+    bool overlap_ngrams = false;
+    const char *overlap_env = getenv("DS4_QWEN4_NGRAM_OVERLAP");
+    overlap_ngrams = (overlap_env ? !strcmp(overlap_env, "1") :
+        (T <= 2u || T >= 128u) && qwen4_ngram_prefill_default(m, w)) && !g->prefetched_ngrams &&
+        DS4_N_PLE_LAYER > 0u && DS4_N_PLE_LAYER < n_trunk;
+    if (!qwen4_graph_stage_inputs(g, m, w, tokens, T) ||
+        (!overlap_ngrams && !qwen4_graph_stage_ngrams(g, m, tokens, T))) return false;
+#else
     if (!qwen4_graph_stage_inputs(g, m, w, tokens, T)) return false;
+#endif
     const double t1 = timing ? now_sec() : 0.0;
     if (!glm_graph_begin_commands_if_needed()) return false;
     bool ok = true;
@@ -58765,6 +58918,17 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     for (uint32_t il = 0; il < n_trunk && ok; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (ds4_qwen4_layer_is_ple(il)) {
+#ifdef __APPLE__
+            /* Earlier layers never read ple_emb. Their queued work can run
+             * while disk reads reuse the already-copied host embedding rows.
+             * A matching layer split has already submitted this prefix. */
+            if (overlap_ngrams &&
+                !((flush_layer == il || ds4_gpu_flush_commands() != 0) &&
+                  qwen4_graph_stage_ngrams(g, m, tokens, T))) {
+                ok = false;
+                break;  /* Drain the submitted prefix in the common epilogue. */
+            }
+#endif
             ok = qwen4_gemv(g->ple_key, m, l->ple_key, g->ple_emb, T) &&
                  qwen4_gemv(g->ple_val, m, l->ple_value, g->ple_emb, T) &&
                  ds4_gpu_qwen4_ple_gate_tensor(g->ple_gated, g->ple_normed, g->R, g->ple_key, g->ple_val,
@@ -58780,7 +58944,11 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, T);
         QWEN4_PROF(1);
         if (ok) {
-            ok = ds4_qwen4_layer_is_linear(il) ? qwen4_graph_linear(g, m, l, il, T)
+            ok = ds4_qwen4_layer_is_linear(il) ? qwen4_graph_linear(g, m, l, il, T
+#ifdef __APPLE__
+                                                                   , decode_fusions
+#endif
+                                                                   )
                                                : qwen4_graph_attention(g, m, l, il, pos0, T);
         }
         if (ok) {
@@ -58790,7 +58958,12 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
             ok = qwen4_graph_apply_steering_attn(g, il, T);
         }
         QWEN4_PROF(ds4_qwen4_layer_is_linear(il) ? 2 : 3);
-        if (T == 1u && !g->mtp_R && DS4_N_HC == 4u && ds4_gpu_qwen4_decode_fusions_enabled() &&
+        if (T == 1u && !g->mtp_R && DS4_N_HC == 4u &&
+#ifdef __APPLE__
+            decode_fusions &&
+#else
+            ds4_gpu_qwen4_decode_fusions_enabled() &&
+#endif
             l->hc_ffn_inject->type == DS4_TENSOR_F16) {
             if (ok) ok = ds4_gpu_qwen4_hc_combine_norm_tensor(g->hc_u, g->blk, g->inj,
                 g->xn, g->inj_alt, g->R, m->map, m->size, l->hc_ffn_norm->abs_offset,
@@ -58871,6 +59044,12 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         g->snap2_valid = ok;
         g->snap_after_second = false;
     }
+#ifdef __APPLE__
+    /* A deferred read can fail after prefix layers mutated recurrent state.
+     * Reset after draining; the caller invalidates the checkpoint and requires
+     * sync or snapshot restore before another public decode. */
+    if (!ok && overlap_ngrams) qwen4_graph_reset(g);
+#endif
     return ok;
 }
 
@@ -75297,7 +75476,37 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
          * batches, despite having multiple rows, must never overwrite dumps. */
         s->qwen4_graph.dump_prompt_rows = true;
         int prefill_rc = 0;
+#ifdef __APPLE__
+        qwen4_ngram_prefetch_job ngram_jobs[2] = {{0}};
+        unsigned ngram_job = 0;
+        const char *prefetch_env = getenv("DS4_QWEN4_NGRAM_PREFETCH");
+        const uint32_t chunk_cap = s->qwen4_graph.cap_tokens;
+        const bool prefetch_ngrams = e->backend == DS4_BACKEND_METAL && chunk_cap > 0u &&
+            (prefetch_env ? !strcmp(prefetch_env, "1") :
+             chunk_cap >= 1024u && qwen4_ngram_prefill_default(&e->model, &e->weights)) &&
+            (uint32_t)(prompt->len - start) > chunk_cap;
+        if (prefetch_ngrams) {
+            if (!DS4_N_EMBD || (size_t)chunk_cap > SIZE_MAX / sizeof(float) / DS4_N_EMBD) {
+                snprintf(err, errlen, "Qwen3.8 n-gram prefetch size overflow");
+                prefill_rc = 1;
+            }
+            for (unsigned j = 0; !prefill_rc && j < 2; j++) {
+                ngram_jobs[j].rows = malloc((size_t)chunk_cap * DS4_N_EMBD * sizeof(float));
+                ngram_jobs[j].group = dispatch_group_create();
+                if (!ngram_jobs[j].rows || !ngram_jobs[j].group) {
+                    snprintf(err, errlen, "Qwen3.8 n-gram prefetch allocation failed");
+                    prefill_rc = 1;
+                }
+            }
+            if (!prefill_rc) {
+                qwen4_ngram_prefetch_start(&ngram_jobs[0], &e->model, prompt->v + start,
+                                           chunk_cap, s->qwen4_graph.ple_prev);
+            } else s->checkpoint_valid = false;
+        }
+        for (int i = start; prefill_rc == 0 && i < prompt->len;) {
+#else
         for (int i = start; i < prompt->len;) {
+#endif
             if (ds4_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted");
                 s->checkpoint_valid = s->checkpoint.len > 0;
@@ -75310,8 +75519,38 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
              * may leave it as the live session. Every completed chunk needs
              * its own logits as well as recurrent/KV state. */
             s->checkpoint_valid = false;
+#ifdef __APPLE__
+            if (prefetch_ngrams) {
+                qwen4_ngram_prefetch_job *ready = &ngram_jobs[ngram_job];
+                dispatch_group_wait(ready->group, DISPATCH_TIME_FOREVER);
+                if (ready->error) {
+                    snprintf(err, errlen, "Qwen3.8 n-gram prefetch failed at token %d: %s",
+                             i, strerror(ready->error));
+                    prefill_rc = 1;
+                    break;
+                }
+                /* The next worker sees only the ready job's private history.
+                 * Real ple_prev and verifier snapshots advance in forward. */
+                const int next = i + (int)chunk;
+                if (next < prompt->len) {
+                    uint32_t next_count = (uint32_t)(prompt->len - next);
+                    if (next_count > chunk_cap) next_count = chunk_cap;
+                    qwen4_ngram_prefetch_start(&ngram_jobs[ngram_job ^ 1u], &e->model,
+                                               prompt->v + next, next_count, ready->prev);
+                }
+                s->qwen4_graph.prefetched_ngrams = ready->rows;
+                s->qwen4_graph.prefetched_ngram_tokens = ready->count;
+            }
+            const bool chunk_ok = qwen4_graph_forward_tokens(&s->qwen4_graph, &e->model, &e->weights,
+                                                              prompt->v + i, chunk, s->logits, false);
+            s->qwen4_graph.prefetched_ngrams = NULL;
+            s->qwen4_graph.prefetched_ngram_tokens = 0;
+            ngram_job ^= 1u;
+            if (!chunk_ok) {
+#else
             if (!qwen4_graph_forward_tokens(&s->qwen4_graph, &e->model, &e->weights,
                                             prompt->v + i, chunk, s->logits, false)) {
+#endif
                 snprintf(err, errlen, "Qwen3.8 prefill failed at token %d", i);
                 s->checkpoint_valid = false;
                 prefill_rc = 1;
@@ -75324,6 +75563,11 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             s->mtp_draft_valid = false;
             if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
         }
+#ifdef __APPLE__
+        s->qwen4_graph.prefetched_ngrams = NULL;
+        s->qwen4_graph.prefetched_ngram_tokens = 0;
+        qwen4_ngram_prefetch_free(ngram_jobs);
+#endif
         s->qwen4_graph.vis_spans = NULL;
         s->qwen4_graph.vis_span_count = 0;
         s->qwen4_graph.dump_prompt_rows = false;
@@ -78715,7 +78959,7 @@ static bool qwen4_batch_rows_build_ragged(qwen4_batch_row *rows, const qwen4_bat
 
 /* Embeddings, rope positions and n-gram ids for every row; a session with a
  * draft row records the verify snapshot's host state after its first token,
- * as qwen4_graph_stage_inputs does. */
+ * as the single-session input staging does. */
 static bool qwen4_batch_stage_embeddings_ragged(const qwen4_batch_member *mem, int count, uint32_t N,
                                                 const ds4_model *m, const ds4_weights *w,
                                                 ds4_qwen4_gpu_graph *g, uint32_t *ids) {

@@ -2208,6 +2208,111 @@ kernel void kernel_qwen4_attn_decode(
                                 sel_tokens + (uint64_t)tok * args.sel_stride, out, part, sgitg, tiisg);
 }
 
+/* Split query groups across threadgroups. The original kernels remain above.
+ * Each head retains its dot/key order and the same partial-buffer layout. */
+template <uint NPT, uint QH>
+static inline void qwen4_attn_decode_grouped_tile(
+        constant ds4_metal_args_qwen4_attn_decode &args, uint split, uint kvh, uint tok,
+        uint n, uint n_splits, uint keys_per_split, uint part_splits, bool use_sel,
+        device const float *q, device const float *gate,
+        device const half *k_cache, device const half *v_cache, device const int32_t *sel,
+        device float *out, device float *part, ushort sgitg, ushort tiisg, uint query_group) {
+    const uint H = args.n_head, Hkv = args.n_head_kv;
+    constexpr uint D = NPT * 32;
+    const uint group = H / Hkv;
+    constexpr uint HPS = (QH + QWEN4_ATTN_NSG - 1u) / QWEN4_ATTN_NSG;
+    const uint width = QH;
+    const uint hps = (width + QWEN4_ATTN_NSG - 1) / QWEN4_ATTN_NSG;
+    const uint base = query_group * width;
+    const uint end = min(group, base + width);
+    const uint g0 = base + (uint)sgitg * hps;
+    if (g0 >= end) return;
+    const uint ng = min(hps, end - g0);
+    const uint k0 = split * keys_per_split;
+    const uint k1 = min(n, k0 + keys_per_split);
+
+    float qv[HPS][NPT];
+    float m[HPS], l[HPS], acc[HPS][NPT];
+#pragma unroll
+    for (uint g = 0; g < HPS; g++) {
+        const uint h = kvh * group + g0 + min(g, ng - 1u);
+        device const float *qh = q + ((uint64_t)tok * H + h) * D + tiisg * NPT;
+#pragma unroll
+        for (uint i = 0; i < NPT; i++) qv[g][i] = qh[i] * args.scale;
+        m[g] = -3.0e38f;
+        l[g] = 0.0f;
+#pragma unroll
+        for (uint i = 0; i < NPT; i++) acc[g][i] = 0.0f;
+    }
+    for (uint idx = k0; idx < k1; idx++) {
+        const uint p = use_sel ? (uint)sel[idx] : idx;
+        device const half *kr = k_cache + ((uint64_t)p * Hkv + kvh) * D + tiisg * NPT;
+        device const half *vr = v_cache + ((uint64_t)p * Hkv + kvh) * D + tiisg * NPT;
+        float kv[NPT], vv[NPT];
+#pragma unroll
+        for (uint i = 0; i < NPT; i++) { kv[i] = (float)kr[i]; vv[i] = (float)vr[i]; }
+#pragma unroll
+        for (uint g = 0; g < HPS; g++) {
+            if (g < ng) {
+                float s = 0.0f;
+#pragma unroll
+                for (uint i = 0; i < NPT; i++) s += qv[g][i] * kv[i];
+                s = simd_sum(s);
+                const float m_new = max(m[g], s);
+                const float corr = exp(m[g] - m_new);
+                const float w = exp(s - m_new);
+                l[g] = l[g] * corr + w;
+#pragma unroll
+                for (uint i = 0; i < NPT; i++) acc[g][i] = acc[g][i] * corr + w * vv[i];
+                m[g] = m_new;
+            }
+        }
+    }
+#pragma unroll
+    for (uint g = 0; g < HPS; g++) {
+        if (g >= ng) break;
+        const uint h = kvh * group + g0 + g;
+        if (n_splits == 1) {
+            device float *dst = out + ((uint64_t)tok * H + h) * D + tiisg * NPT;
+            device const float *gt = gate + ((uint64_t)tok * H + h) * D + tiisg * NPT;
+            const float inv = l[g] > 0.0f ? 1.0f / l[g] : 0.0f;
+#pragma unroll
+            for (uint i = 0; i < NPT; i++) dst[i] = acc[g][i] * inv * qwen4_sigmoid(gt[i]);
+        } else {
+            device float *dst = part + ((((uint64_t)tok * Hkv + kvh) * part_splits + split) * group + g0 + g) * (2u + D);
+            if (tiisg == 0) { dst[0] = m[g]; dst[1] = l[g]; }
+#pragma unroll
+            for (uint i = 0; i < NPT; i++) dst[2u + tiisg * NPT + i] = acc[g][i];
+        }
+    }
+}
+
+template <uint NPT, uint QH>
+kernel void kernel_qwen4_attn_decode_grouped(
+        constant ds4_metal_args_qwen4_attn_decode & args,
+        device const float   *q,          /* [T][H*D] */
+        device const float   *gate,       /* [T][H*D] */
+        device const half    *k_cache,    /* [cap][Hkv*D] */
+        device const half    *v_cache,    /* [cap][Hkv*D] */
+        device const int32_t *sel_tokens, /* [T][sel_stride] */
+        device const uint32_t *n_sel,     /* [T] */
+        device float         *out,        /* [T][H*D] */
+        device float         *part,       /* [T][Hkv][n_splits][group][2+D] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint split = tgpig.x;
+    const uint query_groups = (args.n_head / args.n_head_kv + QH - 1u) / QH;
+    const uint kvh = tgpig.y / query_groups;
+    const uint query_group = tgpig.y % query_groups;
+    const uint tok = tgpig.z;
+    if (split >= args.n_splits || kvh >= args.n_head_kv || tok >= args.n_tokens) return;
+    const uint n = args.use_sel ? n_sel[tok] : args.pos0 + tok + 1;
+    qwen4_attn_decode_grouped_tile<NPT, QH>(args, split, kvh, tok, n, args.n_splits, args.keys_per_split, args.n_splits,
+                                args.use_sel != 0, q, gate, k_cache, v_cache,
+                                sel_tokens + (uint64_t)tok * args.sel_stride, out, part, sgitg, tiisg, query_group);
+}
+
 /* The split count and width the host picks for one row from its key count
  * (keys_per_split is the keys per split before the cap on splits). */
 static inline uint2 qwen4_attn_row_splits(uint n_keys, uint split_keys, uint max_splits) {
@@ -2390,6 +2495,14 @@ kernel void kernel_qwen4_attn_merge<NPT_>(constant ds4_metal_args_qwen4_attn_dec
 QWEN4_ATTN_INSTANCE(8)
 QWEN4_ATTN_INSTANCE(4)
 QWEN4_ATTN_INSTANCE(1)
+
+#define QWEN4_ATTN_QUERY_GROUP_INSTANCE(QH_) \
+template [[host_name("kernel_qwen4_attn_decode_npt8_qh" #QH_)]] \
+kernel void kernel_qwen4_attn_decode_grouped<8, QH_>(constant ds4_metal_args_qwen4_attn_decode &, device const float *, \
+        device const float *, device const half *, device const half *, device const int32_t *, device const uint32_t *, \
+        device float *, device float *, uint3, ushort, ushort);
+QWEN4_ATTN_QUERY_GROUP_INSTANCE(6)
+QWEN4_ATTN_QUERY_GROUP_INSTANCE(4)
 
 #define QWEN4_AMM_KT 16
 

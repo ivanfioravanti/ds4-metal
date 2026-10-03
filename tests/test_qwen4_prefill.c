@@ -70,11 +70,19 @@ int main(int argc, char **argv) {
     int vocab = ds4_engine_vocab_size(engine);
     float *a = malloc((size_t)vocab*4), *b = malloc((size_t)vocab*4);
     assert(a && b);
-    int lengths[] = {128,129,132,511,512,1024,2047,2048,2049,2052,3072,4096,(int)max};
+    const int marks[] = {128,129,132,511,512,1024,2047,2048,2049,2050,2051,2052,3072,4096,
+                         8194,8195,8196};
+    int lengths[sizeof(marks)/sizeof(*marks) + 1];
+    size_t count = 0;
+    /* Include both sides of the Qwen Q4 sparse-attention boundary. Compact
+     * the selected marks so the reference replays only executed frontiers. */
+    for (size_t i = 0; i < sizeof(marks)/sizeof(*marks); i++)
+        if (marks[i] <= max) lengths[count++] = marks[i];
+    if (!count || lengths[count-1] < max) lengths[count++] = (int)max;
     int previous = 0;
-    for (size_t j = 0; j < sizeof(lengths)/sizeof(*lengths); j++) {
+    for (size_t j = 0; j < count; j++) {
         int n = lengths[j];
-        if (n <= previous) continue;
+        assert(n > previous && n <= max);
         progress p = {.last = previous, .total = n};
         ds4_session_set_progress(live, report, &p);
         double start = now();
@@ -86,7 +94,6 @@ int main(int argc, char **argv) {
 
         ds4_session_invalidate(control);
         for (size_t k = 0; k <= j; k++) {
-            if (k && lengths[k] <= lengths[k-1]) continue;
             sync_prefix(control, &tokens, lengths[k]);
         }
         assert(ds4_session_copy_logits(control, b, vocab) == vocab);

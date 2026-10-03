@@ -130,21 +130,35 @@ tests/test_metal_tp_cancel: tests/test_metal_tp_cancel.c ds4.h ds4_tp.h $(CORE_O
 test-metal-session-batch: tests/test_metal_session_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_session_batch
 
-speed-bench/metal_decode_schedule_bench.o: speed-bench/metal_decode_schedule_bench.c ds4.h
+speed-bench/metal_decode_schedule_bench.o: speed-bench/metal_decode_schedule_bench.c ds4.h speed-bench/benchmark_pool.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-speed-bench/metal_decode_schedule_bench: speed-bench/metal_decode_schedule_bench.o $(CORE_OBJS)
+speed-bench/metal_decode_schedule_bench: speed-bench/metal_decode_schedule_bench.o speed-bench/benchmark_pool.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 metal-decode-schedule-bench: speed-bench/metal_decode_schedule_bench
 
-speed-bench/metal_prefill_variant_bench.o: speed-bench/metal_prefill_variant_bench.c ds4.h
+speed-bench/benchmark_pool.o: speed-bench/benchmark_pool.m speed-bench/benchmark_pool.h
+	$(CC) $(filter-out -fobjc-arc,$(OBJCFLAGS)) -fno-objc-arc -c -o $@ $<
+
+speed-bench/metal_prefill_variant_bench.o: speed-bench/metal_prefill_variant_bench.c ds4.h speed-bench/benchmark_pool.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-speed-bench/metal_prefill_variant_bench: speed-bench/metal_prefill_variant_bench.o $(CORE_OBJS)
+speed-bench/metal_prefill_variant_bench: speed-bench/metal_prefill_variant_bench.o speed-bench/benchmark_pool.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 metal-prefill-variant-bench: speed-bench/metal_prefill_variant_bench
+
+tests/test_decode_schedule_harness: tests/test_decode_schedule_harness.c speed-bench/metal_decode_schedule_bench.c speed-bench/benchmark_pool.h ds4.h
+	$(CC) $(CFLAGS) -I. -o $@ $< -lm
+
+tests/test_prefill_bench_reporting: tests/test_prefill_bench_reporting.c speed-bench/metal_prefill_variant_bench.c speed-bench/benchmark_pool.h ds4.h speed-bench/benchmark_pool.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -I. -o $@ $< speed-bench/benchmark_pool.o $(CORE_OBJS) $(METAL_LDLIBS)
+
+.PHONY: test-benchmark-harnesses
+test-benchmark-harnesses: tests/test_decode_schedule_harness tests/test_prefill_bench_reporting
+	./tests/test_decode_schedule_harness
+	./tests/test_prefill_bench_reporting
 
 speed-bench/session_concurrency_bench.o: speed-bench/session_concurrency_bench.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -184,6 +198,26 @@ tests/test_qwen4_moe_mm_specialize: tests/test_qwen4_moe_mm_specialize.o $(CORE_
 .PHONY: test-qwen4-moe-mm-specialize
 test-qwen4-moe-mm-specialize: tests/test_qwen4_moe_mm_specialize
 	./tests/test_qwen4_moe_mm_specialize
+
+tests/test_qwen4_prefill_candidates.o: tests/test_qwen4_prefill_candidates.c ds4_gpu.h
+	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
+
+tests/test_qwen4_prefill_candidates: tests/test_qwen4_prefill_candidates.o ds4_metal.o ds4_image.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-qwen4-prefill-candidates
+test-qwen4-prefill-candidates: tests/test_qwen4_prefill_candidates
+	./tests/test_qwen4_prefill_candidates
+
+tests/test_qwen4_decode_primitives.o: tests/test_qwen4_decode_primitives.c tests/test_qwen4_kernels.c ds4.h ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -fno-fast-math -ffp-contract=off -I. -c -o $@ $<
+
+tests/test_qwen4_decode_primitives: tests/test_qwen4_decode_primitives.o ds4_metal.o ds4_image.o
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -fno-fast-math -ffp-contract=off -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-qwen4-attention-query-groups
+test-qwen4-attention-query-groups: tests/test_qwen4_decode_primitives
+	./tests/test_qwen4_decode_primitives attention
 
 tests/test_qwen4_conv_parallel.o: tests/test_qwen4_conv_parallel.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
@@ -1065,6 +1099,9 @@ ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
 
 clean:
+	rm -f tests/test_qwen4_decode_primitives
+	rm -f tests/test_decode_schedule_harness tests/test_prefill_bench_reporting
+	rm -f tests/test_qwen4_prefill_candidates
 	rm -f tests/test_qwen4_ngrams
 	rm -f tests/test_qwen4_ngram_state
 	rm -f tests/test_web_recovery

@@ -1,0 +1,129 @@
+decision=accepted_with_documented_baseline_limitations
+decision_date=2026-10-03
+experiment_families_attempted=20
+families_with_usable_measured_outcomes=19
+baseline_correctness_blocked_family=D09
+original_revision=0aaea5a238fb41a35106a551e73c8409dfb751ac
+accepted_runtime_patch=accepted-runtime.patch
+accepted_runtime_patch_sha256=5058ab0a4da45d2d22e7142c89f2009d5d2c80592a23856acc8e93a920f623c1
+measured_final_runtime_aggregate_sha256=74bd3c3e026e1bc26bc8804348e949e32f2f0e78aaca51216c8a2fac1d87bef6
+runtime_source_manifest=final-runtime-source.sha256
+
+Root decision: retain the minimal v2 prefill and decode changes for the measured
+Qwen3.8 Q4 / Apple M5 Ultra workload. All planned final collections, independent
+performance/I/O audits, focused correctness checks, official ordinary quality
+comparisons, baseline-failure classification and branch attention verification
+are complete. This decision does not make the failed broad suite or D09 pass.
+
+The complete patch changes only ds4.c, ds4_metal.m and metal/qwen4.metal:
+400 insertions and 15 deletions. It includes the already accepted prefill work.
+Apply this patch once against the original; do not also apply the earlier
+accepted-prefill-runtime.patch. The provisional v2 patch and reviewed runtime
+patch are byte-identical and remain preserved as historical evidence.
+
+Retained prefill: existing MID32 gate/up dispatch, HC normalization reuse,
+convolution halo reuse, current-token n-gram overlap and bounded next-chunk
+prefetch (P02/P07/P08/P10). The phase was frozen before decode experiments.
+Retained decode: ordinary T1 fusion, four-query attention grouping and known-row
+n-gram overlap (D05/D06/D08). Automatic short overlap is limited to T<=2, while
+the accepted T>=128 prefill default remains. No T3 overlap default is adopted.
+Chunk capacity, GDN/flush schedules, output-head dispatch, MTP depth policy,
+full-vocabulary GPU selection and swap/acceptance rules retain their originals.
+Rejected traversal, staging, coalescing, compact-list and numerical candidates
+are absent. Individual screen gains are not added to bundle gains.
+
+Performance acceptance uses serial external ABBA/BAAB/ABBA blocks, clean compiled
+defaults, warmups, immutable original/candidate runtime identities, and code and
+prose at 2K/8K/32K/64K. Throughput collection used no diagnostic synchronization
+or I/O injection. The final ordinary and MTP matrices each contain 96 successful
+processes and 128 measured tokens per process. Independent native recomputation
+reproduces their CSVs byte-for-byte. Source, binary, corpus, argv, raw-output and
+exit records passed independent verification before and after collection.
+
+Frozen prefill: 24 cells/288 processes/864 exact full-logit and checkpoint
+frontiers with selected-token parity. Fresh gains 8.760891–28.763287% and
+256-token append gains 5.471318–6.426946% have positive paired 95% intervals.
+All eight 32-token append intervals cross zero; some extend below -2%.
+No short-append improvement or proof of zero possible regression is claimed.
+Final v2 preserves the measured primary prefill dispatch; its tiny continuations
+were covered by the actual rebuilt v2 quality and recovery checks.
+
+Ordinary decode: all eight final-original intervals are positive, gains
+1.898034–2.185276%. All 96 final full-logit/checkpoint fingerprints match, and
+12,288 measured cycle rows reconcile. A separate accepted-prefill comparison
+also passed all eight cells with positive intervals; baselines remain distinct.
+
+Fixed-depth2 MTP: gains 0.464204–0.671164%, with seven positive intervals.
+Code32K is inconclusive: +0.474104% [-0.029929%, +0.980678%]. No improvement is
+claimed as established for that cell. All 7,668 public-frontier full-logit and
+snapshot hashes, accepted trajectories/cycle plans, timed final states, own
+replays and restored continuations pass their appropriate exact checks.
+The 7,572 measured cycles reconcile. These results do not establish ordinary
+raw equivalence, adaptive-policy throughput or depth3 performance.
+
+No repeatable primary-workload regression above 2% was observed. No swap usage
+or swap-in/out activity was recorded in the final performance matrices.
+Latency, sampled memory and read counters remain in the CSVs. Two bounded
+prefetch buffers total 160 MiB at capacity8192; matched-cell resident increases
+were approximately that size. Sampling is not continuous peak tracking.
+
+Separate I/O diagnostics passed: prefill 24 pairs/48 processes, final ordinary
+8 pairs/16 processes, and final fixed2 MTP 8 pairs/16 processes. Final decode
+audits verified all 96 markers, 32 final fingerprints and 1,278 MTP public
+frontiers against corresponding uninstrumented evidence, with matched logical
+reads/bytes and zero failed, short, dropped, unfinished or out-of-scope records.
+No swap was recorded. Ordinary reads exactly 2,048 rows/655,360 bytes per build
+and cell; MTP reads 2,080–2,912 rows/665,600–931,840 bytes. Native MTP pair CSVs
+recompute exactly. Both valid-copy audit controls and all six malformed-input
+rejection cases passed. Cumulative syscall durations and concurrent active-read
+union are diagnostic only, not physical SSD time or GPU critical-path stalls;
+instrumented throughput is excluded. See FINAL_IO_AUDIT.txt and paired CSVs.
+
+Correctness: all eight actual final-v2 focused gates passed, covering n-gram
+partial/failed reads, cancellation and recovery; query/fusion primitives;
+forced MTP rejection and checkpoint recovery; sampled rewind/restore; sparse
+boundaries; SSD experts; and command memory. Independent references retain
+their existing tolerances. Equivalent schedules retain exact logits/state.
+All eight v2 official ordinary quality comparisons passed against pinned
+original scores, with identical reported NLL values. All 100 short and 12 long
+cases remain in NLL checks, with 98 short/12 long API-aligned cases. Ordinary
+teacher-forced quality, adaptive greedy text parity and exact sampled fallback
+remain separate scopes. The portable branch attention test also passed under
+Metal validation, using the same reference arithmetic and tolerances.
+
+Known failures: actual final-v2 make test exits2 with19 assertions. All19,
+14 printed numerical mismatches and5 error verdicts match the original exactly.
+Eight subsequent recipes passed separately. D09 ordinary-reference numerical
+gates and separate depth3 own-replay failures also reproduce on original, before
+usable timing. Original/final depth3 reference captures and failure signatures
+match. A future predictor pos3 read-before-staging hazard is source-confirmed;
+its role in the replay failure is unproven. No workaround, tolerance relaxation,
+predictor equation change or depth3 performance claim is included.
+
+Scope: weights, quantization, operand precision, model equations, attention
+selection/masking/cache contents, checkpoint serialization and public APIs are
+unchanged. Storage remains mmap/disk-backed. Native C/Objective-C/Metal only;
+no MLX or C++ dependency. New fusion/I/O defaults use the measured Ultra/Q4
+profile; query grouping and compatible norm/halo operators can reach other
+quantizations, without a full-model Q2 claim. Original M3/explicit overrides
+remain. Non-Apple preprocessing preserves original C tokens; public headers,
+checkpoint code and77 backend source files are unchanged. This is source
+evidence, not physical CUDA or distributed execution.
+
+Canonical final evidence:
+  FINAL_REPORT.md, BRANCH_REPORT.md, experiments-final.tsv, REPRODUCTION.txt
+  final-prefill-latency-matrix/results.csv and results.svg
+  final-ordinary-matrix/results.csv and final-ordinary-matrix-audit/
+  final-mtp-depth2-matrix/results.csv and final-mtp-depth2-matrix-audit/
+  io-prefill-paired-audit.csv, FINAL_IO_AUDIT.txt and final I/O audit directories
+  final-decode-v2-regressions/, quality-final-v2/, final-branch-validation/
+  final-v2-make-test-baseline-comparison/evidence/
+  mtp-depth3-final-classification/, final-v2-portability-audit/
+  final-source-review-v2/, final-packaging-review-v2/
+
+Raw measurement CSV accepted=no fields describe the non-adopting measurement
+tools. They are deliberately unchanged; this file records the manual decision.
+Historical provisional/pending documents are superseded by this final decision,
+not retroactively relabeled. Optional subvariants are listed as unrun where
+applicable; twenty attempted families does not mean every possible search was
+exhausted or every test passed.

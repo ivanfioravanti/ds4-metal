@@ -1,0 +1,9 @@
+PASS:8 fixed-depth2 MTP cells,96 processes,24 external ABBA/BAAB blocks,7572 timed cycles,7668 full public-frontier hash rows.
+Full public logits/snapshot hashes, accepted trajectory/cycle plans and timed final state agree across original/candidate/repeats.
+Finite first-cycle/committed-token/loop clocks and exact128 commits per process; valid memory telemetry, matched process read counters and no swap.
+original_runtime_sha256=822fe7e1d0491f5b4a830147e79d2724667a576ce9f430bfc2da02eb392bd17d
+original_binary_sha256=cc7cfaddf0631630c2f52e195c4fc5a438719d3ed5742e023baa315c970a0b4e
+candidate_runtime_sha256=74bd3c3e026e1bc26bc8804348e949e32f2f0e78aaca51216c8a2fac1d87bef6
+candidate_binary_sha256=fe0303614d938eb0f25585b961a9df4495fee401fa6c1374f0771197607e5730
+Native recomputation is separate from adoption; see numerical-summary.txt. Ordinary raw equivalence and adaptive production-depth performance are not claimed.
+I/O elapsed duration, official quality and rejection recovery are separate evidence gates.

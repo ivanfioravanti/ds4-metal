@@ -1,0 +1,9 @@
+case,status,logical_reads_per_build,logical_bytes_per_build,original_cumulative_pread_seconds,candidate_cumulative_pread_seconds,original_active_read_union_seconds,candidate_active_read_union_seconds,original_excluded_calls,candidate_excluded_calls
+ordinary-code-2048-fresh,diagnostic_only,2048,655360,0.118186750,0.114462792,0.024496667,0.023509083,25256,25256
+ordinary-code-32768-fresh,diagnostic_only,2048,655360,0.110984792,0.112469958,0.022817750,0.022740542,276176,276176
+ordinary-code-65536-fresh,diagnostic_only,2048,655360,0.123430500,0.131047417,0.025412083,0.026550208,616982,616982
+ordinary-code-8192-fresh,diagnostic_only,2048,655360,0.111358208,0.112587625,0.022995208,0.022818333,79600,79600
+ordinary-prose-2048-fresh,diagnostic_only,2048,655360,0.111633083,0.114054375,0.022912333,0.023152042,34440,34440
+ordinary-prose-32768-fresh,diagnostic_only,2048,655360,0.116946375,0.119404083,0.024319958,0.024341167,508406,508406
+ordinary-prose-65536-fresh,diagnostic_only,2048,655360,0.129296333,0.128444750,0.026661042,0.026326917,1013706,1013706
+ordinary-prose-8192-fresh,diagnostic_only,2048,655360,0.111788167,0.113758917,0.023049000,0.023080250,129480,129480

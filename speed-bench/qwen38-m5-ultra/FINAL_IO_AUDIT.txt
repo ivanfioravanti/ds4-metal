@@ -1,0 +1,33 @@
+PASS: final original-versus-final ordinary and fixed-depth2 MTP diagnostic I/O audits.
+Both collectors exit0;32 processes/16 paired cells; all96 scope markers valid; zero read errors, short reads, dropped intervals, unfinished reads, scope failures or swap samples.
+Every diagnostic emitted state fingerprint matches its corresponding uninstrumented build/cell:32 final fingerprints and1,278 MTP full public-frontier records.
+Raw four-file hashes, clean instrumented argv, source/protocol/binary/corpus identities, unchanged final runtime, parent collector argv/exits and merged CSV reconciliation passed.
+
+ordinary: cells=8 paired_reads_per_build=[2048,2048] paired_bytes_per_build=[655360,655360]
+  original cumulative pread seconds=[0.110984792,0.129296333]; candidate=[0.112469958,0.131047417]
+  original active-read union seconds=[0.022817750,0.026661042]; candidate=[0.022740542,0.026550208]
+mtp-depth2: cells=8 paired_reads_per_build=[2080,2912] paired_bytes_per_build=[665600,931840]
+  original cumulative pread seconds=[0.093676833,0.145517875]; candidate=[0.103342667,0.146228083]
+  original active-read union seconds=[0.018534833,0.028528667]; candidate=[0.019954083,0.028161208]
+
+Cumulative duration sums concurrent native pread calls. Union measures elapsed time with one or more matching reads active. Neither measures physical disk service, storage stalls on the critical path, nor the full worker/sort pipeline. Instrumented runs are excluded from all performance CIs.
+
+Native MTP pair validation reran successfully and matched collector per-cell CSV byte-for-byte. The independent AWK audit also reconciled all raw counts/bytes/durations and required union<=cumulative and union<=timed-loop duration.
+
+New rejection fixture PASS: two unmodified-copy controls; six malformed cases rejected for expected reasons (markers moved after attribution and trailing junk in each of two CSV duration fields, tested for both modes). No real-audit failure or unexpected fixture failure occurred.
+
+
+
+Evidence:
+
+  io-final-ordinary-matrix-audit/{report.txt,paired.csv,audit.sha256}
+
+  io-final-mtp-depth2-matrix-audit/{report.txt,paired.csv,audit.sha256}
+
+  final-io-completion-audit/{report.txt,evidence.sha256,collection.sha256}
+
+  final-io-rejection-fixtures/{results.tsv,evidence.sha256}
+
+  final-io-rejection-test.log
+
+No acceptance decision is inferred by these auditing tools.

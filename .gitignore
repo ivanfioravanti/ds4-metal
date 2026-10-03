@@ -58,6 +58,7 @@
 /tests/test_qwen4_kernels
 /tests/test_qwen4_prefill_candidates
 /tests/test_qwen4_decode_primitives
+/speed-bench/qwen38-m5-ultra/.build/
 /tests/test_decode_schedule_harness
 /tests/test_prefill_bench_reporting
 /tests/test_qwen4_moe_mm_specialize

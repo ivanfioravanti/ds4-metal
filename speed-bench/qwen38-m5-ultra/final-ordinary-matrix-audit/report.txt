@@ -1,0 +1,11 @@
+PASS: 8 ordinary cells, 96 serial processes, 24 external ABBA/BAAB blocks, 12,288 one-token cycle rows.
+All 96 final full-logit/checkpoint hashes match within each cell across builds/repeats; checkpoint sizes and positions match.
+Finite first-step, mean-token and total-loop clocks reconcile; all telemetry rows valid, matched read bytes, no swap activity.
+Native analyzer independently reran with output identical to the collected CSV; raw exit, checksum and exact clean argv checks passed.
+Original and candidate source/binary/corpus manifest and raw argv/exit records verified by the audit wrapper.
+original_runtime_sha256=822fe7e1d0491f5b4a830147e79d2724667a576ce9f430bfc2da02eb392bd17d
+original_binary_sha256=f21954e13cf27229e4e991a86f7c4958bc55223b70d538e8eb7d3fdbbe0509bf
+candidate_runtime_sha256=74bd3c3e026e1bc26bc8804348e949e32f2f0e78aaca51216c8a2fac1d87bef6
+candidate_binary_sha256=2f168cb9b0f939d9ba2905cb3831e81b90c11b6ac13de93b6f78a0d328982861
+Scope: original baseline versus final compiled defaults, with no candidate environment overrides. See numerical-summary.txt for observed CIs; no adoption decision is inferred.
+Timed process disk counters are not elapsed I/O time. Separate instrumented read attribution and official quality gates remain distinct.

@@ -4100,6 +4100,10 @@ static void anthropic_prepare_live_continuation(server *s, request *r,
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
+static bool parse_responses_reasoning(const char **p, ds4_think_mode *effort,
+                                      bool *summary_opted_in,
+                                      bool *effort_seen);
+
 static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
@@ -4225,6 +4229,12 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             got_thinking = true;
         } else if (!strcmp(key, "reasoning_effort")) {
             if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "reasoning")) {
+            /* OpenRouter-style {"effort": ...}; only the effort is applied */
+            if (!parse_responses_reasoning(&p, &reasoning_effort, NULL, NULL)) {
                 free(key);
                 goto bad;
             }
@@ -15096,7 +15106,7 @@ typedef struct {
 } client_arg;
 
 static void append_model_json_values(buf *b, const char *id, const char *name,
-                                     int ctx, int default_tokens) {
+                                     int ctx, int default_tokens, bool vision) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
     buf_printf(b,
         "{\"id\":");
@@ -15114,6 +15124,7 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"context_length\":%d,"
             "\"max_completion_tokens\":%d,"
             "\"is_moderated\":false},"
+        "%s"
         "\"supported_parameters\":["
             "\"tools\","
             "\"tool_choice\","
@@ -15126,10 +15137,18 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"stop\","
             "\"seed\","
             "\"stream\","
+            "\"reasoning\","
+            "\"include_reasoning\","
             "\"reasoning_effort\"]}",
         ctx,
         ctx,
-        max_completion);
+        max_completion,
+        /* clients gate image attachments on the advertised input modalities */
+        vision ? "\"architecture\":{"
+                     "\"modality\":\"text+image->text\","
+                     "\"input_modalities\":[\"text\",\"image\"],"
+                     "\"output_modalities\":[\"text\"]},"
+               : "");
 }
 
 static void append_model_json(buf *b, const server *s, const char *id) {
@@ -15137,7 +15156,8 @@ static void append_model_json(buf *b, const server *s, const char *id) {
                              id,
                              ds4_engine_model_name(s->engine),
                              s->ctx_size,
-                             s->default_tokens);
+                             s->default_tokens,
+                             ds4_engine_has_vision(s->engine));
 }
 
 static bool send_model(server *s, int fd, const char *id) {

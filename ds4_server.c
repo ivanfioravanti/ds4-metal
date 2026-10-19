@@ -21138,7 +21138,7 @@ static void test_tool_history_validation_handles_large_replays(void) {
 static void test_model_metadata_clamps_completion_to_context(void) {
     buf b = {0};
     append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
-                             32768, 393216);
+                             32768, 393216, false);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
@@ -21147,7 +21147,7 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 
     append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
-                             100000, 4096);
+                             100000, 4096, false);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);

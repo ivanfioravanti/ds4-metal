@@ -108,15 +108,23 @@ kernel void kernel_dsv41_router_one(
 
 /* SIMD nominations for the unique finite top-six case; ties use the original
  * bitonic order. Keep six active lanes in the normalization reduction. */
-kernel void kernel_dsv41_router_hier(
+template<bool COHERENT>
+static inline float ds4_dsv41_router_logit(device const float *logits, uint i) {
+    return COHERENT ? dsv41_coherent_load(logits + i) : logits[i];
+}
+
+/* kernel_dsv41_router_hier's body; COHERENT reads logits another threadgroup
+ * of the same dispatch stored (kernel_dsv41_router_fused). */
+template<bool COHERENT>
+static inline void ds4_dsv41_router_hier_body(
         constant ds4_metal_args_dsv41_router & args,
         device const float *logits,
         device const float *bias,
         device       float *probs,
         device     int32_t *selected,
         device       float *weights,
-        threadgroup   char *shmem [[threadgroup(0)]],
-        uint tid [[thread_position_in_threadgroup]]) {
+        threadgroup   char *shmem,
+        uint tid) {
     const uint lane = tid % 32u, sg = tid / 32u;
     threadgroup float *cscore = (threadgroup float *)shmem;
     threadgroup uint *cid = (threadgroup uint *)(shmem + 128u*4u);
@@ -124,7 +132,7 @@ kernel void kernel_dsv41_router_hier(
     float score = -INFINITY, prob = 0.f;
     bool valid = true;
     if (tid < 384u) {
-        const float x = logits[tid];
+        const float x = ds4_dsv41_router_logit<COHERENT>(logits, tid);
         const float ex = exp(x);
         const float em = min(ex, 0.03125f);
         const float poly = em*(1.0f - em*(0.5f - em*(1.0f/3.0f - 0.25f*em)));
@@ -184,7 +192,7 @@ kernel void kernel_dsv41_router_hier(
     const int col = (int)tid;
     sidx[col] = col;
     if (col < width) {
-        const float x = logits[col];
+        const float x = ds4_dsv41_router_logit<COHERENT>(logits, col);
         const float ex = exp(x);
         const float em = min(ex, 0.03125f);
         const float poly = em*(1.0f - em*(0.5f - em*(1.0f/3.0f - 0.25f*em)));
@@ -249,6 +257,18 @@ kernel void kernel_dsv41_router_hier(
     if (col < used) {
         weights[col] = wtmp[col] * args.scale;
     }
+}
+
+kernel void kernel_dsv41_router_hier(
+        constant ds4_metal_args_dsv41_router & args,
+        device const float *logits,
+        device const float *bias,
+        device       float *probs,
+        device     int32_t *selected,
+        device       float *weights,
+        threadgroup   char *shmem [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    ds4_dsv41_router_hier_body<false>(args, logits, bias, probs, selected, weights, shmem, tid);
 }
 
 struct ds4_metal_args_dsv41_rope {
@@ -457,7 +477,26 @@ kernel void kernel_dsv41_engram_add(
     const ulong key_offset = ((ulong)group.x * 5u + group.y) * args.width;
     const ulong value_offset = ((ulong)group.x * 5u + 4u) * args.width;
     float h2 = 0.0f, k2 = 0.0f, dot = 0.0f;
-    for (uint i = lane; i < args.width; i += 32u) {
+    /* Issue eight iterations' loads before accumulating them in the original
+     * order: one simdgroup per stream was waiting out a DRAM round trip per
+     * step. Each lane's sums see the same operands in the same order. */
+    uint i = lane;
+    for (; i + 7u * 32u < args.width; i += 8u * 32u) {
+        float h[8], k[8], w[8];
+        for (uint u = 0; u < 8u; u++) {
+            const uint j = i + u * 32u;
+            const uint wi = group.y * args.width + j;
+            h[u] = residual[offset + j];
+            k[u] = dsv41_bf16(kv[key_offset + j]);
+            w[u] = q_weight[wi] * k_weight[wi];
+        }
+        for (uint u = 0; u < 8u; u++) {
+            h2 += h[u] * h[u];
+            k2 += k[u] * k[u];
+            dot += h[u] * w[u] * k[u];
+        }
+    }
+    for (; i < args.width; i += 32u) {
         const float h = residual[offset + i];
         const float k = dsv41_bf16(kv[key_offset + i]);
         const uint wi = group.y * args.width + i;
@@ -470,9 +509,16 @@ kernel void kernel_dsv41_engram_add(
     dot = simd_sum(dot) * rsqrt(h2 / args.width + args.eps) *
           rsqrt(k2 / args.width + args.eps) * rsqrt(float(args.width));
     const float gate = 1.0f / (1.0f + exp(-copysign(sqrt(max(abs(dot), 1.0e-6f)), dot)));
-    for (uint i = lane; i < args.width; i += 32u)
-        residual[offset + i] = dsv41_bf16(residual[offset + i] +
-            gate * dsv41_bf16(kv[value_offset + i]));
+    uint o = lane;
+    for (; o + 7u * 32u < args.width; o += 8u * 32u) {
+        float r[8], v[8];
+        for (uint u = 0; u < 8u; u++) { r[u] = residual[offset + o + u * 32u]; v[u] = kv[value_offset + o + u * 32u]; }
+        for (uint u = 0; u < 8u; u++)
+            residual[offset + o + u * 32u] = dsv41_bf16(r[u] + gate * dsv41_bf16(v[u]));
+    }
+    for (; o < args.width; o += 32u)
+        residual[offset + o] = dsv41_bf16(residual[offset + o] +
+            gate * dsv41_bf16(kv[value_offset + o]));
 }
 
 struct ds4_metal_args_dsv41_pool {
@@ -1094,4 +1140,88 @@ kernel void kernel_dsv41_add_bf16_rows4(
     const bool4 finite = (bits & 0x7f800000u) != 0x7f800000u;
     bits += select(uint4(0), uint4(0x7fffu) + ((bits >> 16u) & 1u), finite);
     out[gid] = bits & 0xffff0000u;
+}
+
+/* V4.1 decode router in one dispatch: the BF16 router matvec exactly as
+ * kernel_mul_mv_bf16_f32_4 (NSG 8, NR0 2: the same K walk and reduction),
+ * its logits stored coherently; the last threadgroup to finish then runs
+ * kernel_dsv41_router_hier's body on them. 512 threads: simdgroups 8-15 only
+ * join the barriers of the matvec half. */
+kernel void kernel_dsv41_router_fused(
+        constant ds4_metal_args_mul_mv & margs,
+        device const char * src0,
+        device const char * src1,
+        device       float * logits_out,
+        constant ds4_metal_args_dsv41_router & args,
+        device const float *logits,
+        device const float *bias,
+        device       float *probs,
+        device     int32_t *selected,
+        device       float *weights,
+        device atomic_uint *completion,
+        threadgroup   char *shmem [[threadgroup(0)]],
+        uint   tgpig [[threadgroup_position_in_grid]],
+        uint   ntgs [[threadgroups_per_grid]],
+        uint   tid [[thread_position_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    {
+        constexpr short NR0 = 2;
+        const short NSG = 8;
+        constexpr short NW = N_SIMDWIDTH;
+        constexpr short NB  = 32;
+        constexpr short NF  = 16;
+        constexpr short NF4 = NF/4;
+        const int nb = margs.ne00/NB;
+        const int r0 = (int)tgpig*NR0;
+        float sumf[NR0] = { 0.f };
+        if (sgitg < NSG) {
+            device const float4 * y4 = (device const float4 *) src1;
+            device const bfloat4 * ax4[NR0];
+            FOR_UNROLL (short row = 0; row < NR0; ++row)
+                ax4[row] = (device const bfloat4 *) ((device char *) src0 + (uint64_t)(r0 + row)*margs.nb01);
+            const short ix = tiisg/(NW/NF);
+            const short il = tiisg%(NW/NF);
+            const int ib0 = sgitg*NF + ix;
+            float4 yl4[NF4];
+            device const float4 * yb4 = y4 + (ib0*NB + il*NF)/4;
+            for (int ib = ib0; ib < nb; ib += NSG*NF) {
+                for (short i = 0; i < NF4; ++i) yl4[i] = yb4[i];
+                for (short row = 0; row < NR0; row++) {
+                    device const bfloat4 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
+                    float sumq = 0.f;
+                    FOR_UNROLL (short i = 0; i < NF4; ++i) sumq += dot(float4(xb4[i]), float4(yl4[i]));
+                    sumf[row] += sumq;
+                }
+                yb4 += NSG*NF*NW/4;
+            }
+        }
+        threadgroup float * sh[NR0];
+        for (short row = 0; row < NR0; ++row) {
+            sh[row] = (threadgroup float *) shmem + NW*row;
+            if (sgitg == 0) sh[row][tiisg] = 0.0f;
+            sumf[row] = simd_sum(sumf[row]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (short row = 0; row < NR0; ++row)
+            if (tiisg == 0 && sgitg < NSG) sh[row][sgitg] = sumf[row];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (short row = 0; row < NR0 && r0 + row < margs.ne01; ++row) {
+            const float tot = simd_sum(sh[row][tiisg]);
+            if (tiisg == 0 && sgitg == 0) dsv41_coherent_store(logits_out + r0 + row, tot);
+        }
+        threadgroup float * flag = (threadgroup float *) shmem + 2*NW;
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            const uint old = atomic_fetch_add_explicit(completion, 1u, memory_order_relaxed);
+            flag[0] = old + 1u == ntgs ? 1.0f : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+        if (flag[0] == 0.0f) return;
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        if (tid == 0) atomic_store_explicit(completion, 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    ds4_dsv41_router_hier_body<true>(args, logits, bias, probs, selected, weights, shmem, tid);
 }

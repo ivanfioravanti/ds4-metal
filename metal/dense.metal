@@ -2306,6 +2306,8 @@ typedef decltype(kernel_mul_mv_t_t_4<half, half4, half, half4>) mul_mv_t_t_4;
 // Host-visible vectorized dense matvec variants for F32 and F16 weights.
 template [[host_name("kernel_mul_mv_f32_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float, float4, float, float4>;
 template [[host_name("kernel_mul_mv_f16_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  float, float4>;
+// BF16 weights (exact copies of BF16-valued F32 tensors such as the V4.1 router).
+template [[host_name("kernel_mul_mv_bf16_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<bfloat, bfloat4, float, float4>;
 
 // The same matvec with its output rounded to bf16.
 template<typename T0, typename T04, typename T1, typename T14>
@@ -4159,3 +4161,83 @@ template [[host_name("kernel_mul_mm_f16_f32")]]  kernel mul_mm_t kernel_mul_mm<h
 template [[host_name("kernel_mul_mm_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4>;
+
+// F16 weights that are exact FP8 (e4m3fn) codes times one power-of-two scale
+// per 32x32 block (V4.1 Engram projections, indexer query; released that way), read at a
+// byte per weight. The lane mapping, K walk, dot order and reduction are those
+// of kernel_mul_mv_f16_f32_4_bf16, and every decoded weight equals the F16
+// value exactly, so the output is bit-identical to it.
+
+template<short NR0>
+void kernel_mul_mv_fp8s_impl(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const uchar * scales,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+    constexpr short NF4 = NF/4;
+    const int nb = args.ne00/NB;
+    const int r0 = tgpig.x*NR0;
+    const int r1 = tgpig.y;
+    const uint64_t offset1 = r1*args.nb11;
+    device const float4 * y4 = (device const float4 *) (src1 + offset1);
+    device const uchar * ax[NR0];
+    device const uchar * sc[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const uchar *) src0 + (uint64_t)(r0 + row)*args.nb01;
+        sc[row] = scales + (uint64_t)((r0 + row)/32)*(uint64_t)nb;
+    }
+    float sumf[NR0] = { 0.f };
+    const short ix = tiisg/(NW/NF);
+    const short il = tiisg%(NW/NF);
+    const int ib0 = sgitg*NF + ix;
+    float4 yl4[NF4];
+    device const float4 * yb4 = y4 + (ib0*NB + il*NF)/4;
+    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+        for (short i = 0; i < NF4; ++i) yl4[i] = yb4[i];
+        for (short row = 0; row < NR0; row++) {
+            /* one 16-byte load: the lane's 16 codes are contiguous and aligned */
+            const uint4 q16 = *((device const uint4 *) (ax[row] + ib*NB + il*NF));
+            /* e4m3fn bits shifted into a half's bit pattern are the code's
+             * value times 2^-8 (subnormals included); fold 2^8 into the block
+             * scale. Exact: the product is a power-of-two rescale. */
+            const float s = as_type<float>((uint(sc[row][ib]) + 8u) << 23);
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                const ushort4 q = ushort4(as_type<uchar4>(q16[i]));
+                const ushort4 hb = ((q & ushort4(0x7f)) << 7) | ((q & ushort4(0x80)) << 8);
+                const float4 w = float4(as_type<half4>(hb)) * s;
+                sumq += dot(w, yl4[i]);
+            }
+            sumf[row] += sumq;
+        }
+        yb4 += NSG*NF*NW/4;
+    }
+    device float * dst_f32 = (device float *) dst + (uint64_t)r1*args.ne0;
+    helper_mv_reduce_and_write<NR0, true>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
+kernel void kernel_mul_mv_fp8s_f32_4_bf16(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const uchar * scales,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    switch (args.nr0) {
+        case 1: kernel_mul_mv_fp8s_impl<1>(args, src0, src1, dst, scales, shmem, tgpig, tiisg, sgitg); break;
+        case 2: kernel_mul_mv_fp8s_impl<2>(args, src0, src1, dst, scales, shmem, tgpig, tiisg, sgitg); break;
+        case 4: kernel_mul_mv_fp8s_impl<4>(args, src0, src1, dst, scales, shmem, tgpig, tiisg, sgitg); break;
+    }
+}

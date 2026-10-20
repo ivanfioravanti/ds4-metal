@@ -620,6 +620,37 @@ kernel void kernel_flash_attn_ext_vec_reduce_rope(
                                   (uint)(32 * FC_flash_attn_ext_vec_reduce_NWG));
 }
 
+/* V4.1 decode: the flash reduce also applies the inverse RoPE tail exactly as
+ * kernel_mul_mv_q8_0_f32_rope_impl<..., ROUND_IN, ROPE_IN> applies it to the
+ * attention output projection's input (bf16-rounded operands, precise sincos,
+ * the same fma pair, bf16-rounded results), so that projection can read the
+ * rotated row with ROPE_IN off and see the identical operands. */
+kernel void kernel_dsv41_flash_reduce_rope(
+        constant ds4_metal_args_flash_attn_ext_vec_reduce & args,
+        device  const char * htmp,
+        device        char * dst,
+        constant ds4_metal_args_mv_rope & rope,
+        uint   tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    ds4_flash_attn_vec_reduce_row(args, htmp, dst, tgpig, tiisg, sgitg,
+                                  (short)FC_flash_attn_ext_vec_reduce_NWG,
+                                  (short)FC_flash_attn_ext_vec_reduce_DV);
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tiitg < 32u) {
+        device float * row = (device float *) dst + (uint64_t)tgpig * rope.width;
+        const uint k = rope.width - 64u + 2u * (uint)tiitg;
+        const float theta = float(rope.start) * rope.frequencies[tiitg];
+        float c;
+        const float sn = precise::sincos(theta, c);
+        const float s = rope.inverse ? -sn : sn;
+        const float re = ds4_bf16_round(row[k]), im = ds4_bf16_round(row[k + 1]);
+        row[k]     = ds4_bf16_round(fma(re, c, -(im * s)));
+        row[k + 1] = ds4_bf16_round(fma(im, c, re * s));
+    }
+}
+
 struct ds4_metal_args_dsv4_comp_finalize {
     ds4_metal_args_dsv4_rope_affine_pair rope;
     float    rms_eps;

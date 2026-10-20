@@ -276,6 +276,22 @@ int ds4_gpu_dsv41_matmul_expand_rows(ds4_gpu_tensor *out_hc, const void *model_m
                                      const ds4_gpu_tensor *x, const ds4_gpu_tensor *add,
                                      const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
                                      uint32_t n_hc, uint32_t rows);
+/* An F16 tensor released as FP8 blocks, matvec'd from exact FP8 codes with
+ * the F16 kernel's arithmetic; 0 when the tensor is not exactly FP8. */
+int ds4_gpu_dsv41_matmul_f16_fp8_bf16(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                      uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
+                                      const ds4_gpu_tensor *x);
+/* Arm the next decode attention reduce to apply the inverse rope tail, so the
+ * low projection reads rotated heads (cleared if the attention fails). */
+void ds4_gpu_dsv41_set_reduce_rope(uint32_t pos, bool compressed);
+void ds4_gpu_dsv41_clear_reduce_rope(void);
+/* The one-token router (BF16 matvec and selection) in one dispatch; 0 when
+ * unavailable, leaving the matvec + ds4_gpu_dsv41_router_one path. */
+int ds4_gpu_dsv41_router_fused(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+                               ds4_gpu_tensor *probs, ds4_gpu_tensor *logits,
+                               const void *model_map, uint64_t model_size,
+                               uint64_t gate_offset, uint64_t bias_offset,
+                               const ds4_gpu_tensor *x, float scale);
 /* The attention output low projection of one row with the heads' inverse
  * rope (and bf16 rounding) folded into the load; heads may be roped in place. */
 int ds4_gpu_dsv41_attention_low(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,

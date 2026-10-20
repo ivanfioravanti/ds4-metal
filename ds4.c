@@ -41271,6 +41271,17 @@ static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
     if (round && weight->type == DS4_TENSOR_Q8_0)
         return ds4_gpu_matmul_q8_0_bf16_tensor(out, m->map, m->size, weight->abs_offset,
                                                weight->dim[0], weight->dim[1], in, 1) != 0;
+#ifdef __APPLE__
+    {
+        /* F16 tensors released as FP8 blocks (indexer wq_b, Engram wkv): read
+         * the exact FP8 codes, same arithmetic, half the bytes. */
+        static int fp8 = -1;
+        if (fp8 < 0) fp8 = getenv("DS4_METAL_DISABLE_V41_FP8_F16") == NULL;
+        if (fp8 && round && weight->type == DS4_TENSOR_F16 &&
+            ds4_gpu_dsv41_matmul_f16_fp8_bf16(out, m->map, m->size, weight->abs_offset,
+                (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], in)) return true;
+    }
+#endif
     if (round && weight->type == DS4_TENSOR_F16 &&
         ds4_gpu_dsv41_project_f16_bf16(out, m->map, m->size, weight->abs_offset,
                                        (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], in)) return true;
@@ -41859,7 +41870,19 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     if ((!q_roped && !ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false)) ||
         (!g->kv_stored && !ds41_rope_store(g->kv, g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
                          DS4_N_HEAD_DIM, il, pos, DS4_V41_FP8_E8M0)) ||
-        !ds41_attention_select(g, m, l, il) || !ds41_attend(g, m, l, il)) return false;
+        !ds41_attention_select(g, m, l, il)) return false;
+#ifdef __APPLE__
+    static int reduce_rope = -1;
+    if (reduce_rope < 0) reduce_rope = getenv("DS4_METAL_DISABLE_V41_REDUCE_ROPE") == NULL;
+    const bool arm = reduce_rope && !projected && g->tp_world == 1 && !g->quality;
+    if (arm) ds4_gpu_dsv41_set_reduce_rope(pos, ds4_layer_compress_ratio(il) != 0);
+#endif
+    if (!ds41_attend(g, m, l, il)) {
+#ifdef __APPLE__
+        ds4_gpu_dsv41_clear_reduce_rope();
+#endif
+        return false;
+    }
     /* a caller that projects the heads itself gets them roped */
     if (projected)
         return ds4_gpu_dsv41_rope_bf16(g->heads, DS4_N_HEAD_DIM, heads, 1, pos,
@@ -41927,13 +41950,19 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN] : sum;
     const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
     if (!bias) return false;
-    if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false)) return false;
 #ifdef __APPLE__
-    const bool routed_one = !ds41_router_one_off() &&
+    const bool fused = !ds41_router_one_off() && l->ffn_gate_inp->type == DS4_TENSOR_F32 &&
+        DS4_N_EXPERT == 384 && DS4_N_EXPERT_USED == 6 &&
+        ds4_gpu_dsv41_router_fused(g->selected, g->route_weights, g->route_probs, g->route_logits,
+            m->map, m->size, l->ffn_gate_inp->abs_offset, bias->abs_offset, g->norm,
+            DS4_EXPERT_WEIGHT_SCALE);
+    if (!fused && !ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false)) return false;
+    const bool routed_one = fused || (!ds41_router_one_off() &&
         ds4_gpu_dsv41_router_one(g->selected, g->route_weights, g->route_probs, g->route_logits,
             m->map, m->size, bias->abs_offset, DS4_N_EXPERT, DS4_N_EXPERT_USED,
-            DS4_EXPERT_WEIGHT_SCALE);
+            DS4_EXPERT_WEIGHT_SCALE));
 #else
+    if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false)) return false;
     const bool routed_one = false;
 #endif
     if (!routed_one &&

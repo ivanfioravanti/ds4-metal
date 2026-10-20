@@ -3537,16 +3537,17 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32_mma_rows8(
 }
 /* DeepSeek V4.1 decode: the heads round to bf16 and take their inverse rope
  * as they load, as the standalone rope pass would have stored them. */
-kernel void kernel_dsv4_attn_out_low_q8_0_f32_rope(
+template<bool ROPE_IN>
+static inline void dsv4_attn_out_low_q8_0_body(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src0s,
         device const char * src1,
         device       char * dst,
         constant ds4_metal_args_mv_rope & rope,
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
     const int iid1 = tgpig.z/args.nei0;
     const int idx  = tgpig.z%args.nei0;
 
@@ -3581,8 +3582,35 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32_rope(
         /*.r3   =*/ 1,
     };
 
-    kernel_mul_mv_q8_0_f32_rope_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &, false, true, true, false>(
+    kernel_mul_mv_q8_0_f32_rope_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &, false, true, ROPE_IN, false>(
         args0, src0_cur, src1_cur, dst_cur, shmem, tgpig, tiisg, sgitg, &rope);
+}
+
+kernel void kernel_dsv4_attn_out_low_q8_0_f32_rope(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        constant ds4_metal_args_mv_rope & rope,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    dsv4_attn_out_low_q8_0_body<true>(args, src0s, src1, dst, rope, shmem, tgpig, tiisg, sgitg);
+}
+
+/* Heads already rotated by kernel_dsv41_flash_reduce_rope: bf16 rounding only. */
+kernel void kernel_dsv4_attn_out_low_q8_0_f32_roundin(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        constant ds4_metal_args_mv_rope & rope,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    dsv4_attn_out_low_q8_0_body<false>(args, src0s, src1, dst, rope, shmem, tgpig, tiisg, sgitg);
 }
 
 kernel void kernel_dsv4_attn_out_low_q4_K_f32(

@@ -26761,6 +26761,68 @@ static int ds4_gpu_matmul_q8_0_kslice_rows_impl(
         uint64_t k_off, uint64_t k_cnt, const ds4_gpu_tensor *x,
         uint64_t n_rows, uint64_t x_stride, uint64_t x_off);
 
+/* Columns [k_off, k_off + k_len) of a Q8_0 matrix whose rows hold full_in
+ * weights, against rows of k_len activations: the tiled Q8 GEMM with the
+ * slice's first block as the weight base and the full row as its stride.
+ * The opt-in TP prefill shared-expert split takes it for its half of the
+ * shared down projection; it reassociates the K sum. */
+static int ds4_gpu_matmul_q8_0_kslice_mm(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                         uint64_t weight_offset, uint64_t full_in, uint64_t k_off,
+                                         uint64_t k_len, uint64_t out_dim,
+                                         const ds4_gpu_tensor *x, uint64_t x_row0, uint64_t n_tok) {
+    if ((full_in % 32u) || (k_off % 32u) || (k_len % 32u) || !k_len || k_off + k_len > full_in ||
+        !out_dim || n_tok < 32u || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
+    @autoreleasepool {
+        const uint64_t row_bytes = full_in / 32u * 34u;
+        const uint64_t base = weight_offset + k_off / 32u * 34u;
+        const uint64_t bytes = (out_dim - 1u) * row_bytes + k_len / 32u * 34u;
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        if (!xbuf || !outbuf || base > model_size || bytes > model_size - base ||
+            ds4_gpu_tensor_bytes(x) < (x_row0 + n_tok) * k_len * sizeof(float) ||
+            ds4_gpu_tensor_bytes(out) < n_tok * out_dim * sizeof(float)) return 0;
+        uint64_t inner = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size, base, bytes, &inner);
+        if (!wbuf) return 0;
+        const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_q8_0_f32", false, bc_out);
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(k_len, out_dim, n_tok, row_bytes);
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) + (NSUInteger)(x_row0 * k_len * sizeof(float))
+               atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
+                                              ((NSUInteger)out_dim + 63u) / 64u, 1)
+             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Q8_0 k-slice matmul")) return 0;
+    }
+    return 1;
+}
+
+/* Rows of k-slice activations against a Q8_0 matrix's column slice: tiled
+ * when the rows fill a tile, the exact matvec reduction for a few. */
+int ds4_gpu_matmul_q8_0_kslice_batch_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                            uint64_t weight_offset, uint64_t full_in, uint64_t k_off,
+                                            uint64_t k_len, uint64_t out_dim,
+                                            const ds4_gpu_tensor *x, uint32_t n_tok) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (n_tok >= 32u && !g_quality_mode &&
+        ds4_gpu_matmul_q8_0_kslice_mm(out, model_map, model_size, weight_offset, full_in, k_off,
+                                      k_len, out_dim, x, 0, n_tok)) return 1;
+    return ds4_gpu_matmul_q8_0_kslice_exact_rows(out, model_map, model_size, weight_offset, full_in,
+                                                 k_off, k_len, out_dim, x, 0, n_tok);
+}
+
 static int ds4_gpu_attention_output_q8_batch_impl(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,

@@ -40971,6 +40971,7 @@ typedef struct {
     /* Rows the unpruned sweep would run here; batched kernels that pick by
      * row count pick for these, so pruned rows match it. 0: the batch's own. */
     uint32_t plan_rows;
+    bool shared_folded;              /* the last FFN gate already summed the shared expert */
     uint64_t allocation_bytes;
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
     uint32_t tp_world, tp_rank;
@@ -43106,6 +43107,46 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             m->map, m->size, l->ffn_exp_probs_b->abs_offset, DS4_N_EXPERT, DS4_N_EXPERT_USED,
             DS4_EXPERT_WEIGHT_SCALE, count);
 #endif
+#ifdef __APPLE__
+    /* Opt-in TP prefill (DS4_METAL_V41_TP_PREFILL_SHARED_SPLIT=1): each rank
+     * takes half the shared expert's hidden width and adds its partial into
+     * the routed partial, so the FFN gate sums both and no rank runs the
+     * whole shared expert. Another summation order, so off by default and
+     * under --quality. */
+    static int shared_split_on = -1;
+    /* the sweep's batched HC combine is the reader that knows the fold */
+    if (shared_split_on < 0) shared_split_on = getenv("DS4_METAL_V41_TP_PREFILL_SHARED_SPLIT") &&
+        !getenv("DS4_METAL_DISABLE_V41_BATCH_HC") && !getenv("DS4_METAL_DISABLE_V41_BATCH_ATTN");
+    const bool shared_split = shared_split_on && !g->quality && !shared_owner && shared_down && g->tp_world == 2 &&
+        !g->verify_prefix && count > DS4_TP_BATCH_MAX_ROWS &&
+        l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 && l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_down_shexp->type == DS4_TENSOR_Q8_0;
+    if (shared_split) {
+        const uint32_t half = DS4_N_FF_EXP / 2u, first = g->tp_rank * half;
+        return (routed ||
+            (ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
+             ds41_route_batch(g, m, l, count))) &&
+            ds41_matmul_rows_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, first, half, count) &&
+            ds41_matmul_rows_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, first, half, count) &&
+            ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
+                count * half, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
+            ds4_gpu_dsv41_quantize(b->shared_mid, half, count, DS4_V41_BF16) &&
+            ds4_gpu_matmul_q8_0_kslice_batch_tensor(b->shared, m->map, m->size,
+                l->ffn_down_shexp->abs_offset, DS4_N_FF_EXP, first, half, DS4_N_EMBD,
+                b->shared_mid, count) &&
+            ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
+                m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
+                gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
+                DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm,
+                il, count, &mid_f16, true) &&
+            ds4_gpu_add_tensor(b->routed, b->routed, b->shared, count * DS4_N_EMBD) &&
+            ds41_sum_partial_batch(g, b->routed, il, DS4_TP_GATE_FFN, count) &&
+            (g->shared_folded = true);
+    }
+#endif
+    g->shared_folded = false;
     return (routed ||
         (ds41_router_batch(g, m, l, count) &&
          ds41_route_batch(g, m, l, count))) &&
@@ -43941,7 +43982,10 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false, true);
                 DS41_STAGE("shared/routed ffn");
                 if (ok && batch_hc) {
-                    ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
+                    ok = (g->shared_folded ?
+                          ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
+                                              (uint64_t)count * DS4_N_EMBD * sizeof(float)) :
+                          ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD)) &&
                         ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, count, DS4_V41_BF16) &&
                         ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                             active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&

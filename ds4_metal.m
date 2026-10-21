@@ -31753,7 +31753,20 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const uint32_t decode_splits =
             decode_one_token && !g_quality_mode ? 12u : 1u;
         const bool split_decode = decode_splits > 1u;
+        /* Opt-in (DS4_METAL_V41_PREFILL_MMA=1) simdgroup-matrix prefill
+         * attention on M1-M4: 32 heads of one token per threadgroup. Its sums
+         * run in another order than the scalar kernel's (KL to it ~1e-4 at
+         * 4-8K), so it is off by default and under --quality. */
+        static int prefill_mma_on = -1;
+        if (prefill_mma_on < 0)
+            prefill_mma_on = getenv("DS4_METAL_V41_PREFILL_MMA") != NULL &&
+                ds4_gpu_device_is_pre_m5_apple_silicon();
+        const bool prefill_mma = n_head % 32u == 0u && prefill_mma_on &&
+            n_tokens > 8u && ratio <= 2u && !prefill_dual_heads &&
+            !g_quality_mode && !g_ssd_streaming_mode &&
+            (!ds4_gpu_tp_world_is_two() || (top_k == 512u && window == 128u));
         id<MTLComputePipelineState> attn_pipeline =
+            prefill_mma ? ds4_gpu_get_pipeline("kernel_dsv41_prefill_attention_mma") :
             split_decode ?
             ds4_gpu_hot_pipeline(
                 g_dsv4_indexed_attention_heads8_split_pipeline,
@@ -31898,6 +31911,15 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                  atIndex:4];
             [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
             [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:6];
+            if (prefill_mma) {
+                /* 16 staged half rows of 520, per simdgroup 8 x 16 float scores
+                 * (then weights), 16 row flags */
+                [enc setThreadgroupMemoryLength:16u * 520u * sizeof(uint16_t) +
+                                                16u * 128u * sizeof(float) + 16u * sizeof(uint32_t)
+                                        atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, (NSUInteger)n_head / 32u, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 16, 1)];
+            } else {
             [enc setThreadgroupMemoryLength:(decode_one_token ? 16u : 1u) *
                                             128u * 4u * sizeof(uint16_t)
                                     atIndex:0];
@@ -31907,6 +31929,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                     (prefill_dual_heads ? 16u : 8u),
                                 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+            }
             ds4_gpu_end_compute_encoder(cb, enc);
         }
 

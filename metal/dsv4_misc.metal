@@ -7391,9 +7391,199 @@ kernel void kernel_dsv4_softmax_pool_ratio4_direct(
     dst[ic * args.head_dim + id] = acc/sum;
 }
 
+/* V4.1 prefill attention on simdgroup matrices (M1-M4, no tensor ops).
+ *
+ * All heads of a token read the same window and top-k rows (one latent row
+ * serves as key and value), so a threadgroup takes 32 heads of one token:
+ * sixteen simdgroups, each eight heads by one quarter of the 512 dims. A block
+ * of 16 rows is staged once as half; Q.K^T accumulates each quarter's partial
+ * scores, the quarters exchange them, and all four run the same online softmax
+ * over the block, so the scalar kernel's per-row rescale happens once per
+ * block. P.V takes float weights and accumulates in float. Q, K and V keep the
+ * scalar kernel's half rounding; sums run in a different order, so outputs
+ * differ by reassociation; --quality keeps the scalar kernel. */
+#define DSV41_MMA_KS 520u   /* staged row stride in halves: 512 + pad */
+
 static inline short2 dsv41_mma_coord(ushort lane) {
     const short qid = lane / 4;
     return short2((qid & 2) * 2 + (lane % 2) * 2, (qid & 4) + ((lane / 2) % 4));
+}
+
+kernel void kernel_dsv41_prefill_attention_mma(
+        constant ds4_metal_args_dsv4_indexed_attention & args,
+        device const char *q,
+        device const char *raw_kv,
+        device const char *comp_kv,
+        device const char *topk,
+        device const char *sinks,
+        device       char *dst,
+        threadgroup half  *kvs [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    const uint token = tgpig.x;
+    /* NQ dim quarters of DW dims; 16 / NQ head tiles of 8 per threadgroup.
+     * Halves (64 heads) spill registers; eighths (16 heads) restage rows. */
+    constexpr uint NQ = 4u, DW = 512u / NQ, NF = DW / 8u, HT = 128u / NQ;
+    const uint tile = sg / NQ, dq = sg % NQ;
+    const uint head0 = tgpig.y * HT + tile * 8u;
+    if (token >= args.n_tokens) return;
+    /* KB staged rows per block (8 measured slower); per simdgroup 8 x KB
+     * scores, then weights in place */
+    constexpr uint KB = 16u, SE = 8u * KB;
+    threadgroup float *sx = (threadgroup float *)(kvs + KB * DSV41_MMA_KS);    /* [16 sg][8][KB] */
+    threadgroup uint *flags = (threadgroup uint *)(sx + 16u * SE);             /* [KB] */
+    threadgroup float *part = sx + tile * NQ * SE;
+    threadgroup float *mine = part + dq * SE;
+
+    /* Q: this simdgroup's 8 heads x 128 dims as half, through its own 1 KiB slice */
+    simdgroup_half8x8 qf[NF];
+    {
+        threadgroup half *slice = kvs + sg * 512u;
+        for (uint h = 0; h < NF / 8u; h++) {
+            for (uint e = lane; e < 512u; e += 32u) {
+                const uint r = e >> 6, c = e & 63u;
+                device const float *qrow = (device const float *)(q +
+                    (uint64_t)token * args.q_token_stride + (uint64_t)(head0 + r) * args.q_head_stride);
+                slice[e] = (half)qrow[dq * DW + h * 64u + c];
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            #pragma clang loop unroll(full)
+            for (uint f = 0; f < 8u; f++) simdgroup_load(qf[h * 8u + f], slice + f * 8u, 64);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_float8x8 o[NF];
+    #pragma clang loop unroll(full)
+    for (uint f = 0; f < NF; f++) o[f] = simdgroup_float8x8(0.0f);
+    const short2 xy = dsv41_mma_coord(lane);   /* x: column, y: row of my two elements */
+    constexpr uint PL = KB / 4u;   /* softmax columns per lane */
+    const uint srow = lane >> 2, scol = (lane & 3u) * PL;
+    float M = -FLT_MAX / 2.0f, S = 0.0f;
+
+    const uint qpos = args.pos0 + token;
+    const uint last_pos = args.pos0 + args.n_tokens - 1u;
+    const uint first_raw_pos = last_pos + 1u - args.n_raw;
+    const uint window_first = (args.window != 0u && qpos + 1u > args.window) ? qpos + 1u - args.window : 0u;
+    const uint wfirst = max(first_raw_pos, window_first), wlast = min(qpos, last_pos);
+    const uint n_window = wfirst <= wlast ? wlast - wfirst + 1u : 0u;
+    const uint visible = min((qpos + 1u) / args.ratio, args.n_comp);
+    device const int32_t *row_topk = (device const int32_t *)(topk + (uint64_t)token * args.topk_token_stride);
+    const uint n_wblocks = (n_window + KB - 1u) / KB;
+
+    for (uint blk = 0;; blk++) {
+        /* block rows: window rows first, then 16-entry chunks of the sorted top-k */
+        const bool win = blk < n_wblocks;
+        const uint i0 = win ? 0u : (blk - n_wblocks) * KB;
+        if (!win) {
+            if (i0 >= args.top_k) break;
+            if (i0 > 0u) {
+                const int32_t prev = row_topk[i0 - 1u];
+                if (prev >= 0 && (uint)prev >= visible) break;   /* sorted: nothing visible remains */
+            }
+            if (row_topk[min(i0 + KB - 1u, args.top_k - 1u)] < 0) continue;   /* an all-absent chunk */
+        }
+        for (uint off = tid; off < KB * 128u; off += 512u) {
+            const uint r = off >> 7, c = off & 127u;
+            half4 v = half4(0.0h);
+            bool ok;
+            if (win) {
+                ok = blk * KB + r < n_window;
+                if (ok) {
+                    const uint logical = wfirst + blk * KB + r - first_raw_pos;
+                    const uint row = (args.raw_start + logical) % args.raw_cap;
+                    v = (half4)((device const float4 *)(raw_kv + (uint64_t)row * args.raw_row_stride))[c];
+                }
+            } else {
+                const int32_t idx = i0 + r < args.top_k ? row_topk[i0 + r] : -1;
+                ok = idx >= 0 && (uint)idx < visible;
+                if (ok) v = dsv4_load_cache_h4(comp_kv, args.comp_row_stride, (uint)idx, c,
+                                               args.comp_kv_f16 != 0u);
+            }
+            *(threadgroup half4 *)(kvs + r * DSV41_MMA_KS + c * 4u) = v;
+            if (c == 0u) flags[r] = ok ? 1u : 0u;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* partial scores over this quarter's dims */
+        simdgroup_float8x8 s0 = simdgroup_float8x8(0.0f), s1 = simdgroup_float8x8(0.0f);
+        (void)s1;
+        #pragma clang loop unroll(full)
+        for (uint f = 0; f < NF; f++) {
+            simdgroup_half8x8 kt;
+            threadgroup const half *kb = kvs + dq * DW + f * 8u;
+            simdgroup_load(kt, kb, DSV41_MMA_KS, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(s0, qf[f], kt, s0);
+            if (KB == 16u) {
+                simdgroup_load(kt, kb + 8u * DSV41_MMA_KS, DSV41_MMA_KS, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(s1, qf[f], kt, s1);
+            }
+        }
+        simdgroup_store(s0, mine, KB);
+        if (KB == 16u) simdgroup_store(s1, mine + 8, KB);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* online softmax, row srow, columns scol..scol+3 (all quarters agree) */
+        float p[PL], bm = -INFINITY;
+        for (uint j = 0; j < PL; j++) {
+            const uint e = srow * KB + scol + j;
+            float sum = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint k = 0; k < NQ; k++) sum += part[k * SE + e];
+            p[j] = flags[scol + j] ? sum * args.scale : -INFINITY;
+            bm = max(bm, p[j]);
+        }
+        bm = max(bm, simd_shuffle_xor(bm, 1));
+        bm = max(bm, simd_shuffle_xor(bm, 2));
+        const float mn = max(M, bm), alpha = exp(M - mn);
+        float rs = 0.0f;
+        for (uint j = 0; j < PL; j++) { p[j] = exp(p[j] - mn); rs += p[j]; }
+        rs += simd_shuffle_xor(rs, 1);
+        rs += simd_shuffle_xor(rs, 2);
+        S = S * alpha + rs;
+        M = mn;
+        threadgroup_barrier(mem_flags::mem_threadgroup);   /* the other quarters have read `mine` */
+        for (uint j = 0; j < PL; j++) mine[srow * KB + scol + j] = p[j];
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        const float a = simd_shuffle(alpha, (ushort)(xy.y * 4));
+        simdgroup_float8x8 p0, p1;   /* half weights cost 3x the drift at 32K */
+        simdgroup_load(p0, mine, KB);
+        if (KB == 16u) simdgroup_load(p1, mine + 8, KB);
+        #pragma clang loop unroll(full)
+        for (uint f = 0; f < NF; f++) {
+            o[f].thread_elements()[0] *= a;
+            o[f].thread_elements()[1] *= a;
+            simdgroup_half8x8 v;
+            threadgroup const half *vb = kvs + dq * DW + f * 8u;
+            simdgroup_load(v, vb, DSV41_MMA_KS);
+            simdgroup_multiply_accumulate(o[f], p0, v, o[f]);
+            if (KB == 16u) {
+                simdgroup_load(v, vb + 8u * DSV41_MMA_KS, DSV41_MMA_KS);
+                simdgroup_multiply_accumulate(o[f], p1, v, o[f]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    /* the sink joins the denominator, then normalize and store */
+    const float sink = ((device const float *)sinks)[head0 + srow];
+    const float mn = max(M, sink), alpha = exp(M - mn);
+    S = S * alpha + exp(sink - mn);
+    const float inv = S == 0.0f ? 0.0f : 1.0f / S;
+    const float a = simd_shuffle(alpha * inv, (ushort)(xy.y * 4));
+    device float *out = (device float *)(dst + (uint64_t)token * args.dst_token_stride +
+                                         (uint64_t)head0 * args.dst_head_stride) + dq * DW;
+    const ulong ostride = args.dst_head_stride / sizeof(float);
+    #pragma clang loop unroll(full)
+    for (uint f = 0; f < NF; f++) {
+        o[f].thread_elements()[0] *= a;
+        o[f].thread_elements()[1] *= a;
+        simdgroup_store(o[f], out + f * 8u, ostride);
+    }
 }
 
 /* V4.1 indexer scores on simdgroup matrices without threadgroup memory: each

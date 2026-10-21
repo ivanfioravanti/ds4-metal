@@ -150,6 +150,8 @@ kernel void kernel_argsort_f32_i32(
 template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC>;
 template [[host_name("kernel_argsort_f32_i32_desc_causal")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, true>;
 template [[host_name("kernel_argsort_f32_i32_desc_causal_shuffle")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, true, true>;
+// The same SIMD-exchange network for the non-causal block sort of the decode call (one row, k = 512).
+template [[host_name("kernel_argsort_f32_i32_desc_shuffle")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, false, true>;
 
 typedef void (argsort_merge_t)(
         constant   ds4_metal_args_argsort_merge & args,
@@ -318,6 +320,183 @@ kernel void kernel_argsort_merge_f32_i32(
 template [[host_name("kernel_argsort_merge_f32_i32_desc")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC>;
 template [[host_name("kernel_argsort_merge_f32_i32_desc_causal")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC, true>;
 template [[host_name("kernel_argsort_merge_f32_i32_desc_causal_prefix")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC, true, true>;
+// The decode merge (one row, k = 512) keeps only the ordered top 512 of every merged pair: the same comparisons and
+// tie order on NaN-free rows.
+template [[host_name("kernel_argsort_merge_f32_i32_desc_prefix")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC, false, true>;
+
+// The same merge with both runs and their scores staged in threadgroup memory first (at most 512 threads, 8 KB).
+kernel void kernel_argsort_merge_f32_i32_desc_prefix_staged(
+        constant   ds4_metal_args_argsort_merge & args,
+        device const char    * src0,
+        device const int32_t * tmp,
+        device       int32_t * dst,
+        threadgroup  char    * shmem [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int im  = tgpig[0] / args.ne01;
+    const int i01 = tgpig[0] % args.ne01;
+    const int i02 = tgpig[1];
+    const int i03 = tgpig[2];
+
+    const int start = im * (2 * args.len);
+    const int work_width = args.ne0;
+    const int read_limit = min(args.len, 512);
+    const int len0 = MIN(read_limit, MAX(0, work_width - start));
+    const int len1 = MIN(read_limit, MAX(0, work_width - (start + args.len)));
+    const int total = len0 + len1;
+
+    device const int32_t * tmp0 = tmp + start
+        + i01*args.ne0
+        + i02*args.ne0*args.ne01
+        + i03*args.ne0*args.ne01*args.ne02;
+    device const int32_t * tmp1 = tmp0 + args.len;
+    dst += start
+        + i01*args.top_k
+        + i02*args.top_k*args.ne01
+        + i03*args.top_k*args.ne01*args.ne02;
+    device const float * src0_row = (device const float *)(src0
+        + args.nb01*i01
+        + args.nb02*i02
+        + args.nb03*i03);
+
+    if (total == 0) {
+        return;   /* uniform over the threadgroup */
+    }
+
+    threadgroup int32_t * s_i0 = (threadgroup int32_t *)shmem;
+    threadgroup int32_t * s_i1 = s_i0 + 512;
+    threadgroup float   * s_v0 = (threadgroup float *)(s_i1 + 512);
+    threadgroup float   * s_v1 = s_v0 + 512;
+    for (int t = tpitg.x; t < len0; t += ntg.x) { const int32_t ix = tmp0[t]; s_i0[t] = ix; s_v0[t] = src0_row[ix]; }
+    for (int t = tpitg.x; t < len1; t += ntg.x) { const int32_t ix = tmp1[t]; s_i1[t] = ix; s_v1[t] = src0_row[ix]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int chunk = (total + ntg.x - 1) / ntg.x;
+    const int k0 = tpitg.x * chunk;
+    const int limit = min(args.top_k, 512);
+    const int k1 = MIN(MIN(k0 + chunk, total), limit);
+    if (k0 >= limit) return;
+    if (k0 >= total) return;
+
+    int low  = k0 > len1 ? k0 - len1 : 0;
+    int high = MIN(k0, len0);
+    while (low < high) {
+        const int mid = (low + high) >> 1;
+        if (s_v0[mid] >= s_v1[k0 - mid - 1]) low = mid + 1; else high = mid;
+    }
+
+    int i = low;
+    int j = k0 - i;
+    int32_t idx0 = 0; float val0 = 0.0f;
+    if (i < len0) { idx0 = s_i0[i]; val0 = s_v0[i]; }
+    int32_t idx1 = 0; float val1 = 0.0f;
+    if (j < len1) { idx1 = s_i1[j]; val1 = s_v1[j]; }
+
+    for (int k = k0; k < k1; ++k) {
+        int32_t out_idx;
+        if (i >= len0) {
+            while (k < k1) dst[k++] = s_i1[j++];
+            break;
+        } else if (j >= len1) {
+            while (k < k1) dst[k++] = s_i0[i++];
+            break;
+        } else {
+            if (val0 >= val1) {
+                out_idx = idx0;
+                ++i;
+                if (i < len0) { idx0 = s_i0[i]; val0 = s_v0[i]; }
+            } else {
+                out_idx = idx1;
+                ++j;
+                if (j < len1) { idx1 = s_i1[j]; val1 = s_v1[j]; }
+            }
+        }
+        dst[k] = out_idx;
+    }
+}
+
+// The last levels of that ladder (at most ten runs of 512) in one threadgroup: each level emulates the dispatch's
+// groups and threads chunk for chunk, so its output equals the dispatch's. One row, 1024 threads, ne00 <= 65536.
+kernel void kernel_argsort_merge_f32_i32_desc_prefix_fused(
+        constant   ds4_metal_args_argsort_merge & args,
+        constant   uint    & mt,
+        device const char    * src0,
+        device const int32_t * tmp,
+        device       int32_t * dst,
+        threadgroup  char    * shmem [[threadgroup(0)]],
+        ushort tid [[thread_position_in_threadgroup]],
+        ushort ntg [[threads_per_threadgroup]]) {
+    const int ww = args.ne0;
+    int len = args.len;
+    const int nruns = (ww + len - 1) / len;
+    threadgroup float  * sv = (threadgroup float *)shmem;
+    threadgroup ushort * si = (threadgroup ushort *)(sv + nruns * 512);
+    device const float * row = (device const float *)src0;
+    /* every index load first, then every score gather: at most five entries per thread (5120 / 1024) */
+    int32_t ixr[5];
+    for (int q = 0; q < 5; ++q) {
+        const int e = tid + q * 1024, j = e >> 9, p = e & 511;
+        const int lj = e < nruns * 512 ? min(min(len, 512), max(0, ww - j * len)) : 0;
+        ixr[q] = p < lj ? tmp[j * len + p] : -1;
+    }
+    for (int q = 0; q < 5; ++q) {
+        const int e = tid + q * 1024;
+        if (ixr[q] >= 0) { si[e] = (ushort)ixr[q]; sv[e] = row[ixr[q]]; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (; len < ww; len <<= 1) {
+        const int nm = (ww + 2 * len - 1) / (2 * len);
+        const bool last = nm == 1;
+        const int rl = min(len, 512);
+        const int vth = min((int)mt, len);
+        const int limit = min(last ? args.top_k : ww, 512);
+        int   okk[8];
+        int   oix[8];
+        float ov[8];
+        int   no = 0;
+        for (int g = tid; g < nm * vth; g += ntg) {
+            const int im = g / vth, vt = g % vth;
+            const int start = im * 2 * len;
+            const int len0 = min(rl, max(0, ww - start));
+            const int len1 = min(rl, max(0, ww - (start + len)));
+            const int total = len0 + len1;
+            if (total == 0) continue;
+            const int chunk = (total + vth - 1) / vth;
+            const int k0 = vt * chunk;
+            const int k1 = min(min(k0 + chunk, total), limit);
+            if (k0 >= limit || k0 >= total) continue;
+            threadgroup const float  * v0s = sv + (2 * im) * 512;
+            threadgroup const float  * v1s = v0s + 512;
+            threadgroup const ushort * i0s = si + (2 * im) * 512;
+            threadgroup const ushort * i1s = i0s + 512;
+            int low  = k0 > len1 ? k0 - len1 : 0;
+            int high = min(k0, len0);
+            while (low < high) {
+                const int mid = (low + high) >> 1;
+                if (v0s[mid] >= v1s[k0 - mid - 1]) low = mid + 1; else high = mid;
+            }
+            int i = low, j = k0 - i;
+            float val0 = i < len0 ? v0s[i] : 0.0f;
+            float val1 = j < len1 ? v1s[j] : 0.0f;
+            for (int k = k0; k < k1; ++k) {
+                int ix; float vv;
+                if (i >= len0)      { ix = i1s[j]; vv = v1s[j]; ++j; }
+                else if (j >= len1) { ix = i0s[i]; vv = v0s[i]; ++i; }
+                else if (val0 >= val1) { ix = i0s[i]; vv = val0; ++i; if (i < len0) val0 = v0s[i]; }
+                else                   { ix = i1s[j]; vv = val1; ++j; if (j < len1) val1 = v1s[j]; }
+                okk[no] = im * 512 + k; oix[no] = ix; ov[no] = vv; ++no;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (last) {
+            for (int q = 0; q < no; ++q) dst[okk[q]] = oix[q];
+            return;
+        }
+        for (int q = 0; q < no; ++q) { si[okk[q]] = (ushort)oix[q]; sv[okk[q]] = ov[q]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
 
 // ---- Whole-GPU top-k for wide score rows -----------------------------------
 //
@@ -584,4 +763,39 @@ kernel void kernel_topk_select_sort(
         }
     }
     for (uint i = tid; i < args.top_k; i += 1024u) out[i] = (int)ids[i];
+}
+
+// kernel_topk_select_sort for top_k <= 512 (one key per thread): score descending, ties by id is a total order, so the
+// same winners in the same order. map != 0 writes candidate positions back as key ids.
+kernel void kernel_topk_select_sort512(
+        constant ds4_metal_args_topk_select & args,
+        device const float * scores,
+        device int * selected,
+        device const uint * list,
+        constant uint & map,
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup uint tk[512], ti[512];
+    device const float * s = scores + (ulong)row * args.n;
+    device int * out = selected + (ulong)row * args.top_k;
+    uint key = 0u, id = 0xffffffffu;
+    if (tid < args.top_k) { id = (uint)out[tid]; key = ds4_topk_key(s[id]); }
+    for (uint k = 2u; k <= 512u; k <<= 1) {
+        for (uint j = k >> 1; j > 0u; j >>= 1) {
+            uint pk, pi;
+            if (j < 32u) {
+                pk = simd_shuffle_xor(key, (ushort)j);
+                pi = simd_shuffle_xor(id, (ushort)j);
+            } else {
+                tk[tid] = key; ti[tid] = id;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                pk = tk[tid ^ j]; pi = ti[tid ^ j];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            const bool mine_first = key > pk || (key == pk && id < pi);
+            const bool keep_first = ((tid & j) == 0u) == ((tid & k) == 0u);
+            if (mine_first != keep_first) { key = pk; id = pi; }
+        }
+    }
+    if (tid < args.top_k) out[tid] = map ? (int)(list[id >> 3] * 8u + (id & 7u)) : (int)id;
 }

@@ -751,6 +751,39 @@ kernel void kernel_dsv4_hc_expand4(
     }
 }
 
+// kernel_dsv4_hc_expand4 at the V4.1 FFN join's shape (5120 x 4, one token, add and bf16 rounding) as literals.
+kernel void kernel_dsv4_hc_expand4_serial_add_bf16(
+        device  const float * block_out [[buffer(1)]],
+        device  const float * residual  [[buffer(2)]],
+        device  const float * post      [[buffer(3)]],
+        device  const float * comb      [[buffer(4)]],
+        device  const float * block_add [[buffer(5)]],
+        device        float * dst       [[buffer(6)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= 5120u) {
+        return;
+    }
+
+    const uint d = gid;
+    const float block_v = ds4_bf16_round(block_out[d] + block_add[d]);
+
+    const float r0 = residual[d];
+    const float r1 = residual[5120u + d];
+    const float r2 = residual[2u*5120u + d];
+    const float r3 = residual[3u*5120u + d];
+
+    for (uint dst_hc = 0; dst_hc < 4u; ++dst_hc) {
+        float acc = block_v * post[dst_hc];
+
+        acc += comb[dst_hc + 0u] * r0;
+        acc += comb[dst_hc + 4u] * r1;
+        acc += comb[dst_hc + 8u] * r2;
+        acc += comb[dst_hc + 12u] * r3;
+
+        dst[dst_hc*5120u + d] = ds4_bf16_round(acc);
+    }
+}
+
 // Decode-time FFN tail fusion:
 //
 //     shared_out = shared_mid @ Wshared_down

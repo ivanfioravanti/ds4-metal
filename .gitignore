@@ -102,6 +102,7 @@
 /tests/test_deepseek41_prefill
 /tests/test_deepseek41_cli
 /tests/test_deepseek41_dspark_lifecycle
+/tests/test_deepseek41_preencode
 /tests/test_engram
 *.o
 *.dSYM/

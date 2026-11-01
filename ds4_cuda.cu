@@ -148,6 +148,8 @@ typedef struct ds4_gpu_stream_expert_table {
 } ds4_gpu_stream_expert_table;
 extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
     const ds4_gpu_stream_expert_table *, const ds4_gpu_tensor *, uint32_t);
+static int cuda_stream_selected_cache_begin_load_tensor(
+    const ds4_gpu_stream_expert_table *, const ds4_gpu_tensor *, uint32_t, bool);
 extern "C" uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(uint64_t, uint64_t);
 
 typedef struct {
@@ -26143,8 +26145,8 @@ static int routed_moe_launch(
             model_map, model_size, layer_index, n_total_expert,
             gate_offset, up_offset, down_offset, gate_expert_bytes, down_expert_bytes};
         if ((uint64_t)n_tokens * n_expert > UINT32_MAX ||
-            !ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
-                &table, selected, n_tokens * n_expert)) return 0;
+            !cuda_stream_selected_cache_begin_load_tensor(
+                &table, selected, n_tokens * n_expert, n_tokens > 1)) return 0;
         allow_streaming = 1;
     }
 
@@ -29013,7 +29015,8 @@ struct cuda_stream_upload_batch {
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
-        uint32_t slot_count) {
+        uint32_t slot_count,
+        bool order_reads = false) {
     cuda_stream_prefetch_before_load(table);
     cuda_stream_selected_cache_invalidate();
     if (!g_ssd_streaming_mode) return 1;
@@ -29117,8 +29120,32 @@ static int cuda_stream_selected_cache_begin_load(
             slots[i] = (int32_t)found->second;
             slot.used = stamp;
         }
+        /* Route-driven staging: retain the router/remap order,
+         * but assign misses in file order so adjacent source and cache ranges
+         * can share a read. Apply this by default to batched prefill: small
+         * single-token loads can lose decode throughput with a tight cache.
+         * Keep both orders available for comparisons and failure tests. */
+        const bool ordered = getenv("DS4_CUDA_DISABLE_SSD_SORT_SELECTED_READS") == NULL &&
+            (order_reads || getenv("DS4_CUDA_SSD_SORT_SELECTED_READS") != NULL);
+        struct selected_copy {
+            char *destination;
+            uint64_t offset, bytes;
+            unsigned part;
+        };
+        std::vector<size_t> order, pending;
+        std::vector<selected_copy> copies;
+        if (ordered) {
+            order.reserve(unique.size());
+            pending.reserve(unique.size());
+            copies.reserve(unique.size() * 3u);
+            for (size_t i = 0; i < unique.size(); i++) order.push_back(i);
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                return unique[a] < unique[b];
+            });
+        }
         cuda_stream_upload_batch uploads;
-        for (size_t i = 0; i < unique.size(); i++) {
+        for (size_t at = 0; at < unique.size(); at++) {
+            const size_t i = ordered ? order[at] : at;
             if (slots[i] >= 0) continue;
             uint32_t victim = UINT32_MAX;
             uint64_t oldest = stamp;
@@ -29130,7 +29157,11 @@ static int cuda_stream_selected_cache_begin_load(
                     if (!oldest) break;
                 }
             }
-            if (victim == UINT32_MAX) return 0;
+            if (victim == UINT32_MAX) {
+                for (size_t index : pending)
+                    g_stream_expert_slots[slots[index]].used = 0;
+                return 0;
+            }
             auto &slot = g_stream_expert_slots[victim];
             if (slot.used) g_stream_expert_by_gate.erase(slot.gate);
             slot.used = 0;
@@ -29138,8 +29169,17 @@ static int cuda_stream_selected_cache_begin_load(
             const uint64_t gate = table->gate_offset + expert * table->gate_expert_bytes;
             const uint64_t up = table->up_offset + expert * table->gate_expert_bytes;
             const uint64_t down = table->down_offset + expert * table->down_expert_bytes;
-            uploads.active = true;
-            if (!cuda_model_copy_to_device_streamed(
+            if (ordered) {
+                copies.push_back({cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
+                    gate, table->gate_expert_bytes, 0});
+                copies.push_back({cache.up_ptr + (uint64_t)victim * table->gate_expert_bytes,
+                    up, table->gate_expert_bytes, 1});
+                copies.push_back({cache.down_ptr + (uint64_t)victim * table->down_expert_bytes,
+                    down, table->down_expert_bytes, 2});
+                pending.push_back(i);
+            } else {
+                uploads.active = true;
+                if (!cuda_model_copy_to_device_streamed(
                     cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
                     table->model_map, table->model_size, gate, table->gate_expert_bytes, "stream gate", uploads.chunks) ||
                 !cuda_model_copy_to_device_streamed(
@@ -29148,12 +29188,56 @@ static int cuda_stream_selected_cache_begin_load(
                 !cuda_model_copy_to_device_streamed(
                     cache.down_ptr + (uint64_t)victim * table->down_expert_bytes,
                     table->model_map, table->model_size, down, table->down_expert_bytes, "stream down", uploads.chunks))
-                return 0;
+                    return 0;
+            }
             slot = {gate, up, down, stamp};
-            g_stream_expert_by_gate[gate] = victim;
+            /* Ordered copies are still pending. Protect their slots, but do
+             * not advertise a cache hit until every upload has completed. */
+            if (!ordered) g_stream_expert_by_gate[gate] = victim;
             slots[i] = (int32_t)victim;
         }
+        if (ordered) {
+            std::sort(copies.begin(), copies.end(), [](const selected_copy &a, const selected_copy &b) {
+                return a.offset < b.offset;
+            });
+            size_t merged = 0;
+            for (const auto copy : copies) {
+                if (merged && copies[merged - 1u].part == copy.part &&
+                    copies[merged - 1u].offset + copies[merged - 1u].bytes == copy.offset &&
+                    copies[merged - 1u].destination + copies[merged - 1u].bytes == copy.destination)
+                    copies[merged - 1u].bytes += copy.bytes;
+                else copies[merged++] = copy;
+            }
+            uint64_t complete_until[3] = {0, 0, 0};
+            for (size_t i = 0; i < merged; i++) {
+                const auto &copy = copies[i];
+                uploads.active = true;
+                if (!cuda_model_copy_to_device_streamed(copy.destination,
+                        table->model_map, table->model_size, copy.offset, copy.bytes,
+                        "ordered selected experts", uploads.chunks)) {
+                    /* Preserve only experts whose three complete ranges
+                     * have actually reached the GPU. Drain before publishing
+                     * those hits or releasing any failed reservation. */
+                    if (!uploads.finish()) return 0;
+                    for (size_t index : pending) {
+                        const uint32_t slot_index = (uint32_t)slots[index];
+                        auto &slot = g_stream_expert_slots[slot_index];
+                        if (slot.gate + table->gate_expert_bytes <= complete_until[0] &&
+                            slot.up + table->gate_expert_bytes <= complete_until[1] &&
+                            slot.down + table->down_expert_bytes <= complete_until[2])
+                            g_stream_expert_by_gate[slot.gate] = slot_index;
+                        else slot.used = 0;
+                    }
+                    return 0;
+                }
+                complete_until[copy.part] = copy.offset + copy.bytes;
+            }
+        }
         if (!uploads.finish()) return 0;
+        if (ordered) for (size_t i : pending) {
+            const uint32_t slot = (uint32_t)slots[i];
+            g_stream_expert_by_gate[g_stream_expert_slots[slot].gate] = slot;
+        }
         g_stream_prefill_ids = remap;
         g_stream_prefill_slots = slots;
         for (auto &id : remap) id = slots[id];
@@ -34773,10 +34857,11 @@ extern "C" int ds4_gpu_glm_store_indexer_k_tensor(
     return cuda_ok(cudaGetLastError(), "glm store indexer k launch");
 }
 
-extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+static int cuda_stream_selected_cache_begin_load_tensor(
         const ds4_gpu_stream_expert_table *table,
         const ds4_gpu_tensor              *selected,
-        uint32_t                           n_selected) {
+        uint32_t                           n_selected,
+        bool                               order_reads) {
     if (!g_ssd_streaming_mode) return 1;
     if (!table || !selected || n_selected == 0 ||
         selected->bytes < (uint64_t)n_selected * sizeof(int32_t)) {
@@ -34794,7 +34879,14 @@ extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
                  "GLM streaming selected-id read")) {
         return 0;
     }
-    return cuda_stream_selected_cache_begin_load(table, ids.data(), n_selected);
+    return cuda_stream_selected_cache_begin_load(table, ids.data(), n_selected, order_reads);
+}
+
+extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+        const ds4_gpu_stream_expert_table *table,
+        const ds4_gpu_tensor *selected,
+        uint32_t n_selected) {
+    return cuda_stream_selected_cache_begin_load_tensor(table, selected, n_selected, false);
 }
 
 __global__ static void glm_value_project_q8_0_batch_heads_kernel(
@@ -35690,7 +35782,7 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         return 0;
     }
     return cuda_stream_selected_cache_begin_load(
-            table, selected_ids, n_tokens * n_selected);
+            table, selected_ids, n_tokens * n_selected, n_tokens > 1);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_experts(

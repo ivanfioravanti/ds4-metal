@@ -15133,7 +15133,7 @@ typedef struct {
 } client_arg;
 
 static void append_model_json_values(buf *b, const char *id, const char *name,
-                                     int ctx, int default_tokens, bool vision) {
+                                     int ctx, int default_tokens, bool has_vision) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
     buf_printf(b,
         "{\"id\":");
@@ -15147,11 +15147,14 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
     buf_printf(b,
         ","
         "\"context_length\":%d,"
+        "\"architecture\":{"
+            "\"modality\":\"%s->text\","
+            "\"input_modalities\":[\"text\"%s],"
+            "\"output_modalities\":[\"text\"]},"
         "\"top_provider\":{"
             "\"context_length\":%d,"
             "\"max_completion_tokens\":%d,"
             "\"is_moderated\":false},"
-        "%s"
         "\"supported_parameters\":["
             "\"tools\","
             "\"tool_choice\","
@@ -15168,14 +15171,11 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"include_reasoning\","
             "\"reasoning_effort\"]}",
         ctx,
-        ctx,
-        max_completion,
         /* clients gate image attachments on the advertised input modalities */
-        vision ? "\"architecture\":{"
-                     "\"modality\":\"text+image->text\","
-                     "\"input_modalities\":[\"text\",\"image\"],"
-                     "\"output_modalities\":[\"text\"]},"
-               : "");
+        has_vision ? "text+image" : "text",
+        has_vision ? ",\"image\"" : "",
+        ctx,
+        max_completion);
 }
 
 static void append_model_json(buf *b, const server *s, const char *id) {
@@ -21220,6 +21220,23 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 }
 
+static void test_model_metadata_reports_modalities(void) {
+    for (int vision = 0; vision <= 1; vision++) {
+        buf b = {0};
+        append_model_json_values(&b, "model", "Model", 32768, 4096, vision);
+        const char *json = b.ptr;
+        TEST_ASSERT(json_skip_value(&json));
+        TEST_ASSERT(*json == '\0');
+        TEST_ASSERT(strstr(b.ptr, "\"architecture\":{") != NULL);
+        TEST_ASSERT(strstr(b.ptr, vision ?
+            "\"input_modalities\":[\"text\",\"image\"]" :
+            "\"input_modalities\":[\"text\"]") != NULL);
+        TEST_ASSERT(strstr(b.ptr, "\"output_modalities\":[\"text\"]") != NULL);
+        if (!vision) TEST_ASSERT(strstr(b.ptr, "\"image\"") == NULL);
+        buf_free(&b);
+    }
+}
+
 static void test_live_prefix_rewind_target(void) {
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8) == 7);
     TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379) == 48378);
@@ -23162,6 +23179,7 @@ static void ds4_server_unit_tests_run(void) {
     test_json_int_handles_non_finite_values();
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
+    test_model_metadata_reports_modalities();
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();

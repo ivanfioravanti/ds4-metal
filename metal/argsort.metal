@@ -146,16 +146,12 @@ kernel void kernel_argsort_f32_i32(
     }
 }
 
-// Host-visible sort variant used by DS4 top-k selection. Two explicit
-// instantiations of one specialization are illegal, so the plain
-// <DS4_SORT_ORDER_DESC> kernel keeps the kernel_argsort_f32_i32_desc name the
-// cached g_argsort_f32_i32_desc_pipeline loads, and the shuffle-network
-// variant stays reachable as kernel_argsort_f32_i32_desc_shuffle for the
-// decode_k512 fast path that upgrades into it.
-template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC>;
+// Host-visible sort variant used by DS4 top-k selection. Uses the register/
+// simd_shuffle_xor network for the j < 32 stages; output is identical to the
+// threadgroup-memory network.
+template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, false, true>;
 template [[host_name("kernel_argsort_f32_i32_desc_causal")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, true>;
 template [[host_name("kernel_argsort_f32_i32_desc_causal_shuffle")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, true, true>;
-template [[host_name("kernel_argsort_f32_i32_desc_shuffle")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, false, true>;
 
 typedef void (argsort_merge_t)(
         constant   ds4_metal_args_argsort_merge & args,

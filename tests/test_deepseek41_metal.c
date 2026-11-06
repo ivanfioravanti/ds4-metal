@@ -1117,6 +1117,39 @@ static int check_attention_output(bool large) {
     return 1;
 }
 
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+static int check_indexer_grouped_keys(const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights) {
+    enum { KEYS = 8197, BLOCKS = (KEYS + 7) / 8, DIM = 128 };
+    ds4_gpu_tensor *keys = upload(NULL, KEYS * DIM * sizeof(float));
+    ds4_gpu_tensor *out = upload(NULL, (KEYS + 1) * sizeof(float));
+    ds4_gpu_tensor *reference = upload(NULL, KEYS * sizeof(float));
+    ds4_gpu_tensor *mask = upload(NULL, BLOCKS * sizeof(float));
+    CHECK(keys && out && reference && mask);
+    float *k = ds4_gpu_tensor_contents(keys), *m = ds4_gpu_tensor_contents(mask);
+    float *s = ds4_gpu_tensor_contents(out), *ref = ds4_gpu_tensor_contents(reference);
+    for (size_t i = 0; i < (size_t)KEYS * DIM; i++) k[i] = random_value();
+    CHECK(ds4_gpu_dsv41_quantize(keys, DIM, KEYS, DS4_V41_FP4_E8M0));
+    ds4_gpu_set_quality(true);
+    CHECK(ds4_gpu_glm_indexer_score_one_tensor(reference, q, weights, keys, KEYS, 32, DIM,
+                                               1.0f / 64.0f, false));
+    CHECK(ds4_gpu_synchronize());
+    ds4_gpu_set_quality(false);
+    s[KEYS] = 12345;
+    CHECK(ds4_gpu_dsv41_indexer_scores_batch(out, q, weights, keys, KEYS, 1, 2 * KEYS - 1, 2));
+    CHECK(ds4_gpu_synchronize() && s[KEYS] == 12345 && !memcmp(s, ref, KEYS * sizeof(float)));
+    for (unsigned phase = 0; phase < 2; phase++) {
+        for (unsigned i = 0; i < BLOCKS; i++) m[i] = (i + phase) % 2u ? -INFINITY : 0.0f;
+        CHECK(ds4_gpu_dsv41_indexer_scores_masked_one(out, q, weights, keys, mask, KEYS));
+        CHECK(ds4_gpu_synchronize() && s[KEYS] == 12345);
+        for (unsigned i = 0; i < KEYS; i++)
+            CHECK(m[i / 8] ? s[i] == -INFINITY : !memcmp(s + i, ref + i, sizeof(float)));
+    }
+    ds4_gpu_tensor_free(mask); ds4_gpu_tensor_free(reference);
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(keys);
+    return 1;
+}
+#endif
+
 static int check_indexer_batch(void) {
     enum { KEYS = 1025, ROWS = 33, HEADS = 32, DIM = 128 };
     ds4_gpu_tensor *qt = upload(NULL, (size_t)ROWS * HEADS * DIM * sizeof(float));
@@ -1143,6 +1176,21 @@ static int check_indexer_batch(void) {
         CHECK(ds4_gpu_dsv41_quantize(qt, DIM, ROWS * HEADS, DS4_V41_FP4_E8M0));
         CHECK(ds4_gpu_dsv41_quantize(kt, DIM, KEYS, DS4_V41_FP4_E8M0));
         if (range == 2) { q[0] = 1.0001f; k[67u * DIM] = 1.0003f; }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        /* The fused rejection must leave the same original score slots,
+         * including a partial final block whether retained or rejected. */
+        float mask[(KEYS + 7u) / 8u];
+        for (size_t i = 0; i < sizeof(mask) / sizeof(mask[0]); i++)
+            mask[i] = (i + range) % 3u ? -INFINITY : 0.0f;
+        ds4_gpu_tensor *mt = upload(mask, sizeof(mask));
+        CHECK(mt && ds4_gpu_dsv41_indexer_scores_batch(reference, qt, wt, kt, KEYS, 1, KEYS - 1, 1));
+        CHECK(ds4_gpu_dsv41_candidate_filter(reference, mt, KEYS, 1, KEYS - 1, 1, 0));
+        s[KEYS] = 12345;
+        CHECK(ds4_gpu_dsv41_indexer_scores_masked_one(st, qt, wt, kt, mt, KEYS));
+        CHECK(ds4_gpu_synchronize() && s[KEYS] == 12345);
+        CHECK(!memcmp(s, ds4_gpu_tensor_contents(reference), KEYS * sizeof(float)));
+        ds4_gpu_tensor_free(mt);
+#endif
         uint32_t *packed_guard = (uint32_t *)((char *)ds4_gpu_tensor_contents(pt) + packed_bytes);
         *packed_guard = 0xabcdef01;
         if (packed_available) CHECK(ds4_gpu_dsv41_indexer_pack(pt, qt, kt, KEYS, ROWS));
@@ -1217,6 +1265,9 @@ static int check_indexer_batch(void) {
             }
         }
     }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (ds4_gpu_device_is_spark()) CHECK(check_indexer_grouped_keys(qt, wt));
+#endif
     CHECK(!ds4_gpu_dsv41_indexer_scores_batch(st, qt, wt, kt, KEYS, ROWS, 0, 0));
     CHECK(!ds4_gpu_dsv41_indexer_scores_batch(st, qt, wt, kt, KEYS, ROWS, 0, 4));
     CHECK(!ds4_gpu_dsv41_indexer_scores_batch(st, qt, wt, kt, KEYS, ROWS, UINT32_MAX, 1));
@@ -1607,14 +1658,14 @@ static int check_decode_topk(void) {
                        pattern == 2 ? (i % 3 ? -INFINITY : random_value()) : pattern == 3 ? (i & 1 ? -0.0f : 0.0f) :
                        (i % 5 == 0 ? NAN : random_value());
             a[512] = b[512] = c[512] = 0x5eed;
-            const uint64_t shuffle = ds4_gpu_test_kernel_runs("kernel_argsort_f32_i32_desc_shuffle");
+            const uint64_t shuffle = ds4_gpu_test_kernel_runs("kernel_argsort_f32_i32_desc");
             const uint64_t fused = ds4_gpu_test_kernel_runs("kernel_argsort_merge_f32_i32_desc_prefix_fused");
             CHECK(ds4_gpu_dsv41_indexer_topk_tensor(ids[0], scores, width, 1, 512) && ds4_gpu_synchronize());
             ds4_gpu_test_set_v41_off(DS4_GPU_V41_UNFUSED_TOPK);
             const int ok = ds4_gpu_dsv41_indexer_topk_tensor(ids[1], scores, width, 1, 512) && ds4_gpu_synchronize();
             ds4_gpu_test_set_v41_off(0);
             CHECK(ok && ds4_gpu_indexer_topk_tensor(ids[2], scores, width, 1, 512) && ds4_gpu_synchronize());
-            CHECK(ds4_gpu_test_kernel_runs("kernel_argsort_f32_i32_desc_shuffle") == shuffle + 2);
+            CHECK(ds4_gpu_test_kernel_runs("kernel_argsort_f32_i32_desc") == shuffle + 3);
             CHECK(ds4_gpu_test_kernel_runs("kernel_argsort_merge_f32_i32_desc_prefix_fused") == fused + (width > 1024));
             CHECK(a[512] == 0x5eed && b[512] == 0x5eed && c[512] == 0x5eed);
             for (uint32_t k = 0; k < 512u; k++) {

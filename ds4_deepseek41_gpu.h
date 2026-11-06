@@ -134,6 +134,11 @@ int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
                                      const ds4_gpu_tensor *keys,
                                      uint32_t source_rows, uint32_t rows,
                                      uint32_t start, uint32_t ratio);
+#ifndef __APPLE__
+int ds4_gpu_dsv41_indexer_scores_masked_one(ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights, const ds4_gpu_tensor *keys,
+        const ds4_gpu_tensor *block_mask, uint32_t width);
+#endif
 /* One-token index scores of FP4 queries/keys: the GLM scorer, plus its wide
  * kernel for long rows (Metal only). */
 int ds4_gpu_dsv41_indexer_score_one_tensor(ds4_gpu_tensor *scores,
